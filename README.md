@@ -50,6 +50,10 @@ accept <username>                 accept their room request
 
 When the other person accepts, a room opens automatically. Type normally; every line is sent as a message. Use `/help`, `/leave`, and `/exit` while in a room.
 
+File transfers use end-to-end encryption and SHA-256 verification. If a transfer
+briefly disconnects, Wire retries automatically; if it remains paused, use
+`/file resume <code>` within ten minutes.
+
 During a screen share, `/share stats` shows measured capture, encode, receive,
 bitrate, packet-loss, and RTT data. `/share stop` tells the other Wire client to
 close the viewer as well.

@@ -521,6 +521,7 @@ class Wire:
         self.call_requests: set[str] = set()
         self.pending_pings: dict[str, float] = {}
         self.pending_files: dict[str, dict] = {}
+        self.paused_files: dict[str, dict] = {}
         self.outgoing_files: dict[str, dict] = {}
         self.pending_shares: dict[str, dict] = {}
         self.outgoing_shares: dict[str, dict] = {}
@@ -1121,8 +1122,9 @@ class Wire:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("0.0.0.0", 0))
-        listener.listen(1)
-        listener.settimeout(180)
+        listener.listen(4)
+        # Keep the sender available long enough for a laptop/network hiccup.
+        listener.settimeout(600)
         offer = {
             "id": file_id, "token": token, "name": path.name, "size": size,
             "sha256": self.file_digest(path), "contents": self.zip_contents(path),
@@ -1145,26 +1147,46 @@ class Wire:
             return
         listener, peer, offer, path = state["listener"], state["peer"], state["offer"], state["path"]
         connection: Optional[socket.socket] = None
+        completed = False
+        deadline = time.monotonic() + 600
         try:
-            connection, _address = listener.accept()
-            connection.settimeout(30)
-            hello = self.read_direct_packet(connection, peer.key)
-            if hello.get("kind") != "hello" or hello.get("id") != file_id or not hmac.compare_digest(str(hello.get("token", "")), offer["token"]):
-                raise ValueError("file receiver could not be verified")
-            self.send_direct_packet(connection, peer.key, {"kind": "start", "id": file_id})
-            with path.open("rb") as handle:
-                sent = 0
-                started, last_status = time.monotonic(), 0.0
-                while chunk := handle.read(FILE_CHUNK_BYTES):
-                    self.send_direct_packet(connection, peer.key, {"kind": "chunk", "id": file_id, "data": b64(chunk)})
-                    sent += len(chunk)
-                    if time.monotonic() - last_status >= 0.5:
-                        self.transfer_status("uploading", path.name, sent, offer["size"], started)
-                        last_status = time.monotonic()
-            self.send_direct_packet(connection, peer.key, {"kind": "end", "id": file_id, "size": sent})
-            say(f"sent file directly: {path.name}")
-        except socket.timeout:
-            say(f"file offer expired: {path.name}")
+            while time.monotonic() < deadline and not completed:
+                listener.settimeout(max(1, deadline - time.monotonic()))
+                try:
+                    connection, _address = listener.accept()
+                    connection.settimeout(30)
+                    hello = self.read_direct_packet(connection, peer.key)
+                    offset = hello.get("offset", 0)
+                    if hello.get("kind") != "hello" or hello.get("id") != file_id or not hmac.compare_digest(str(hello.get("token", "")), offer["token"]) or not isinstance(offset, int) or not 0 <= offset <= offer["size"]:
+                        raise ValueError("file receiver could not be verified")
+                    self.send_direct_packet(connection, peer.key, {"kind": "start", "id": file_id, "offset": offset})
+                    with path.open("rb") as handle:
+                        handle.seek(offset)
+                        sent = offset
+                        started, last_status = time.monotonic(), 0.0
+                        while chunk := handle.read(FILE_CHUNK_BYTES):
+                            self.send_direct_packet(connection, peer.key, {"kind": "chunk", "id": file_id, "data": b64(chunk)})
+                            sent += len(chunk)
+                            if time.monotonic() - last_status >= 0.5:
+                                self.transfer_status("uploading", path.name, sent, offer["size"], started)
+                                last_status = time.monotonic()
+                    self.send_direct_packet(connection, peer.key, {"kind": "end", "id": file_id, "size": sent})
+                    receipt = self.read_direct_packet(connection, peer.key)
+                    if receipt.get("kind") != "complete" or receipt.get("id") != file_id:
+                        raise ConnectionError("receiver did not verify the file")
+                    completed = True
+                    say(f"sent file directly: {path.name}")
+                except socket.timeout:
+                    break
+                except (ConnectionError, OSError):
+                    say(f"upload interrupted; waiting for {peer.name} to resume {path.name}")
+                finally:
+                    if connection:
+                        try: connection.close()
+                        except OSError: pass
+                        connection = None
+            if not completed:
+                say(f"file offer expired: {path.name}")
         except Exception as exc:
             say(f"file transfer stopped: {exc}")
         finally:
@@ -1175,11 +1197,6 @@ class Wire:
                 listener.close()
             except OSError:
                 pass
-            if connection:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
 
     def answer_file_offer(self, code: str, accept: bool) -> None:
         matches = [key for key in self.pending_files if key.startswith(code.lower())]
@@ -1199,7 +1216,15 @@ class Wire:
         threading.Thread(target=self.direct_receive_worker, args=(peer, host, port, offer), daemon=True).start()
         say("accepting direct encrypted file transfer...")
 
-    def direct_receive_worker(self, peer: Peer, host: str, port: int, offer: dict) -> None:
+    def resume_file(self, code: str) -> None:
+        matches = [key for key in self.paused_files if key.startswith(code.lower())]
+        if len(matches) != 1:
+            raise ValueError("no paused transfer with that code")
+        state = self.paused_files[matches[0]]
+        threading.Thread(target=self.direct_receive_worker, args=(state["peer"], state["host"], state["port"], state["offer"], state["target"]), daemon=True).start()
+        say("resuming encrypted file transfer...")
+
+    def direct_receive_worker(self, peer: Peer, host: str, port: int, offer: dict, target_override: Optional[Path] = None) -> None:
         name = Path(str(offer.get("name", "file"))).name
         size, file_id, token, expected_hash = offer.get("size"), offer.get("id"), offer.get("token"), offer.get("sha256")
         if not name or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not isinstance(file_id, str) or not isinstance(token, str) or not isinstance(expected_hash, str):
@@ -1207,52 +1232,81 @@ class Wire:
             return
         FILES_DIR = DOWNLOADS_DIR / "Files"
         FILES_DIR.mkdir(parents=True, exist_ok=True)
-        target = FILES_DIR / name
-        stem, suffix, number = target.stem, target.suffix, 2
-        while target.exists():
-            target = FILES_DIR / f"{stem} ({number}){suffix}"
-            number += 1
-        temp = target.with_suffix(target.suffix + ".part")
+        target = target_override or FILES_DIR / name
+        if not target_override:
+            stem, suffix, number = target.stem, target.suffix, 2
+            while target.exists():
+                target = FILES_DIR / f"{stem} ({number}){suffix}"
+                number += 1
+        # The transfer ID makes the partial filename stable across reconnects.
+        temp = FILES_DIR / f".{name}.{file_id}.part"
         connection: Optional[socket.socket] = None
         try:
-            connection = socket.create_connection((host, port), timeout=15)
-            connection.settimeout(30)
-            self.send_direct_packet(connection, peer.key, {"kind": "hello", "id": file_id, "token": token})
-            start = self.read_direct_packet(connection, peer.key)
-            if start.get("kind") != "start" or start.get("id") != file_id:
-                raise ValueError("sender did not verify the transfer")
-            digest, written = hashlib.sha256(), 0
-            started, last_status = time.monotonic(), 0.0
-            with temp.open("wb") as handle:
-                while True:
-                    frame = self.read_direct_packet(connection, peer.key)
-                    if frame.get("id") != file_id:
-                        raise ValueError("wrong file transfer")
-                    if frame.get("kind") == "end":
-                        if frame.get("size") != written:
-                            raise ValueError("file size did not match")
-                        break
-                    if frame.get("kind") != "chunk" or not isinstance(frame.get("data"), str):
-                        raise ValueError("invalid file data")
-                    chunk = unb64(frame["data"])
-                    if not chunk or len(chunk) > FILE_CHUNK_BYTES or written + len(chunk) > size:
-                        raise ValueError("invalid file chunk")
-                    handle.write(chunk)
-                    digest.update(chunk)
-                    written += len(chunk)
-                    if time.monotonic() - last_status >= 0.5:
-                        self.transfer_status("downloading", name, written, size, started)
-                        last_status = time.monotonic()
-            if written != size or not hmac.compare_digest(digest.hexdigest(), expected_hash):
+            verified = False
+            # A short retry loop resumes transient disconnects without needing a
+            # new offer or another accept command.
+            for attempt in range(4):
+                written = temp.stat().st_size if temp.exists() else 0
+                if written > size:
+                    raise ValueError("saved partial file is larger than the offer")
+                digest = hashlib.sha256()
+                if written:
+                    with temp.open("rb") as previous:
+                        while chunk := previous.read(1024 * 1024): digest.update(chunk)
+                try:
+                    connection = socket.create_connection((host, port), timeout=15)
+                    connection.settimeout(30)
+                    self.send_direct_packet(connection, peer.key, {"kind": "hello", "id": file_id, "token": token, "offset": written})
+                    start = self.read_direct_packet(connection, peer.key)
+                    if start.get("kind") != "start" or start.get("id") != file_id or start.get("offset") != written:
+                        raise ValueError("sender did not verify the resume offset")
+                    started, last_status = time.monotonic(), 0.0
+                    with temp.open("ab") as handle:
+                        while True:
+                            frame = self.read_direct_packet(connection, peer.key)
+                            if frame.get("id") != file_id:
+                                raise ValueError("wrong file transfer")
+                            if frame.get("kind") == "end":
+                                if frame.get("size") != written:
+                                    raise ValueError("file size did not match")
+                                if written != size or not hmac.compare_digest(digest.hexdigest(), expected_hash):
+                                    raise ValueError("file failed verification")
+                                self.send_direct_packet(connection, peer.key, {"kind": "complete", "id": file_id})
+                                verified = True
+                                break
+                            if frame.get("kind") != "chunk" or not isinstance(frame.get("data"), str):
+                                raise ValueError("invalid file data")
+                            chunk = unb64(frame["data"])
+                            if not chunk or len(chunk) > FILE_CHUNK_BYTES or written + len(chunk) > size:
+                                raise ValueError("invalid file chunk")
+                            handle.write(chunk)
+                            digest.update(chunk)
+                            written += len(chunk)
+                            if time.monotonic() - last_status >= 0.5:
+                                self.transfer_status("downloading", name, written, size, started)
+                                last_status = time.monotonic()
+                    break
+                except (ConnectionError, OSError, socket.timeout) as exc:
+                    if attempt == 3:
+                        raise
+                    say(f"download interrupted at {written / 1024 / 1024:.1f} MB; resuming...")
+                    time.sleep(1)
+                finally:
+                    if connection:
+                        try: connection.close()
+                        except OSError: pass
+                        connection = None
+            if not verified:
                 raise ValueError("file failed verification")
             temp.replace(target)
+            self.paused_files.pop(file_id, None)
             say(f"\nfile received and verified: {target}")
             toast(f"file received from {peer.name}: {name}")
             if target.suffix.lower() in VIDEO_EXTENSIONS:
                 say(f"video received. Type /preview \"{target}\" to watch its first 5 seconds.")
         except Exception as exc:
-            temp.unlink(missing_ok=True)
-            say(f"file transfer failed: {exc}")
+            self.paused_files[file_id] = {"peer": peer, "host": host, "port": port, "offer": offer, "target": target}
+            say(f"file transfer paused: {exc}; type /file resume {file_id[:6]} within 10 minutes")
         finally:
             if connection:
                 try:
@@ -2140,7 +2194,7 @@ history [name]  search <words>  peers  room [name]  group  leave  settings  iden
 
 IN A ROOM: type normally.
 /send <image>  /image accept|decline <code>
-/sendfile <file-or-folder>  /file accept|decline <code>
+/sendfile <file-or-folder>  /file accept|decline|resume <code>
 /preview <video> = play first 5 seconds
 /reply <message-code> <text>  /react <message-code> <emoji>
 /edit <message-code> <text>  /delete <message-code>
@@ -2301,9 +2355,12 @@ def main() -> None:
                         app.edit_message(room_peer, pieces[0], pieces[1])
                 elif command == "file":
                     pieces = argument.split(maxsplit=1)
-                    if len(pieces) != 2 or pieces[0] not in ("accept", "decline"):
-                        raise ValueError("use: /file accept <code> or /file decline <code>")
-                    app.answer_file_offer(pieces[1], accept=pieces[0] == "accept")
+                    if len(pieces) != 2 or pieces[0] not in ("accept", "decline", "resume"):
+                        raise ValueError("use: /file accept|decline|resume <code>")
+                    if pieces[0] == "resume":
+                        app.resume_file(pieces[1])
+                    else:
+                        app.answer_file_offer(pieces[1], accept=pieces[0] == "accept")
                 elif command == "preview":
                     if not argument:
                         raise ValueError("use: /preview <video path>")
