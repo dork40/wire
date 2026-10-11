@@ -15,12 +15,13 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.7"
+SERVER_VERSION = "1.4.10"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
 GROUPS_FILE = STATE / "groups.json"
 BACKUPS_FILE = STATE / "identity-backups.json"
+QUEUES_FILE = STATE / "offline-queue.json"
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str]] = {}
 
@@ -91,6 +92,20 @@ def save_backups(backups: dict) -> None:
     temp.replace(BACKUPS_FILE)
 
 
+def load_queues() -> dict:
+    try:
+        value = json.loads(QUEUES_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError): return {}
+
+
+def save_queues(queues: dict) -> None:
+    STATE.mkdir(exist_ok=True)
+    temp = QUEUES_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(queues, separators=(",", ":")), encoding="utf-8")
+    temp.replace(QUEUES_FILE)
+
+
 def valid_group_name(value: object) -> bool:
     return isinstance(value, str) and 3 <= len(value) <= 32 and all(char.isalnum() or char in "_-" for char in value)
 
@@ -132,6 +147,21 @@ def deliver(username: str, packet: dict) -> bool:
         return True
     except OSError:
         return False
+
+
+def deliver_or_queue(username: str, packet: dict) -> bool:
+    """The directory queues encrypted relay packets only; it cannot read them."""
+    if deliver(username, packet):
+        return True
+    key = username.lower()
+    with LOCK:
+        if key not in load_users() or len(json.dumps(packet, separators=(",", ":"))) > 100_000:
+            return False
+        queues = load_queues(); pending = queues.setdefault(key, [])
+        if len(pending) >= 1_000:
+            return False
+        pending.append(packet); save_queues(queues)
+    return True
 
 
 def handle(sock: socket.socket, address: tuple[str, int]) -> None:
@@ -180,7 +210,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             users[key] = {"name": name, "public": public, "sign_public": sign_public}
             save_users(users)
             ONLINE[key] = (name, sock, public, address[0])
+            queues = load_queues()
+            queued_packets = queues.pop(key, [])
+            if queued_packets: save_queues(queues)
         send(sock, {"type": "ready", "name": name, "version": SERVER_VERSION})
+        for queued in queued_packets:
+            if isinstance(queued, dict): send(sock, queued)
         print(f"online  {name}  {address[0]}")
 
         while True:
@@ -353,7 +388,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 for member_key in group["members"]:
                     encrypted = packets.get(member_key)
                     if member_key != key and isinstance(encrypted, dict):
-                        deliver(member_key, {"type": "group_message", "group": group["name"], "from": name, "public": public, "packet": encrypted})
+                        deliver_or_queue(member_key, {"type": "group_message", "group": group["name"], "from": name, "public": public, "packet": encrypted})
             elif kind == "direct_offer":
                 target = packet.get("to", "").lower()
                 port = packet.get("port")
@@ -394,9 +429,9 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             elif kind == "relay":
                 target = packet.get("to", "").lower()
                 payload = packet.get("packet")
-                if isinstance(payload, dict) and deliver(target, {"type": "relay", "from": name, "packet": payload}):
+                if isinstance(payload, dict) and deliver_or_queue(target, {"type": "relay", "from": name, "packet": payload}):
                     continue
-                send(sock, {"type": "error", "message": "person is offline"})
+                send(sock, {"type": "error", "message": "person is unavailable or their offline queue is full"})
             else:
                 send(sock, {"type": "error", "message": "unknown request"})
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError):

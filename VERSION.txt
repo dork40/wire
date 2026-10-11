@@ -1,3 +1,3 @@
-Wire v1.4.9
+Wire v1.4.10
 
 Includes encrypted chat rooms, group rooms, friend discovery, Windows Terminal image previews, arrow-key voice and screen-share settings, share statistics, update checks, encrypted identity backup, and direct encrypted file transfers up to 500 MB. Files and screen-share video do not pass through the Wire directory server.
