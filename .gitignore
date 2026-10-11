@@ -1,0 +1,12 @@
+.venv/
+build/
+dist/
+dist-wheel/
+package/
+wire-data/
+wire-server-data/
+transfer-temp/
+__pycache__/
+*.pyc
+*.zip
+*.spec

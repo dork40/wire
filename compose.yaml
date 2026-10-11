@@ -1,0 +1,11 @@
+services:
+  wire-server:
+    build: .
+    container_name: wire-server
+    restart: unless-stopped
+    environment:
+      WIRE_STATE: /data
+    ports:
+      - "47666:47666/tcp"
+    volumes:
+      - ./wire-server-data:/data
