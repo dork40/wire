@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.1"
+SERVER_VERSION = "1.4.6"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -97,9 +97,11 @@ def valid_group_name(value: object) -> bool:
 
 def group_details(group: dict, users: dict, online: set[str]) -> dict:
     member_keys = [item for item in group.get("members", []) if item in users]
+    admins = set(group.get("admins", [group.get("owner")]))
     return {
         "name": group["name"], "owner": group["owner"],
-        "members": [{"name": users[item]["name"], "public": users[item]["public"], "online": item in online} for item in member_keys],
+        "members": [{"name": users[item]["name"], "public": users[item]["public"], "online": item in online,
+                     "role": "owner" if item == group["owner"] else ("admin" if item in admins else "member")} for item in member_keys],
     }
 
 
@@ -244,7 +246,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         send(sock, {"type": "error", "message": "that group already exists"})
                         continue
                     members = list(dict.fromkeys([key] + [item for item in requested_keys if item in users]))
-                    groups[group_key] = {"name": group_name, "owner": key, "members": members}
+                    groups[group_key] = {"name": group_name, "owner": key, "admins": [key], "members": members, "invites": []}
                     save_groups(groups)
                     detail = group_details(groups[group_key], users, set(ONLINE))
                 for member_key in members:
@@ -259,8 +261,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 with LOCK:
                     users, groups = load_users(), load_groups()
                     group = groups.get(group_key)
-                    if not group or group.get("owner") != key:
-                        send(sock, {"type": "error", "message": "only the group owner can add people"})
+                    if not group or key not in group.get("admins", [group.get("owner")]):
+                        send(sock, {"type": "error", "message": "only group admins can add people"})
                         continue
                     if member not in users:
                         send(sock, {"type": "error", "message": "that username does not exist"})
@@ -271,6 +273,47 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     detail = group_details(group, users, set(ONLINE))
                 for member_key in group["members"]:
                     deliver(member_key, {"type": "group_list", "groups": [detail]})
+            elif kind == "group_invite":
+                group_key, member = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower()
+                with LOCK:
+                    users, groups = load_users(), load_groups(); group = groups.get(group_key)
+                    if not group or key not in group.get("admins", [group.get("owner")]) or member not in users:
+                        send(sock, {"type": "error", "message": "group invite was rejected"}); continue
+                    if member in group.get("members", []):
+                        send(sock, {"type": "error", "message": "that person is already in the group"}); continue
+                    group.setdefault("invites", [])
+                    if member not in group["invites"]: group["invites"].append(member); save_groups(groups)
+                    inviter = name
+                if not deliver(member, {"type": "group_invite", "group": group["name"], "from": inviter}):
+                    send(sock, {"type": "error", "message": "invite saved; that person is offline"})
+            elif kind == "group_accept_invite":
+                group_key = str(packet.get("group", "")).lower()
+                with LOCK:
+                    users, groups = load_users(), load_groups(); group = groups.get(group_key)
+                    if not group or key not in group.get("invites", []):
+                        send(sock, {"type": "error", "message": "no pending group invite"}); continue
+                    group["invites"].remove(key); group["members"].append(key); save_groups(groups)
+                    detail = group_details(group, users, set(ONLINE))
+                for member_key in group["members"]: deliver(member_key, {"type": "group_list", "groups": [detail]})
+            elif kind == "group_kick":
+                group_key, member = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower()
+                with LOCK:
+                    users, groups = load_users(), load_groups(); group = groups.get(group_key)
+                    if not group or key not in group.get("admins", [group.get("owner")]) or member == group.get("owner") or member not in group.get("members", []):
+                        send(sock, {"type": "error", "message": "group removal was rejected"}); continue
+                    group["members"].remove(member); group["admins"] = [item for item in group.get("admins", []) if item != member]; save_groups(groups)
+                    detail = group_details(group, users, set(ONLINE))
+                deliver(member, {"type": "group_kicked", "group": group_key})
+                for member_key in group["members"]: deliver(member_key, {"type": "group_list", "groups": [detail]})
+            elif kind == "group_admin":
+                group_key, member, enabled = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower(), bool(packet.get("enabled"))
+                with LOCK:
+                    users, groups = load_users(), load_groups(); group = groups.get(group_key)
+                    if not group or group.get("owner") != key or member not in group.get("members", []):
+                        send(sock, {"type": "error", "message": "only the group owner can change admins"}); continue
+                    admins = set(group.get("admins", [key])); (admins.add(member) if enabled else admins.discard(member)); admins.add(key)
+                    group["admins"] = sorted(admins); save_groups(groups); detail = group_details(group, users, set(ONLINE))
+                for member_key in group["members"]: deliver(member_key, {"type": "group_list", "groups": [detail]})
             elif kind == "group_leave":
                 group_key = str(packet.get("group", "")).lower()
                 with LOCK:
@@ -283,7 +326,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     if not group["members"]:
                         groups.pop(group_key, None)
                     elif group.get("owner") == key:
-                        group["owner"] = group["members"][0]
+                        group["owner"] = next((item for item in group.get("admins", []) if item in group["members"]), group["members"][0])
+                        group["admins"] = list(dict.fromkeys([group["owner"]] + [item for item in group.get("admins", []) if item in group["members"]]))
                     save_groups(groups)
                 send(sock, {"type": "group_left", "group": group_key})
             elif kind == "group_send":

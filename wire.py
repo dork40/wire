@@ -529,6 +529,7 @@ class Wire:
         self.share_peers: dict[str, str] = {}
         self.share_viewers: dict[str, mp.Process] = {}
         self.groups: dict[str, dict] = {}
+        self.group_invites: dict[str, str] = {}
         self.group_room: Optional[str] = None
         self.settings = load_settings()
 
@@ -1932,7 +1933,8 @@ class Wire:
         say("\nGROUPS")
         for group in self.groups.values():
             online = sum(1 for member in group.get("members", []) if member.get("online"))
-            say(f"{group['name']}  [{online}/{len(group.get('members', []))} online]")
+            mine = next((member.get("role", "member") for member in group.get("members", []) if member.get("name", "").lower() == self.name.lower()), "member")
+            say(f"{group['name']}  [{online}/{len(group.get('members', []))} online]  {mine}")
 
     def send_group_message(self, group_name: str, text: str) -> None:
         group = self.groups.get(group_name.lower())
@@ -2005,6 +2007,17 @@ class Wire:
                     if self.group_room == group_name:
                         self.group_room = None
                     say("left group")
+                elif kind == "group_kicked":
+                    group_name = str(packet.get("group", "")).lower()
+                    self.groups.pop(group_name, None)
+                    if self.group_room == group_name: self.group_room = None
+                    say("you were removed from that group")
+                elif kind == "group_invite":
+                    group_name, inviter = packet.get("group"), packet.get("from")
+                    if isinstance(group_name, str) and isinstance(inviter, str):
+                        self.group_invites[group_name.lower()] = group_name
+                        say(f"\n{inviter} invited you to group {group_name}. Type /group accept {group_name}")
+                        redraw_prompt()
                 elif kind == "group_message":
                     self.handle_group_message(packet)
                 elif kind == "pong":
@@ -2199,7 +2212,7 @@ IN A ROOM: type normally.
 /reply <message-code> <text>  /react <message-code> <emoji>
 /edit <message-code> <text>  /delete <message-code>
 /share  /share accept|decline <code>  /share stop|stats
-/group create <name> <people...>  /group list|open|add|leave
+/group create <name> <people...>  /group list|open|invite|accept|kick|admin|leave
 /call  /acceptcall <name>  /declinecall <name>  /hangup
 /settings = settings list; arrows change options
 /ping  /update  /help  /leave  /exit"""
@@ -2316,12 +2329,18 @@ def main() -> None:
                         app.room = None
                         print(f"group open: {group['name']} (type normally; /group leave {group['name']} to leave)")
                         app.show_history(f"group-{group['name']}")
-                    elif pieces[0] == "add" and len(pieces) == 3:
-                        app.server_send({"type": "group_add", "group": pieces[1], "member": pieces[2]})
+                    elif pieces[0] in ("add", "invite") and len(pieces) == 3:
+                        app.server_send({"type": "group_invite", "group": pieces[1], "member": pieces[2]})
+                    elif pieces[0] == "accept" and len(pieces) == 2:
+                        app.server_send({"type": "group_accept_invite", "group": pieces[1]})
+                    elif pieces[0] == "kick" and len(pieces) == 3:
+                        app.server_send({"type": "group_kick", "group": pieces[1], "member": pieces[2]})
+                    elif pieces[0] in ("admin", "member") and len(pieces) == 3:
+                        app.server_send({"type": "group_admin", "group": pieces[1], "member": pieces[2], "enabled": pieces[0] == "admin"})
                     elif pieces[0] == "leave" and len(pieces) == 2:
                         app.server_send({"type": "group_leave", "group": pieces[1]})
                     else:
-                        raise ValueError("use: /group create <name> <people...> | list | open <name> | add <name> <user> | leave <name>")
+                        raise ValueError("use: /group create <name> <people...> | list | open <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | leave <name>")
                 elif command == "send":
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
