@@ -7,7 +7,9 @@ $serverBase64 = [Convert]::ToBase64String($serverSource)
 @"
 services:
   wire-server:
-    image: wire-server:1.3.1
+    # Bump this whenever the embedded server protocol changes so TrueNAS
+    # rebuilds the custom image instead of reusing the prior local tag.
+    image: wire-server:1.4.0
     build:
       context: .
       dockerfile_inline: |
