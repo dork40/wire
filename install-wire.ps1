@@ -1,5 +1,5 @@
 param(
-    [string]$Source = 'git+https://github.com/dork40/wire.git'
+    [string]$Source = 'https://github.com/dork40/wire/archive/refs/heads/main.zip'
 )
 $ErrorActionPreference = 'Stop'
 if (-not (Get-Command py -ErrorAction SilentlyContinue)) {
