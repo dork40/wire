@@ -60,7 +60,12 @@ except ImportError:
 
 APP = "wire"
 PORT = 46565
-DATA = (Path(sys.executable).parent / "wire-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-data")
+# Account data must never live beside a versioned package/executable.  Updates,
+# pipx environments and portable builds can be replaced without losing users.
+if os.name == "nt":
+    DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Wire"
+else:
+    DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "wire"
 USERS = DATA / "users.json"
 SERVER_CONFIG = DATA / "server.json"
 HISTORY_DIR = DATA / "history"
@@ -85,21 +90,20 @@ SAFE_PROMPT_ACTIVE = False
 
 
 def migrate_portable_data() -> None:
-    """Bring accounts made by older portable builds into the stable app-data folder."""
-    if not getattr(sys, "frozen", False) or USERS.exists():
+    """One-time migration from old project / portable locations; never overwrites data."""
+    if USERS.exists():
         return
-    legacy = Path(__file__).with_name("wire-data")
-    if not (legacy / "users.json").exists():
-        return
-    DATA.mkdir(exist_ok=True)
-    for source in legacy.iterdir():
-        destination = DATA / source.name
-        if destination.exists():
+    candidates = [Path(__file__).with_name("wire-data"), Path(sys.executable).parent / "wire-data"]
+    for legacy in candidates:
+        if not (legacy / "users.json").exists():
             continue
-        if source.is_dir():
-            shutil.copytree(source, destination)
-        else:
-            shutil.copy2(source, destination)
+        DATA.mkdir(parents=True, exist_ok=True)
+        for source in legacy.iterdir():
+            destination = DATA / source.name
+            if destination.exists(): continue
+            if source.is_dir(): shutil.copytree(source, destination)
+            else: shutil.copy2(source, destination)
+        break
 
 
 migrate_portable_data()
