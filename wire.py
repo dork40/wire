@@ -294,20 +294,26 @@ def screen_viewer_process(frames: object, title: str) -> None:
 
 
 def toast(text: str) -> None:
-    # PowerShell uses the Windows toast API. Failure is harmless: the terminal still shows the message.
+    """Show a Windows notification without needing a packaged-app AUMID.
+
+    WinRT toast notifications are silently discarded for many unpackaged console
+    apps because Windows has no Start-menu registration for their app identity.
+    A short-lived tray icon is reliable for a `wire` command installed by pipx.
+    """
+    if os.name != "nt":
+        return
     encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
     script = (
-        "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime] > $null;"
+        "Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing;"
         "$t=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "'));"
-        "$t=[Security.SecurityElement]::Escape($t);"
-        "$x=New-Object Windows.Data.Xml.Dom.XmlDocument;"
-        "$x.LoadXml(\"<toast><visual><binding template='ToastGeneric'><text>wire</text><text>$t</text></binding></visual></toast>\");"
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('wire').Show((New-Object Windows.UI.Notifications.ToastNotification $x))"
+        "$n=New-Object System.Windows.Forms.NotifyIcon;$n.Icon=[System.Drawing.SystemIcons]::Information;"
+        "$n.Visible=$true;$n.BalloonTipTitle='Wire';$n.BalloonTipText=$t;"
+        "$n.ShowBalloonTip(5000);[System.Windows.Forms.Application]::DoEvents();Start-Sleep -Milliseconds 5200;$n.Dispose()"
     )
     try:
-        subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-STA", "-WindowStyle", "Hidden", "-Command", script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception:
         pass
 
@@ -2254,7 +2260,7 @@ IN A ROOM: type normally.
 /group create <name> <people...>  /group list|open|invite|accept|kick|admin|pin|leave
 /call  /acceptcall <name>  /declinecall <name>  /hangup
 /settings = settings list; arrows change options
-/ping  /update  /help  /leave  /exit"""
+/ping  /testnotify  /update  /help  /leave  /exit"""
 
 
 def main() -> None:
@@ -2448,6 +2454,9 @@ def main() -> None:
                     app.server_send({"type": "ping", "id": ping_id})
                 elif command == "update":
                     check_for_update()
+                elif command == "testnotify":
+                    toast("Wire notifications are working.")
+                    print("sent Windows notification test")
                 elif command == "image":
                     room_peer = app.peers.get(app.room or "")
                     pieces = argument.split(maxsplit=1)
