@@ -748,7 +748,8 @@ class Wire:
         self.server_send({"type": "status", "users": friends})
 
     def show_settings(self) -> None:
-        say("SETTINGS")
+        say("WIRE SETTINGS")
+        say("Use /settings on Windows for the arrow-key menu. Changes save automatically.")
         say(f"notifications: {'on' if self.settings['notifications'] else 'off'}")
         say(f"voice activation: {'always on' if self.settings['voice_mode'] == 'open' else 'hold F12 to talk'}")
         say(f"echo cancellation: {'on' if self.settings['voice_echo'] else 'off'}")
@@ -758,7 +759,8 @@ class Wire:
         width, height = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         caps = stream_capabilities()
         say(f"screen share: monitor {self.settings['stream_monitor']}; {self.settings['stream_profile']}; {width}x{height} at {STREAM_FPS[self.settings['stream_fps']]} FPS, {STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps target")
-        say(f"screen codec: {self.settings['stream_codec']}; WebRTC: {'available' if caps['webrtc'] else 'not installed'}; codecs: {', '.join(caps['codecs']) or 'none'}")
+        say(f"screen codec: {self.settings['stream_codec']}; hardware acceleration: {'on' if self.settings['stream_hardware'] else 'off'}; latency: {self.settings['stream_latency']}")
+        say(f"WebRTC: {'available' if caps['webrtc'] else 'not installed'}; available codecs: {', '.join(caps['codecs']) or 'none'}")
         say("images: ask before download")
 
     def apply_voice_settings(self) -> None:
@@ -807,11 +809,31 @@ class Wire:
                 ("Latency mode", self.settings["stream_latency"]),
                 ("Back", ""),
             ]
+            hints = [
+                "Windows notifications appear only while Wire is not the active window.",
+                "Always on sends audio continuously; push-to-talk uses F12.",
+                "Applies to your next and current voice calls.",
+                "Higher noise removal can use more CPU.",
+                "Keeps voice volume steady.",
+                "Selects the microphone for your next call.",
+                "Selects the speakers for your next call.",
+                "Selects which display /share captures.",
+                "Higher resolutions need more encoder and network capacity.",
+                "Higher FPS needs more encoder and network capacity.",
+                "A target rate; WebRTC can adapt to the connection.",
+                "Profiles choose sensible resolution, FPS, and bitrate starting points.",
+                "Auto selects a compatible WebRTC codec when possible.",
+                "Uses supported GPU acceleration where the active WebRTC stack provides it.",
+                "Low minimizes buffering; balanced is more tolerant of network variation.",
+                "Return to chat.",
+            ]
             print("\x1b[2J\x1b[H", end="")
-            print("WIRE SETTINGS  (Up/Down: select   Left/Right: change   Enter/Esc: back)\n")
+            print("WIRE SETTINGS  (Up/Down: select   Left/Right: change   Enter/Esc: back)")
+            print("Changes save automatically.\n")
             for index, (label, value) in enumerate(rows):
                 marker = ">" if index == selected else " "
                 print(f"{marker} {label}: {value}" if value else f"{marker} {label}")
+            print(f"\n{hints[selected]}")
             key = msvcrt.getwch()
             if key in ("\x00", "\xe0"):
                 key = msvcrt.getwch()
@@ -2295,22 +2317,52 @@ IN A ROOM
   Use /help, /leave, or /exit for commands while chatting."""
 
 
-HELP = """WIRE
-signup/login [name]  discover [name]  open/accept [name]
-friends  friend add/remove [name]  block/unblock [name]  blocked
-history [name]  search <words>  peers  room [name]  group  leave  settings  identity  exit
+HELP = """WIRE HELP
 
-IN A ROOM: type normally.
-/send <image>  /image accept|decline <code>
-/sendfile <file-or-folder>  /file accept|decline|resume <code>
-/preview <video> = play first 5 seconds
-/reply <message-code> <text>  /react <message-code> <emoji>
-/edit <message-code> <text>  /delete <message-code>
-/share  /share accept|decline <code>  /share stop|stats
-/group create <name> <people...>  /group list|open|invite|accept|kick|admin|pin|jump|leave
-/call  /acceptcall <name>  /declinecall <name>  /hangup
-/settings = settings list; arrows change options
-/ping  /testnotify  /update  /help  /leave  /exit"""
+ACCOUNT AND PEOPLE
+  signup [name] / login [name]       Create or sign in to an account.
+  discover [name]                    Find a Wire username.
+  open <name> / accept <name>        Open or accept a private chat.
+  friends / friend add|remove <name> Manage friends.
+  block|unblock <name> / blocked     Manage blocked people.
+
+CHAT
+  Type normally in an open room to send a message.
+  /history <name>                    Show saved messages and their short message codes.
+  /search <words>                    Search your saved messages locally.
+  /reply <code> <text>               Reply to a saved message.
+  /react <code> <emoji>              Add or replace your reaction.
+  /edit <code> <text> / /delete <code>
+                                      Change or delete one of your messages.
+  /room <name> / /leave              Switch or close the current room.
+  /peers                             Show connected people.
+
+FILES AND MEDIA
+  /send <image path>                 Offer an encrypted image.
+  /image accept|decline <code>       Answer an image offer.
+  /sendfile <file-or-folder>         Offer an encrypted file or folder.
+  /file accept|decline|resume <code> Answer or resume a file transfer.
+  /preview <video path>              Play the first five seconds locally.
+  /call / /acceptcall <name> / /declinecall <name> / /hangup
+  /share                             Start sharing your selected monitor.
+  /share accept|decline <code>       Answer a screen-share request.
+  /share stop|close / /share stats   Stop sharing or show live share statistics.
+
+GROUPS
+  /group list / create <name> <people...> / open <name>
+  /group invite|accept|kick <group> <person>
+  /group admin|member <group> <person>
+  /group pin|unpin <group> <message-code> / pins <group>
+  /group jump <group> <message-code> / leave <group>
+
+SETTINGS AND UTILITIES
+  /settings                          Open the one arrow-key settings menu; changes save automatically.
+  /settings delete                   Delete this PC's local account data.
+  /identity / /fingerprint <name>    Show safety fingerprints.
+  /ping / /testnotify / /update      Connection, notification, and update checks.
+  /help / /exit                      Show this help or close Wire.
+
+Typing indicators clear automatically five seconds after typing stops."""
 
 
 def main() -> None:
