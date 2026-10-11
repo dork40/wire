@@ -551,6 +551,7 @@ class Wire:
         self.group_invites: dict[str, str] = {}
         self.typing_until: dict[str, float] = {}
         self.last_typing_sent = 0.0
+        self.typing_notifier: Optional[Callable[[], None]] = None
         self.group_room: Optional[str] = None
         self.settings = load_settings()
 
@@ -977,9 +978,9 @@ class Wire:
             raise ValueError("message code did not match exactly one saved message")
         return records, candidates[0]
 
-    def render_record(self, record: dict) -> str:
+    def render_record(self, record: dict, show_id: bool = False) -> str:
         text = "[deleted]" if record.get("deleted") else str(record.get("text", ""))
-        suffix = f"  ({record.get('id', '')[:6]})" if record.get("id") else ""
+        suffix = f"  ({record.get('id', '')[:6]})" if show_id and record.get("id") else ""
         if record.get("reply_to"):
             suffix += f"  reply:{str(record['reply_to'])[:6]}"
         if record.get("edited"):
@@ -999,7 +1000,7 @@ class Wire:
             return
         say("-- earlier messages --")
         for record in records[-30:]:
-            say(self.render_record(record))
+            say(self.render_record(record, show_id=True))
         say("-- end earlier messages --")
 
     def search_history(self, query: str) -> None:
@@ -1033,6 +1034,19 @@ class Wire:
         if peer and now - self.last_typing_sent >= 2:
             peer.send_control({"kind": "typing"})
             self.last_typing_sent = now
+
+    def typing_label(self) -> str:
+        """Return the transient prompt status without adding a chat message."""
+        now = time.monotonic()
+        names = [name for name, expires in self.typing_until.items() if expires > now]
+        return f" {names[0]} is typing..." if names else ""
+
+    def refresh_typing_status(self) -> None:
+        if self.typing_notifier:
+            try:
+                self.typing_notifier()
+            except Exception:
+                pass
 
     def reply_message(self, peer: Peer, prefix: str, text: str) -> None:
         _, target = self.matching_message(peer.name, prefix)
@@ -1826,11 +1840,11 @@ class Wire:
                     self.apply_message_control(peer, control)
                 elif control.get("kind") == "typing":
                     now = time.monotonic()
-                    was_typing = self.typing_until.get(peer.name.lower(), 0) > now
-                    self.typing_until[peer.name.lower()] = now + 3
-                    if not was_typing:
-                        say(f"\n{peer.name} is typing...")
-                        redraw_prompt()
+                    self.typing_until[peer.name.lower()] = now + 5
+                    self.refresh_typing_status()
+                    expiry_refresh = threading.Timer(5.05, self.refresh_typing_status)
+                    expiry_refresh.daemon = True
+                    expiry_refresh.start()
             except Exception: pass
             return
         if packet.get("type") == "image":
@@ -2016,7 +2030,7 @@ class Wire:
             return
         message_id = encrypted.get("id") if isinstance(encrypted.get("id"), str) else uuid.uuid4().hex
         self.record_history(f"group-{group}", sender, text, message_id)
-        say(f"\n[{group}] {sender} > {text}  ({message_id[:6]})")
+        say(f"\n[{group}] {sender} > {text}")
         redraw_prompt()
         if self.settings["notifications"]:
             toast(f"new group message in {group} from {sender}")
@@ -2041,14 +2055,14 @@ class Wire:
         say(f"PINS — {group['name']}")
         for message_id in pins:
             record = by_id.get(message_id)
-            say(self.render_record(record) if record else f"({str(message_id)[:6]}) message is not in local history")
+            say(self.render_record(record, show_id=True) if record else f"({str(message_id)[:6]}) message is not in local history")
 
     def jump_group_message(self, group_name: str, prefix: str) -> None:
         group = self.groups.get(group_name.lower())
         if not group:
             raise ValueError("unknown group; use /group list first")
         _, record = self.matching_message(f"group-{group['name']}", prefix)
-        say(self.render_record(record))
+        say(self.render_record(record, show_id=True))
 
     def server_loop(self, sock: socket.socket) -> None:
         try:
@@ -2311,12 +2325,13 @@ def main() -> None:
     # screen buffer.  prompt_toolkit cannot attach there, so use normal
     # input() rather than crashing before Wire can start.
     try:
-        session = PromptSession() if PromptSession else None
+        session = PromptSession(bottom_toolbar=app.typing_label) if PromptSession else None
     except Exception:
         session = None
     global SAFE_PROMPT_ACTIVE
     SAFE_PROMPT_ACTIVE = session is not None
     if session:
+        app.typing_notifier = session.app.invalidate
         def announce_typing(_buffer: object) -> None:
             try:
                 app.send_typing()
