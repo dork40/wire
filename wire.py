@@ -370,10 +370,10 @@ class Peer:
     public_key: bytes
     relay: Optional[Callable[[dict], None]] = None
 
-    def send(self, text: str) -> None:
+    def send(self, text: str, message_id: str, reply_to: str | None = None) -> None:
         nonce = os.urandom(12)
         data = AESGCM(self.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
-        packet = {"type": "msg", "nonce": b64(nonce), "data": b64(data)}
+        packet = {"type": "msg", "id": message_id, "reply_to": reply_to, "nonce": b64(nonce), "data": b64(data)}
         if self.relay:
             self.relay(packet)
         elif self.sock:
@@ -927,15 +927,44 @@ class Wire:
         except Exception:
             return []
 
-    def record_history(self, peer_name: str, sender: str, text: str) -> None:
+    def record_history(self, peer_name: str, sender: str, text: str, message_id: str | None = None, reply_to: str | None = None) -> str:
         if not self.history_key:
-            return
+            return ""
+        message_id = message_id or uuid.uuid4().hex
         with self.history_lock:
             records = self.read_history(peer_name)
-            records.append({"at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text})
+            records.append({"id": message_id, "at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text, "reply_to": reply_to, "reactions": []})
             HISTORY_DIR.mkdir(exist_ok=True)
             encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
             self.history_path(peer_name).write_bytes(encrypted)
+        return message_id
+
+    def save_history(self, peer_name: str, records: list[dict]) -> None:
+        self.require_login()
+        assert self.history_key
+        HISTORY_DIR.mkdir(exist_ok=True)
+        self.history_path(peer_name).write_bytes(Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8")))
+
+    def matching_message(self, peer_name: str, prefix: str, own_only: bool = False) -> tuple[list[dict], dict]:
+        records = self.read_history(peer_name)
+        candidates = [record for record in records if isinstance(record.get("id"), str) and record["id"].startswith(prefix.lower())]
+        if own_only:
+            candidates = [record for record in candidates if record.get("from") == self.name]
+        if len(candidates) != 1:
+            raise ValueError("message code did not match exactly one saved message")
+        return records, candidates[0]
+
+    def render_record(self, record: dict) -> str:
+        text = "[deleted]" if record.get("deleted") else str(record.get("text", ""))
+        suffix = f"  ({record.get('id', '')[:6]})" if record.get("id") else ""
+        if record.get("reply_to"):
+            suffix += f"  reply:{str(record['reply_to'])[:6]}"
+        if record.get("edited"):
+            suffix += "  edited"
+        reactions = record.get("reactions", [])
+        if reactions:
+            suffix += "  " + " ".join(str(item) for item in reactions[:12])
+        return f"{record.get('from', '?')} > {text}{suffix}"
 
     def show_history(self, peer_name: str) -> None:
         records = self.read_history(peer_name)
@@ -943,7 +972,7 @@ class Wire:
             return
         say("-- earlier messages --")
         for record in records[-30:]:
-            say(f"{record.get('from', '?')} > {record.get('text', '')}")
+            say(self.render_record(record))
         say("-- end earlier messages --")
 
     def search_history(self, query: str) -> None:
@@ -966,9 +995,40 @@ class Wire:
         if not found:
             say("no saved messages match")
 
-    def send_message(self, peer: Peer, text: str) -> None:
-        peer.send(text)
-        self.record_history(peer.name, self.name or "me", text)
+    def send_message(self, peer: Peer, text: str, reply_to: str | None = None) -> None:
+        message_id = uuid.uuid4().hex
+        peer.send(text, message_id, reply_to)
+        self.record_history(peer.name, self.name or "me", text, message_id, reply_to)
+
+    def reply_message(self, peer: Peer, prefix: str, text: str) -> None:
+        _, target = self.matching_message(peer.name, prefix)
+        self.send_message(peer, text, str(target["id"]))
+
+    def edit_message(self, peer: Peer, prefix: str, text: str) -> None:
+        records, target = self.matching_message(peer.name, prefix, own_only=True)
+        if target.get("deleted"):
+            raise ValueError("cannot edit a deleted message")
+        target["text"], target["edited"] = text, True
+        self.save_history(peer.name, records)
+        peer.send_control({"kind": "message_edit", "id": target["id"], "text": text})
+        say(f"edited message {target['id'][:6]}")
+
+    def delete_message(self, peer: Peer, prefix: str) -> None:
+        records, target = self.matching_message(peer.name, prefix, own_only=True)
+        target["deleted"], target["text"] = True, ""
+        self.save_history(peer.name, records)
+        peer.send_control({"kind": "message_delete", "id": target["id"]})
+        say(f"deleted message {target['id'][:6]}")
+
+    def react_message(self, peer: Peer, prefix: str, reaction: str) -> None:
+        if not reaction or len(reaction) > 24:
+            raise ValueError("reaction must be 1-24 characters")
+        records, target = self.matching_message(peer.name, prefix)
+        token = f"{self.name}:{reaction}"
+        reactions = [item for item in target.get("reactions", []) if not str(item).startswith(f"{self.name}:")]
+        reactions.append(token); target["reactions"] = reactions
+        self.save_history(peer.name, records)
+        peer.send_control({"kind": "message_react", "id": target["id"], "reaction": reaction})
 
     @staticmethod
     def file_digest(path: Path) -> str:
@@ -1675,6 +1735,8 @@ class Wire:
                 if control.get("kind") == "webrtc_answer" and isinstance(control.get("answer"), dict):
                     media = self.webrtc_shares.get(str(control.get("id", "")))
                     if media: media.call(media.remote(control["answer"]))
+                elif control.get("kind") in ("message_react", "message_edit", "message_delete"):
+                    self.apply_message_control(peer, control)
             except Exception: pass
             return
         if packet.get("type") == "image":
@@ -1690,11 +1752,38 @@ class Wire:
             return
         nonce, data = unb64(packet["nonce"]), unb64(packet["data"])
         text = AESGCM(peer.key).decrypt(nonce, data, b"wire-v1-message").decode("utf-8")
-        self.record_history(peer.name, peer.name, text)
-        say(f"\n{peer.name} > {text}")
+        message_id = packet.get("id") if isinstance(packet.get("id"), str) and len(packet["id"]) <= 64 else uuid.uuid4().hex
+        reply_to = packet.get("reply_to") if isinstance(packet.get("reply_to"), str) else None
+        self.record_history(peer.name, peer.name, text, message_id, reply_to)
+        say(f"\n{self.render_record({'id': message_id, 'from': peer.name, 'text': text, 'reply_to': reply_to})}")
         redraw_prompt()
         if self.settings["notifications"]:
             toast(f"new message from {peer.name}")
+
+    def apply_message_control(self, peer: Peer, control: dict) -> None:
+        message_id = control.get("id")
+        if not isinstance(message_id, str):
+            return
+        records = self.read_history(peer.name)
+        target = next((record for record in records if record.get("id") == message_id and record.get("from") == peer.name), None)
+        if not target:
+            return
+        kind = control["kind"]
+        if kind == "message_react" and isinstance(control.get("reaction"), str):
+            reaction = control["reaction"]
+            token = f"{peer.name}:{reaction}"
+            target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{peer.name}:")] + [token]
+            say(f"\n{peer.name} reacted {reaction} to {message_id[:6]}")
+        elif kind == "message_edit" and isinstance(control.get("text"), str):
+            target["text"], target["edited"] = control["text"], True
+            say(f"\n{peer.name} edited message {message_id[:6]}")
+        elif kind == "message_delete":
+            target["deleted"], target["text"] = True, ""
+            say(f"\n{peer.name} deleted message {message_id[:6]}")
+        else:
+            return
+        self.save_history(peer.name, records)
+        redraw_prompt()
 
     def receive_loop(self, peer: Peer) -> None:
         try:
@@ -2053,6 +2142,8 @@ IN A ROOM: type normally.
 /send <image>  /image accept|decline <code>
 /sendfile <file-or-folder>  /file accept|decline <code>
 /preview <video> = play first 5 seconds
+/reply <message-code> <text>  /react <message-code> <emoji>
+/edit <message-code> <text>  /delete <message-code>
 /share  /share accept|decline <code>  /share stop|stats
 /group create <name> <people...>  /group list|open|add|leave
 /call  /acceptcall <name>  /declinecall <name>  /hangup
@@ -2191,6 +2282,23 @@ def main() -> None:
                     if not argument:
                         raise ValueError("use: /sendfile <file path>")
                     app.send_file(room_peer, argument)
+                elif command in ("reply", "react", "edit", "delete"):
+                    room_peer = app.peers.get(app.room or "")
+                    if not room_peer:
+                        raise ValueError("open a room first")
+                    pieces = argument.split(maxsplit=1)
+                    if not pieces:
+                        raise ValueError(f"use: /{command} <message-code>" + (" <text>" if command != "delete" else ""))
+                    if command == "delete":
+                        app.delete_message(room_peer, pieces[0])
+                    elif len(pieces) != 2:
+                        raise ValueError(f"use: /{command} <message-code> <text>")
+                    elif command == "reply":
+                        app.reply_message(room_peer, pieces[0], pieces[1])
+                    elif command == "react":
+                        app.react_message(room_peer, pieces[0], pieces[1])
+                    else:
+                        app.edit_message(room_peer, pieces[0], pieces[1])
                 elif command == "file":
                     pieces = argument.split(maxsplit=1)
                     if len(pieces) != 2 or pieces[0] not in ("accept", "decline"):
@@ -2309,7 +2417,7 @@ def main() -> None:
                     break
                 else:
                     if len(app.peers) == 1:
-                        next(iter(app.peers.values())).send(line)
+                        app.send_message(next(iter(app.peers.values())), line)
                     else:
                         print("unknown command; type help")
             except (ValueError, OSError, ConnectionError) as exc:
