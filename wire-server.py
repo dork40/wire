@@ -15,11 +15,12 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.3.1"
+SERVER_VERSION = "1.4.0"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
 GROUPS_FILE = STATE / "groups.json"
+BACKUPS_FILE = STATE / "identity-backups.json"
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str]] = {}
 
@@ -76,6 +77,20 @@ def save_groups(groups: dict) -> None:
     tmp.replace(GROUPS_FILE)
 
 
+def load_backups() -> dict:
+    try:
+        value = json.loads(BACKUPS_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError): return {}
+
+
+def save_backups(backups: dict) -> None:
+    STATE.mkdir(exist_ok=True)
+    temp = BACKUPS_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(backups), encoding="utf-8")
+    temp.replace(BACKUPS_FILE)
+
+
 def valid_group_name(value: object) -> bool:
     return isinstance(value, str) and 3 <= len(value) <= 32 and all(char.isalnum() or char in "_-" for char in value)
 
@@ -120,6 +135,13 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
     key: str | None = None
     try:
         hello = receive(sock)
+        # The blob is encrypted with the user's password before it reaches us.
+        # This unauthenticated lookup supports recovery on a new computer.
+        if hello.get("type") == "identity_fetch":
+            name = hello.get("name", "").lower()
+            with LOCK: backup = load_backups().get(name)
+            send(sock, {"type": "identity_backup", "backup": backup} if isinstance(backup, dict) else {"type": "error", "message": "no encrypted backup for that user"})
+            return
         if hello.get("type") != "hello" or not (details := valid_hello(hello)):
             send(sock, {"type": "error", "message": "bad login"})
             return
@@ -200,6 +222,14 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 send(sock, {"type": "status", "users": matches})
             elif kind == "ping":
                 send(sock, {"type": "pong", "id": packet.get("id", "")})
+            elif kind == "identity_backup":
+                backup = packet.get("backup")
+                if not isinstance(backup, dict) or not isinstance(backup.get("salt"), str) or not isinstance(backup.get("ciphertext"), str) or len(json.dumps(backup)) > 20000:
+                    send(sock, {"type": "error", "message": "invalid encrypted backup"})
+                    continue
+                with LOCK:
+                    backups = load_backups(); backups[key] = backup; save_backups(backups)
+                send(sock, {"type": "identity_backup_saved"})
             elif kind == "group_create":
                 group_name = packet.get("name")
                 requested = packet.get("members", [])

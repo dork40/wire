@@ -470,6 +470,7 @@ class Wire:
         self.sign_private: Optional[ed25519.Ed25519PrivateKey] = None
         self.sign_public: Optional[bytes] = None
         self.history_key: Optional[bytes] = None
+        self.account_secret: Optional[bytes] = None
         self.history_lock = threading.Lock()
         self.peers: dict[str, Peer] = {}
         self.room: Optional[str] = None
@@ -522,9 +523,10 @@ class Wire:
     def login(self, name: str) -> None:
         users = load_users()
         account = users.get(name.lower())
-        if not account:
-            raise ValueError("no local user with that name")
         password = getpass.getpass("password: ")
+        if not account:
+            account = self.restore_identity(name, password)
+            users = load_users()
         secret = derive(password, unb64(account["salt"]))
         if not hmac.compare_digest(secret, unb64(account["check"])):
             raise ValueError("wrong password")
@@ -546,11 +548,37 @@ class Wire:
         )
         self.sign_public = unb64(account["sign_public"])
         self.history_key = base64.urlsafe_b64encode(secret)
+        self.account_secret = secret
         say(f"signed in as {self.name}")
         try:
             self.connect_server()
         except (OSError, ConnectionError, ValueError) as exc:
             say(f"directory offline ({exc})")
+
+    def restore_identity(self, name: str, password: str) -> dict:
+        """Fetch a password-encrypted identity backup for a fresh computer."""
+        try:
+            saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8")); host, port = saved["host"], int(saved["port"])
+            sock = socket.create_connection((host, port), timeout=10)
+            send_frame(sock, {"type": "identity_fetch", "name": name})
+            reply = recv_frame(sock); sock.close()
+            backup = reply.get("backup") if reply.get("type") == "identity_backup" else None
+            if not isinstance(backup, dict): raise ValueError("no encrypted backup found")
+            secret = derive(password, unb64(backup["salt"]))
+            account = json.loads(Fernet(base64.urlsafe_b64encode(secret)).decrypt(backup["ciphertext"].encode("ascii")).decode("utf-8"))
+            if not isinstance(account, dict) or str(account.get("name", "")).lower() != name.lower(): raise ValueError("backup does not match that username")
+            users = load_users(); users[name.lower()] = account; save_users(users)
+            say("encrypted identity restored to this computer")
+            return account
+        except Exception as exc:
+            raise ValueError("no local user with that name; encrypted restore was unavailable") from exc
+
+    def backup_identity(self) -> None:
+        if not self.name or not self.account_secret: return
+        account = load_users().get(self.name.lower())
+        if not account: return
+        encrypted = Fernet(base64.urlsafe_b64encode(self.account_secret)).encrypt(json.dumps(account, separators=(",", ":")).encode("utf-8")).decode("ascii")
+        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "ciphertext": encrypted}})
 
     def require_login(self) -> None:
         if not self.private or not self.public or not self.sign_private or not self.sign_public or not self.name:
@@ -1611,6 +1639,7 @@ class Wire:
             DATA.mkdir(exist_ok=True)
             SERVER_CONFIG.write_text(json.dumps({"host": host, "port": port}), encoding="utf-8")
             threading.Thread(target=self.server_loop, args=(sock,), daemon=True).start()
+            self.backup_identity()
             version = reply.get("version")
             say(f"username directory online{f' (server {version})' if isinstance(version, str) else ' (old server)' }")
         except Exception:
