@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.6"
+SERVER_VERSION = "1.4.7"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -100,6 +100,7 @@ def group_details(group: dict, users: dict, online: set[str]) -> dict:
     admins = set(group.get("admins", [group.get("owner")]))
     return {
         "name": group["name"], "owner": group["owner"],
+        "pins": [item for item in group.get("pins", []) if isinstance(item, str)][:50],
         "members": [{"name": users[item]["name"], "public": users[item]["public"], "online": item in online,
                      "role": "owner" if item == group["owner"] else ("admin" if item in admins else "member")} for item in member_keys],
     }
@@ -246,7 +247,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         send(sock, {"type": "error", "message": "that group already exists"})
                         continue
                     members = list(dict.fromkeys([key] + [item for item in requested_keys if item in users]))
-                    groups[group_key] = {"name": group_name, "owner": key, "admins": [key], "members": members, "invites": []}
+                    groups[group_key] = {"name": group_name, "owner": key, "admins": [key], "members": members, "invites": [], "pins": []}
                     save_groups(groups)
                     detail = group_details(groups[group_key], users, set(ONLINE))
                 for member_key in members:
@@ -330,6 +331,17 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         group["admins"] = list(dict.fromkeys([group["owner"]] + [item for item in group.get("admins", []) if item in group["members"]]))
                     save_groups(groups)
                 send(sock, {"type": "group_left", "group": group_key})
+            elif kind in ("group_pin", "group_unpin"):
+                group_key, message_id = str(packet.get("group", "")).lower(), packet.get("id")
+                with LOCK:
+                    users, groups = load_users(), load_groups(); group = groups.get(group_key)
+                    if not group or key not in group.get("admins", [group.get("owner")]) or not isinstance(message_id, str) or not 6 <= len(message_id) <= 64:
+                        send(sock, {"type": "error", "message": "group pin was rejected"}); continue
+                    pins = group.setdefault("pins", [])
+                    if kind == "group_pin" and message_id not in pins: pins.append(message_id)
+                    if kind == "group_unpin": group["pins"] = [item for item in pins if item != message_id]
+                    group["pins"] = group.get("pins", [])[-50:]; save_groups(groups); detail = group_details(group, users, set(ONLINE))
+                for member_key in group["members"]: deliver(member_key, {"type": "group_list", "groups": [detail]})
             elif kind == "group_send":
                 group_key, packets = str(packet.get("group", "")).lower(), packet.get("packets")
                 with LOCK:

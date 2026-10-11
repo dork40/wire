@@ -963,6 +963,10 @@ class Wire:
             suffix += f"  reply:{str(record['reply_to'])[:6]}"
         if record.get("edited"):
             suffix += "  edited"
+        if record.get("read"):
+            suffix += "  read"
+        elif record.get("delivered"):
+            suffix += "  delivered"
         reactions = record.get("reactions", [])
         if reactions:
             suffix += "  " + " ".join(str(item) for item in reactions[:12])
@@ -1790,7 +1794,7 @@ class Wire:
                 if control.get("kind") == "webrtc_answer" and isinstance(control.get("answer"), dict):
                     media = self.webrtc_shares.get(str(control.get("id", "")))
                     if media: media.call(media.remote(control["answer"]))
-                elif control.get("kind") in ("message_react", "message_edit", "message_delete"):
+                elif control.get("kind") in ("message_react", "message_edit", "message_delete", "message_delivered", "message_read"):
                     self.apply_message_control(peer, control)
             except Exception: pass
             return
@@ -1810,6 +1814,10 @@ class Wire:
         message_id = packet.get("id") if isinstance(packet.get("id"), str) and len(packet["id"]) <= 64 else uuid.uuid4().hex
         reply_to = packet.get("reply_to") if isinstance(packet.get("reply_to"), str) else None
         self.record_history(peer.name, peer.name, text, message_id, reply_to)
+        peer.send_control({"kind": "message_delivered", "id": message_id})
+        # Wire renders incoming room messages immediately, so that is the
+        # honest moment to acknowledge them as read.
+        peer.send_control({"kind": "message_read", "id": message_id})
         say(f"\n{self.render_record({'id': message_id, 'from': peer.name, 'text': text, 'reply_to': reply_to})}")
         redraw_prompt()
         if self.settings["notifications"]:
@@ -1824,6 +1832,13 @@ class Wire:
         if not target:
             return
         kind = control["kind"]
+        if kind in ("message_delivered", "message_read"):
+            if target.get("from") != self.name:
+                return
+            target["delivered"] = True
+            if kind == "message_read": target["read"] = True
+            self.save_history(peer.name, records)
+            return
         if kind == "message_react" and isinstance(control.get("reaction"), str):
             reaction = control["reaction"]
             token = f"{peer.name}:{reaction}"
@@ -1941,6 +1956,7 @@ class Wire:
         if not group:
             raise ValueError("unknown group; use group list first")
         packets: dict[str, dict] = {}
+        message_id = uuid.uuid4().hex
         for member in group.get("members", []):
             name, public = member.get("name"), member.get("public")
             if not isinstance(name, str) or not isinstance(public, str) or name.lower() == self.name.lower():
@@ -1948,9 +1964,9 @@ class Wire:
             peer = self.relay_peer(name, public)
             nonce = os.urandom(12)
             data = AESGCM(peer.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
-            packets[name.lower()] = {"type": "msg", "nonce": b64(nonce), "data": b64(data)}
+            packets[name.lower()] = {"type": "msg", "id": message_id, "nonce": b64(nonce), "data": b64(data)}
         self.server_send({"type": "group_send", "group": group["name"], "packets": packets})
-        self.record_history(f"group-{group['name']}", self.name or "me", text)
+        self.record_history(f"group-{group['name']}", self.name or "me", text, message_id)
 
     def handle_group_message(self, packet: dict) -> None:
         group, sender, public, encrypted = packet.get("group"), packet.get("from"), packet.get("public"), packet.get("packet")
@@ -1963,11 +1979,34 @@ class Wire:
             text = AESGCM(peer.key).decrypt(unb64(encrypted["nonce"]), unb64(encrypted["data"]), b"wire-v1-message").decode("utf-8")
         except Exception:
             return
-        self.record_history(f"group-{group}", sender, text)
-        say(f"\n[{group}] {sender} > {text}")
+        message_id = encrypted.get("id") if isinstance(encrypted.get("id"), str) else uuid.uuid4().hex
+        self.record_history(f"group-{group}", sender, text, message_id)
+        say(f"\n[{group}] {sender} > {text}  ({message_id[:6]})")
         redraw_prompt()
         if self.settings["notifications"]:
             toast(f"new group message in {group} from {sender}")
+
+    def group_pin(self, group_name: str, prefix: str, remove: bool = False) -> None:
+        group = self.groups.get(group_name.lower())
+        if not group:
+            raise ValueError("unknown group; use /group list first")
+        records, target = self.matching_message(f"group-{group['name']}", prefix)
+        self.server_send({"type": "group_unpin" if remove else "group_pin", "group": group["name"], "id": target["id"]})
+
+    def show_group_pins(self, group_name: str) -> None:
+        group = self.groups.get(group_name.lower())
+        if not group:
+            raise ValueError("unknown group; use /group list first")
+        records = self.read_history(f"group-{group['name']}")
+        by_id = {record.get("id"): record for record in records}
+        pins = group.get("pins", [])
+        if not pins:
+            say("no pinned messages")
+            return
+        say(f"PINS — {group['name']}")
+        for message_id in pins:
+            record = by_id.get(message_id)
+            say(self.render_record(record) if record else f"({str(message_id)[:6]}) message is not in local history")
 
     def server_loop(self, sock: socket.socket) -> None:
         try:
@@ -2212,7 +2251,7 @@ IN A ROOM: type normally.
 /reply <message-code> <text>  /react <message-code> <emoji>
 /edit <message-code> <text>  /delete <message-code>
 /share  /share accept|decline <code>  /share stop|stats
-/group create <name> <people...>  /group list|open|invite|accept|kick|admin|leave
+/group create <name> <people...>  /group list|open|invite|accept|kick|admin|pin|leave
 /call  /acceptcall <name>  /declinecall <name>  /hangup
 /settings = settings list; arrows change options
 /ping  /update  /help  /leave  /exit"""
@@ -2337,10 +2376,14 @@ def main() -> None:
                         app.server_send({"type": "group_kick", "group": pieces[1], "member": pieces[2]})
                     elif pieces[0] in ("admin", "member") and len(pieces) == 3:
                         app.server_send({"type": "group_admin", "group": pieces[1], "member": pieces[2], "enabled": pieces[0] == "admin"})
+                    elif pieces[0] in ("pin", "unpin") and len(pieces) == 3:
+                        app.group_pin(pieces[1], pieces[2], remove=pieces[0] == "unpin")
+                    elif pieces[0] == "pins" and len(pieces) == 2:
+                        app.show_group_pins(pieces[1])
                     elif pieces[0] == "leave" and len(pieces) == 2:
                         app.server_send({"type": "group_leave", "group": pieces[1]})
                     else:
-                        raise ValueError("use: /group create <name> <people...> | list | open <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | leave <name>")
+                        raise ValueError("use: /group create <name> <people...> | list | open <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | leave <name>")
                 elif command == "send":
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
