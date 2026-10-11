@@ -23,13 +23,14 @@ and an X11 backend where applicable.
 
 ## Start
 
-For a local test, open one Command Prompt and run:
+Open Command Prompt and run:
 
 ```cmd
-wire-server
+wire
 ```
 
-Then open another Command Prompt, run `wire`, create a user with `signup kai`, and sign in using `login kai`.
+Wire automatically starts its bundled local directory when one is not already
+running. Create an account with `signup kai`, then sign in using `login kai`.
 
 ## Commands
 
