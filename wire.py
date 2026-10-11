@@ -1765,7 +1765,7 @@ class Wire:
         if not isinstance(message_id, str):
             return
         records = self.read_history(peer.name)
-        target = next((record for record in records if record.get("id") == message_id and record.get("from") == peer.name), None)
+        target = next((record for record in records if record.get("id") == message_id), None)
         if not target:
             return
         kind = control["kind"]
@@ -1774,10 +1774,10 @@ class Wire:
             token = f"{peer.name}:{reaction}"
             target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{peer.name}:")] + [token]
             say(f"\n{peer.name} reacted {reaction} to {message_id[:6]}")
-        elif kind == "message_edit" and isinstance(control.get("text"), str):
+        elif kind == "message_edit" and target.get("from") == peer.name and isinstance(control.get("text"), str):
             target["text"], target["edited"] = control["text"], True
             say(f"\n{peer.name} edited message {message_id[:6]}")
-        elif kind == "message_delete":
+        elif kind == "message_delete" and target.get("from") == peer.name:
             target["deleted"], target["text"] = True, ""
             say(f"\n{peer.name} deleted message {message_id[:6]}")
         else:
