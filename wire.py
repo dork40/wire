@@ -66,6 +66,8 @@ except ImportError:
 
 APP = "wire"
 PORT = 46565
+DEFAULT_DIRECTORY_HOST = "wirecmd.ddns.net"
+DEFAULT_DIRECTORY_PORT = 47666
 # Account data must never live beside a versioned package/executable.  Updates,
 # pipx environments and portable builds can be replaced without losing users.
 if os.name == "nt":
@@ -623,7 +625,10 @@ class Wire:
     def restore_identity(self, name: str, password: str) -> dict:
         """Fetch a password-encrypted identity backup for a fresh computer."""
         try:
-            saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8")); host, port = saved["host"], int(saved["port"])
+            try:
+                saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8")); host, port = saved["host"], int(saved["port"])
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
             sock = socket.create_connection((host, port), timeout=10)
             send_frame(sock, {"type": "identity_fetch", "name": name})
             reply = recv_frame(sock); sock.close()
@@ -1980,8 +1985,8 @@ class Wire:
                 saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
                 host, port = saved["host"], int(saved["port"])
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                host, port = "127.0.0.1", 47666
-        port = port or 47666
+                host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
+        port = port or DEFAULT_DIRECTORY_PORT
         if self.server:
             self.server.close()
             self.server = None

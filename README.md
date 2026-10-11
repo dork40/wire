@@ -27,6 +27,8 @@ implemented; it will need a PipeWire/XDG Desktop Portal backend for Wayland
 and an X11 backend where applicable.
 
 `wire` is a command-line encrypted chat with usernames and rooms.
+New installs automatically connect to the Wire username directory at
+`wirecmd.ddns.net`; no IP address or server command is needed for normal use.
 
 ## Start
 
