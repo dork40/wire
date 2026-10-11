@@ -549,6 +549,8 @@ class Wire:
         self.share_viewers: dict[str, mp.Process] = {}
         self.groups: dict[str, dict] = {}
         self.group_invites: dict[str, str] = {}
+        self.typing_until: dict[str, float] = {}
+        self.last_typing_sent = 0.0
         self.group_room: Optional[str] = None
         self.settings = load_settings()
 
@@ -1024,6 +1026,13 @@ class Wire:
         message_id = uuid.uuid4().hex
         peer.send(text, message_id, reply_to)
         self.record_history(peer.name, self.name or "me", text, message_id, reply_to)
+
+    def send_typing(self) -> None:
+        peer = self.peers.get(self.room or "")
+        now = time.monotonic()
+        if peer and now - self.last_typing_sent >= 2:
+            peer.send_control({"kind": "typing"})
+            self.last_typing_sent = now
 
     def reply_message(self, peer: Peer, prefix: str, text: str) -> None:
         _, target = self.matching_message(peer.name, prefix)
@@ -1815,6 +1824,13 @@ class Wire:
                     if media: media.call(media.remote(control["answer"]))
                 elif control.get("kind") in ("message_react", "message_edit", "message_delete", "message_delivered", "message_read"):
                     self.apply_message_control(peer, control)
+                elif control.get("kind") == "typing":
+                    now = time.monotonic()
+                    was_typing = self.typing_until.get(peer.name.lower(), 0) > now
+                    self.typing_until[peer.name.lower()] = now + 3
+                    if not was_typing:
+                        say(f"\n{peer.name} is typing...")
+                        redraw_prompt()
             except Exception: pass
             return
         if packet.get("type") == "image":
@@ -2026,6 +2042,13 @@ class Wire:
         for message_id in pins:
             record = by_id.get(message_id)
             say(self.render_record(record) if record else f"({str(message_id)[:6]}) message is not in local history")
+
+    def jump_group_message(self, group_name: str, prefix: str) -> None:
+        group = self.groups.get(group_name.lower())
+        if not group:
+            raise ValueError("unknown group; use /group list first")
+        _, record = self.matching_message(f"group-{group['name']}", prefix)
+        say(self.render_record(record))
 
     def server_loop(self, sock: socket.socket) -> None:
         try:
@@ -2270,7 +2293,7 @@ IN A ROOM: type normally.
 /reply <message-code> <text>  /react <message-code> <emoji>
 /edit <message-code> <text>  /delete <message-code>
 /share  /share accept|decline <code>  /share stop|stats
-/group create <name> <people...>  /group list|open|invite|accept|kick|admin|pin|leave
+/group create <name> <people...>  /group list|open|invite|accept|kick|admin|pin|jump|leave
 /call  /acceptcall <name>  /declinecall <name>  /hangup
 /settings = settings list; arrows change options
 /ping  /testnotify  /update  /help  /leave  /exit"""
@@ -2293,6 +2316,13 @@ def main() -> None:
         session = None
     global SAFE_PROMPT_ACTIVE
     SAFE_PROMPT_ACTIVE = session is not None
+    if session:
+        def announce_typing(_buffer: object) -> None:
+            try:
+                app.send_typing()
+            except (OSError, ConnectionError):
+                pass
+        session.default_buffer.on_text_changed += announce_typing
     try:
         while True:
             try:
@@ -2399,10 +2429,12 @@ def main() -> None:
                         app.group_pin(pieces[1], pieces[2], remove=pieces[0] == "unpin")
                     elif pieces[0] == "pins" and len(pieces) == 2:
                         app.show_group_pins(pieces[1])
+                    elif pieces[0] == "jump" and len(pieces) == 3:
+                        app.jump_group_message(pieces[1], pieces[2])
                     elif pieces[0] == "leave" and len(pieces) == 2:
                         app.server_send({"type": "group_leave", "group": pieces[1]})
                     else:
-                        raise ValueError("use: /group create <name> <people...> | list | open <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | leave <name>")
+                        raise ValueError("use: /group create <name> <people...> | list | open <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | jump <name> <message-code> | leave <name>")
                 elif command == "send":
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
