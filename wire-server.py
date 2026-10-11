@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.10"
+SERVER_VERSION = "1.4.14"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -207,7 +207,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             return
         with LOCK:
             users = load_users()
-            users[key] = {"name": name, "public": public, "sign_public": sign_public}
+            previous = users.get(key, {})
+            users[key] = {"name": name, "public": public, "sign_public": sign_public,
+                          "allow_group_invites": bool(previous.get("allow_group_invites", True)),
+                          "dnd": bool(previous.get("dnd", False)),
+                          "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
+                          "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
             save_users(users)
             ONLINE[key] = (name, sock, public, address[0])
             queues = load_queues()
@@ -258,8 +263,65 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     if item in users
                 ]
                 send(sock, {"type": "status", "users": matches})
+            elif kind == "friends_list":
+                with LOCK:
+                    users = load_users(); account = users.get(key, {})
+                    friends = [item for item in account.get("friends", []) if item in users]
+                    matches = [{"name": users[item]["name"], "online": item in ONLINE,
+                                "dnd": bool(users[item].get("dnd", False))} for item in friends]
+                    requests = [users[item]["name"] for item in account.get("friend_requests", []) if item in users]
+                send(sock, {"type": "friends", "users": matches, "requests": requests})
+            elif kind == "friend_request":
+                target = str(packet.get("to", "")).lower()
+                with LOCK:
+                    users = load_users()
+                    if target not in users or target == key:
+                        send(sock, {"type": "error", "message": "that username cannot be added"}); continue
+                    if target in users[key].get("friends", []):
+                        send(sock, {"type": "error", "message": "that person is already your friend"}); continue
+                    requests = users[target].setdefault("friend_requests", [])
+                    if key not in requests: requests.append(key); save_users(users)
+                deliver_or_queue(target, {"type": "friend_request", "from": name})
+                send(sock, {"type": "friend_request_sent", "to": users[target]["name"]})
+            elif kind in ("friend_accept", "friend_decline"):
+                target = str(packet.get("from", "")).lower()
+                with LOCK:
+                    users = load_users()
+                    if target not in users or target not in users[key].get("friend_requests", []):
+                        send(sock, {"type": "error", "message": "no pending friend request from that person"}); continue
+                    users[key]["friend_requests"] = [item for item in users[key]["friend_requests"] if item != target]
+                    accepted = kind == "friend_accept"
+                    if accepted:
+                        for left, right in ((key, target), (target, key)):
+                            friends = users[left].setdefault("friends", [])
+                            if right not in friends: friends.append(right)
+                    save_users(users)
+                if accepted:
+                    deliver_or_queue(target, {"type": "friend_added", "name": name})
+                    send(sock, {"type": "friend_added", "name": users[target]["name"]})
+                else:
+                    send(sock, {"type": "friend_declined", "name": users[target]["name"]})
+            elif kind == "friend_remove":
+                target = str(packet.get("name", "")).lower()
+                with LOCK:
+                    users = load_users()
+                    if target not in users or target not in users[key].get("friends", []):
+                        send(sock, {"type": "error", "message": "that person is not your friend"}); continue
+                    users[key]["friends"] = [item for item in users[key]["friends"] if item != target]
+                    users[target]["friends"] = [item for item in users[target].get("friends", []) if item != key]
+                    save_users(users)
+                deliver_or_queue(target, {"type": "friend_removed", "name": name})
+                send(sock, {"type": "friend_removed", "name": users[target]["name"]})
             elif kind == "ping":
                 send(sock, {"type": "pong", "id": packet.get("id", "")})
+            elif kind == "preferences":
+                with LOCK:
+                    users = load_users()
+                    account = users.get(key)
+                    if account is not None:
+                        account["allow_group_invites"] = bool(packet.get("allow_group_invites", True))
+                        account["dnd"] = bool(packet.get("dnd", False))
+                        save_users(users)
             elif kind == "identity_backup":
                 backup = packet.get("backup")
                 if not isinstance(backup, dict) or not isinstance(backup.get("salt"), str) or not isinstance(backup.get("ciphertext"), str) or len(json.dumps(backup)) > 20000:
@@ -317,6 +379,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         send(sock, {"type": "error", "message": "group invite was rejected"}); continue
                     if member in group.get("members", []):
                         send(sock, {"type": "error", "message": "that person is already in the group"}); continue
+                    if not bool(users[member].get("allow_group_invites", True)):
+                        send(sock, {"type": "error", "message": "that person does not allow group invites"}); continue
                     group.setdefault("invites", [])
                     if member not in group["invites"]: group["invites"].append(member); save_groups(groups)
                     inviter = name

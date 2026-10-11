@@ -140,9 +140,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_latency": saved.get("stream_latency", "low")}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_latency": saved.get("stream_latency", "low")}
     except Exception:
-        return {"notifications": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_latency": "low"}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_latency": "low"}
 
 
 def save_settings(settings: dict) -> None:
@@ -741,16 +741,14 @@ class Wire:
         return any(item.lower() == username.lower() for item in self.contacts()["blocked"])
 
     def show_friends(self) -> None:
-        friends = self.contacts()["friends"]
-        if not friends:
-            say("no friends yet; use friend add <username>")
-            return
-        self.server_send({"type": "status", "users": friends})
+        self.server_send({"type": "friends_list"})
 
     def show_settings(self) -> None:
         say("WIRE SETTINGS")
         say("Use /settings on Windows for the arrow-key menu. Changes save automatically.")
         say(f"notifications: {'on' if self.settings['notifications'] else 'off'}")
+        say(f"do not disturb: {'on' if self.settings['do_not_disturb'] else 'off'}")
+        say(f"allow group invites: {'on' if self.settings['allow_group_invites'] else 'off'}")
         say(f"voice activation: {'always on' if self.settings['voice_mode'] == 'open' else 'hold F12 to talk'}")
         say(f"echo cancellation: {'on' if self.settings['voice_echo'] else 'off'}")
         say(f"noise removal: {('off', 'light', 'normal', 'strong')[self.settings['voice_noise']]}")
@@ -762,6 +760,15 @@ class Wire:
         say(f"screen codec: {self.settings['stream_codec']}; hardware acceleration: {'on' if self.settings['stream_hardware'] else 'off'}; latency: {self.settings['stream_latency']}")
         say(f"WebRTC: {'available' if caps['webrtc'] else 'not installed'}; available codecs: {', '.join(caps['codecs']) or 'none'}")
         say("images: ask before download")
+
+    def sync_preferences(self) -> None:
+        """Tell the authenticated directory only the two server-enforced preferences."""
+        if self.server:
+            self.server_send({"type": "preferences", "dnd": self.settings["do_not_disturb"],
+                              "allow_group_invites": self.settings["allow_group_invites"]})
+
+    def notifications_allowed(self) -> bool:
+        return bool(self.settings["notifications"] and not self.settings["do_not_disturb"])
 
     def apply_voice_settings(self) -> None:
         for call in list(self.calls.values()):
@@ -793,6 +800,8 @@ class Wire:
             output_name = next((name for index, name in outputs if index == output_id), "Windows default")
             rows = [
                 ("Notifications", "On" if self.settings["notifications"] else "Off"),
+                ("Do Not Disturb", "On" if self.settings["do_not_disturb"] else "Off"),
+                ("Allow group invites", "On" if self.settings["allow_group_invites"] else "Off"),
                 ("Voice activation", "Always on" if self.settings["voice_mode"] == "open" else "Push-to-talk (F12)"),
                 ("Echo cancellation", "On" if self.settings["voice_echo"] else "Off"),
                 ("Noise removal", ("Off", "Light", "Normal", "Strong")[self.settings["voice_noise"]]),
@@ -811,6 +820,8 @@ class Wire:
             ]
             hints = [
                 "Windows notifications appear only while Wire is not the active window.",
+                "Suppresses Wire notifications and tells the directory you are unavailable.",
+                "When off, the directory rejects new group invitations for you.",
                 "Always on sends audio continuously; push-to-talk uses F12.",
                 "Applies to your next and current voice calls.",
                 "Higher noise removal can use more CPU.",
@@ -846,42 +857,47 @@ class Wire:
                     if selected == 0:
                         self.settings["notifications"] = not self.settings["notifications"]
                     elif selected == 1:
-                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
+                        self.settings["do_not_disturb"] = not self.settings["do_not_disturb"]
                     elif selected == 2:
-                        self.settings["voice_echo"] = not self.settings["voice_echo"]
+                        self.settings["allow_group_invites"] = not self.settings["allow_group_invites"]
                     elif selected == 3:
-                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
                     elif selected == 4:
+                        self.settings["voice_echo"] = not self.settings["voice_echo"]
+                    elif selected == 5:
+                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                    elif selected == 6:
                         self.settings["voice_gain"] = not self.settings["voice_gain"]
-                    elif selected in (5, 6):
-                        choices = inputs if selected == 5 else outputs
-                        setting = "voice_input" if selected == 5 else "voice_output"
+                    elif selected in (7, 8):
+                        choices = inputs if selected == 7 else outputs
+                        setting = "voice_input" if selected == 7 else "voice_output"
                         if choices:
                             current = self.settings.get(setting)
                             position = next((i for i, (device_id, _) in enumerate(choices) if device_id == current), -1)
                             self.settings[setting] = choices[(position + direction) % len(choices)][0]
-                    elif selected == 7:
-                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
-                    elif selected == 8:
-                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 9:
-                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 10:
-                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 11:
+                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                    elif selected == 12:
+                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                    elif selected == 13:
                         options = list(STREAM_PROFILES)
                         self.settings["stream_profile"] = options[(options.index(self.settings["stream_profile"]) + direction) % len(options)]
                         apply_stream_profile(self.settings)
-                    elif selected == 12:
+                    elif selected == 14:
                         options = ["auto", "H264", "VP8", "VP9", "AV1", "HEVC"]
                         self.settings["stream_codec"] = options[(options.index(self.settings["stream_codec"]) + direction) % len(options)]
-                    elif selected == 13:
+                    elif selected == 15:
                         self.settings["stream_hardware"] = not self.settings["stream_hardware"]
-                    elif selected == 14:
+                    elif selected == 16:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
                     self.apply_voice_settings()
-            elif key in ("\r", "\x1b") and selected == 15:
+                    self.sync_preferences()
+            elif key in ("\r", "\x1b") and selected == 17:
                 print()
                 return
             elif key == "\x1b":
@@ -1711,6 +1727,16 @@ class Wire:
         peer.send_image_frame({"kind": "offer", "id": image_id, "name": path.name, "size": size, "sha256": digest})
         say(f"image offer sent: {path.name} (waiting for them to accept)")
 
+    def send_attachment(self, peer: Peer, value: str) -> None:
+        """Use one send command: image flow for images, file flow for everything else."""
+        path = Path(value.strip().strip('"')).expanduser()
+        if not path.exists():
+            raise ValueError(f"file or folder not found: {path}")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+            self.send_image(peer, value)
+        else:
+            self.send_file(peer, value)
+
     def transfer_image(self, peer: Peer, image_id: str) -> None:
         state = self.outgoing_images.pop(image_id, None)
         if not state:
@@ -1891,7 +1917,7 @@ class Wire:
         peer.send_control({"kind": "message_read", "id": message_id})
         say(f"\n{self.render_record({'id': message_id, 'from': peer.name, 'text': text, 'reply_to': reply_to})}")
         redraw_prompt()
-        if self.settings["notifications"]:
+        if self.notifications_allowed():
             toast(f"new message from {peer.name}")
 
     def apply_message_control(self, peer: Peer, control: dict) -> None:
@@ -1973,6 +1999,7 @@ class Wire:
             DATA.mkdir(exist_ok=True)
             SERVER_CONFIG.write_text(json.dumps({"host": host, "port": port}), encoding="utf-8")
             threading.Thread(target=self.server_loop, args=(sock,), daemon=True).start()
+            self.sync_preferences()
             self.backup_identity()
             version = reply.get("version")
             say(f"username directory online{f' (server {version})' if isinstance(version, str) else ' (old server)' }")
@@ -2054,7 +2081,7 @@ class Wire:
         self.record_history(f"group-{group}", sender, text, message_id)
         say(f"\n[{group}] {sender} > {text}")
         redraw_prompt()
-        if self.settings["notifications"]:
+        if self.notifications_allowed():
             toast(f"new group message in {group} from {sender}")
 
     def group_pin(self, group_name: str, prefix: str, remove: bool = False) -> None:
@@ -2115,6 +2142,31 @@ class Wire:
                     for user in users:
                         marker = "online" if user.get("online") else "offline"
                         say(f"{user.get('name', '?')}  [{marker}]")
+                elif kind == "friends":
+                    users = packet.get("users", [])
+                    requests = packet.get("requests", [])
+                    say("\nFRIENDS")
+                    if not users:
+                        say("no friends yet; use /friend add <username>")
+                    for user in users:
+                        marker = "online" if user.get("online") else "offline"
+                        dnd = "; do not disturb" if user.get("dnd") else ""
+                        say(f"{user.get('name', '?')}  [{marker}{dnd}]")
+                    for requester in requests:
+                        say(f"friend request from {requester}: /friend accept {requester} or /friend decline {requester}")
+                elif kind == "friend_request":
+                    requester = packet.get("from")
+                    if isinstance(requester, str):
+                        say(f"\nfriend request from {requester}: /friend accept {requester} or /friend decline {requester}")
+                        redraw_prompt()
+                elif kind == "friend_request_sent":
+                    say(f"friend request sent to {packet.get('to', '?')}")
+                elif kind == "friend_added":
+                    say(f"friends with {packet.get('name', '?')}")
+                elif kind == "friend_declined":
+                    say(f"friend request declined by {packet.get('name', '?')}")
+                elif kind == "friend_removed":
+                    say(f"removed friend: {packet.get('name', '?')}")
                 elif kind == "group_list":
                     self.update_groups(packet.get("groups"))
                     self.show_groups()
@@ -2323,7 +2375,9 @@ ACCOUNT AND PEOPLE
   signup [name] / login [name]       Create or sign in to an account.
   discover [name]                    Find a Wire username.
   open <name> / accept <name>        Open or accept a private chat.
-  friends / friend add|remove <name> Manage friends.
+  friends                             Show friends, online state, and pending requests.
+  friend add|accept|decline|remove <name>
+                                      Send, answer, or remove a friend request.
   block|unblock <name> / blocked     Manage blocked people.
 
 CHAT
@@ -2338,9 +2392,10 @@ CHAT
   /peers                             Show connected people.
 
 FILES AND MEDIA
-  /send <image path>                 Offer an encrypted image.
+  /send <path>                       Send an image, video, file, or folder.
+                                      Images use the image flow; everything else uses file transfer.
   /image accept|decline <code>       Answer an image offer.
-  /sendfile <file-or-folder>         Offer an encrypted file or folder.
+  /sendfile <path>                   Older alias for /send.
   /file accept|decline|resume <code> Answer or resume a file transfer.
   /preview <video path>              Play the first five seconds locally.
   /call / /acceptcall <name> / /declinecall <name> / /hangup
@@ -2357,6 +2412,7 @@ GROUPS
 
 SETTINGS AND UTILITIES
   /settings                          Open the one arrow-key settings menu; changes save automatically.
+                                      Includes Do Not Disturb and Allow group invites.
   /settings delete                   Delete this PC's local account data.
   /identity / /fingerprint <name>    Show safety fingerprints.
   /ping / /testnotify / /update      Connection, notification, and update checks.
@@ -2450,10 +2506,14 @@ def main() -> None:
                     app.show_friends()
                 elif command == "friend":
                     action, username = argument.split(maxsplit=1)
-                    if action not in ("add", "remove"):
-                        raise ValueError("use: friend add <username> or friend remove <username>")
-                    app.edit_contact("friends", username, add=action == "add")
-                    print(f"friend {'added' if action == 'add' else 'removed'}: {username}")
+                    if action == "add":
+                        app.server_send({"type": "friend_request", "to": username})
+                    elif action in ("accept", "decline"):
+                        app.server_send({"type": f"friend_{action}", "from": username})
+                    elif action == "remove":
+                        app.server_send({"type": "friend_remove", "name": username})
+                    else:
+                        raise ValueError("use: /friend add|accept|decline|remove <username>")
                 elif command == "block":
                     app.edit_contact("blocked", argument, add=True)
                     print(f"blocked: {argument}")
@@ -2505,17 +2565,17 @@ def main() -> None:
                 elif command == "send":
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
-                        raise ValueError("open a room before sending an image")
+                        raise ValueError("open a room before sending a file")
                     if not argument:
-                        raise ValueError("use: /send <image path>")
-                    app.send_image(room_peer, argument)
+                        raise ValueError("use: /send <file, image, video, or folder path>")
+                    app.send_attachment(room_peer, argument)
                 elif command == "sendfile":
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
                         raise ValueError("open a room before sending a file")
                     if not argument:
                         raise ValueError("use: /sendfile <file path>")
-                    app.send_file(room_peer, argument)
+                    app.send_attachment(room_peer, argument)
                 elif command in ("reply", "react", "edit", "delete"):
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
