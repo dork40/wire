@@ -9,6 +9,13 @@ package runner. On Windows, from this folder, run:
 irm https://raw.githubusercontent.com/dork40/wire/main/install-wire.ps1 | iex
 ```
 
+From ordinary Command Prompt (`cmd.exe`), use this Windows-built-in command
+instead:
+
+```cmd
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/dork40/wire/main/install-wire.ps1 | iex"
+```
+
 On Linux later, the equivalent is:
 
 ```sh
