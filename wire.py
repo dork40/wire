@@ -293,6 +293,19 @@ def screen_viewer_process(frames: object, title: str) -> None:
     root.protocol("WM_DELETE_WINDOW", close); root.after(15, draw); root.mainloop()
 
 
+def wire_console_is_foreground() -> bool:
+    """True only when the Windows console hosting Wire is the active window."""
+    if os.name != "nt":
+        return False
+    try:
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        return bool(console and ctypes.windll.user32.GetForegroundWindow() == console)
+    except Exception:
+        # If Windows Terminal does not expose a legacy console HWND, prefer a
+        # notification over accidentally hiding every notification.
+        return False
+
+
 def toast(text: str) -> None:
     """Show a Windows notification without needing a packaged-app AUMID.
 
@@ -300,7 +313,7 @@ def toast(text: str) -> None:
     apps because Windows has no Start-menu registration for their app identity.
     A short-lived tray icon is reliable for a `wire` command installed by pipx.
     """
-    if os.name != "nt":
+    if os.name != "nt" or wire_console_is_foreground():
         return
     encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
     script = (
