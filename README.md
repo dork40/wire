@@ -38,6 +38,8 @@ wire
 
 Wire automatically starts its bundled local directory when one is not already
 running. Create an account with `signup kai`, then sign in using `login kai`.
+It checks for a newer release in the background at startup; use `/update` to
+show the result manually.
 
 ## Commands
 
@@ -47,6 +49,10 @@ accept <username>                 accept their room request
 ```
 
 When the other person accepts, a room opens automatically. Type normally; every line is sent as a message. Use `/help`, `/leave`, and `/exit` while in a room.
+
+During a screen share, `/share stats` shows measured capture, encode, receive,
+bitrate, packet-loss, and RTT data. `/share stop` tells the other Wire client to
+close the viewer as well.
 
 The directory address is saved after `server <host> [port]` is used once. In a normal release, the official directory address would be built in, so chat users never need to enter an IP address.
 

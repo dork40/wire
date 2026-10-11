@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.0"
+SERVER_VERSION = "1.4.1"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -321,6 +321,10 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 target = packet.get("to", "").lower()
                 answer = packet.get("answer")
                 if not isinstance(answer, dict) or not deliver(target, {"type": "share_answer", "from": name, "answer": answer}):
+                    send(sock, {"type": "error", "message": "screen-share peer is offline"})
+            elif kind == "share_stop":
+                target, share_id = packet.get("to", "").lower(), packet.get("id")
+                if not isinstance(share_id, str) or not deliver(target, {"type": "share_stop", "from": name, "id": share_id}):
                     send(sock, {"type": "error", "message": "screen-share peer is offline"})
             elif kind == "accept":
                 source = packet.get("from", "").lower()

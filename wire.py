@@ -21,9 +21,11 @@ import shutil
 import sys
 import threading
 import time
+import urllib.request
 import uuid
 import zipfile
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -177,7 +179,41 @@ def wire_version() -> str:
     try:
         return (base / "VERSION.txt").read_text(encoding="utf-8").splitlines()[0]
     except (OSError, IndexError):
-        return "Wire version unknown"
+        # Running from a source checkout is common while developing Wire.
+        # Prefer its declared version over stale editable-install metadata.
+        try:
+            project = (Path(__file__).parent / "pyproject.toml").read_text(encoding="utf-8")
+            return "Wire v" + project.split('version = "', 1)[1].split('"', 1)[0]
+        except (OSError, IndexError):
+            pass
+        try:
+            return f"Wire v{package_version('wire-messenger')}"
+        except PackageNotFoundError:
+            return "Wire version unknown"
+
+
+def version_parts(value: str) -> tuple[int, ...]:
+    return tuple(int(piece) for piece in value.split(".") if piece.isdigit())
+
+
+def check_for_update(quiet: bool = False) -> None:
+    """Check the public source version without delaying the interactive prompt."""
+    try:
+        with urllib.request.urlopen("https://raw.githubusercontent.com/dork40/wire/main/pyproject.toml", timeout=5) as response:
+            remote = response.read().decode("utf-8")
+        marker = 'version = "'
+        latest = remote.split(marker, 1)[1].split('"', 1)[0]
+        current = wire_version().removeprefix("Wire v")
+        if current == "Wire version unknown":
+            if not quiet:
+                say(f"latest Wire version: {latest}")
+        elif version_parts(latest) > version_parts(current):
+            say(f"update available: {current} -> {latest}. Re-run the Wire install command.")
+        elif not quiet:
+            say(f"Wire is up to date ({current})")
+    except Exception as exc:
+        if not quiet:
+            say(f"update check unavailable: {exc}")
 
 
 def send_frame(sock: socket.socket, payload: dict) -> None:
@@ -489,6 +525,7 @@ class Wire:
         self.pending_shares: dict[str, dict] = {}
         self.outgoing_shares: dict[str, dict] = {}
         self.webrtc_shares: dict[str, WebRTCShare] = {}
+        self.share_peers: dict[str, str] = {}
         self.share_viewers: dict[str, mp.Process] = {}
         self.groups: dict[str, dict] = {}
         self.group_room: Optional[str] = None
@@ -579,6 +616,23 @@ class Wire:
         if not account: return
         encrypted = Fernet(base64.urlsafe_b64encode(self.account_secret)).encrypt(json.dumps(account, separators=(",", ":")).encode("utf-8")).decode("ascii")
         self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "ciphertext": encrypted}})
+
+    def show_share_stats(self) -> None:
+        if not self.webrtc_shares:
+            say("no active screen share")
+            return
+        for share_id, media in self.webrtc_shares.items():
+            stats = media.snapshot()
+            bitrate = (stats.get("bitrate_bytes", 0) * 8 / max(1, stats["seconds"]) / 1_000_000)
+            line = (f"share {share_id[:6]}: {stats['state']}; "
+                    f"capture {stats['capture_fps']:.1f} fps ({stats['capture_ms']:.1f} ms); "
+                    f"encode {stats['send_fps']:.1f} fps ({stats['encode_ms']:.1f} ms); "
+                    f"receive {stats['receive_fps']:.1f} fps; {bitrate:.2f} Mbps")
+            if "packets_lost" in stats:
+                line += f"; lost {stats['packets_lost']}"
+            if "rtt_ms" in stats:
+                line += f"; RTT {stats['rtt_ms']} ms"
+            say(line)
 
     def require_login(self) -> None:
         if not self.private or not self.public or not self.sign_private or not self.sign_public or not self.name:
@@ -1135,12 +1189,13 @@ class Wire:
         fps = STREAM_FPS[self.settings["stream_fps"]]
         media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps)
         self.webrtc_shares[share_id] = media
+        self.share_peers[share_id] = peer.name
         try:
             offer = media.call(media.offer()).result(timeout=35); offer["id"] = share_id
             # `port` keeps old Wire directories compatible; WebRTC ignores it.
             self.server_send({"type": "share_offer", "to": peer.name, "port": 1, "offer": offer})
         except Exception:
-            self.webrtc_shares.pop(share_id, None); media.close()
+            self.webrtc_shares.pop(share_id, None); self.share_peers.pop(share_id, None); media.close()
             raise
         say(f"WebRTC screen-share offer sent to {peer.name}; waiting for them to accept")
 
@@ -1218,8 +1273,14 @@ class Wire:
     def stop_screen_share(self) -> None:
         """Cancel an unanswered offer or end an active share immediately."""
         had_webrtc = bool(self.webrtc_shares)
-        for media in list(self.webrtc_shares.values()): media.close()
+        for share_id, media in list(self.webrtc_shares.items()):
+            peer_name = self.share_peers.get(share_id)
+            if peer_name and self.server:
+                try: self.server_send({"type": "share_stop", "to": peer_name, "id": share_id})
+                except (OSError, ConnectionError): pass
+            media.close()
         self.webrtc_shares.clear()
+        self.share_peers.clear()
         for viewer in list(self.share_viewers.values()):
             if viewer.is_alive(): viewer.terminate()
         self.share_viewers.clear()
@@ -1265,6 +1326,7 @@ class Wire:
             if status in ("closed", "failed", "stream ended"): stream_ended.set()
         media = WebRTCShare(lambda _: None, on_frame, on_state, *(offer.get("resolution") or [1280, 720]), int(offer.get("fps", 30)))
         self.webrtc_shares[share_id] = media
+        self.share_peers[share_id] = peer.name
         try:
             answer = media.call(media.answer(offer)).result(timeout=35)
             # Relay the answer end-to-end so the deployed directory never sees SDP
@@ -1278,7 +1340,19 @@ class Wire:
             say(f"screen share failed: {exc}")
         finally:
             self.share_viewers.pop(share_id, None)
+            self.share_peers.pop(share_id, None)
             self.webrtc_shares.pop(share_id, media).close()
+
+    def stop_share_id(self, share_id: str, remote: bool = False) -> None:
+        media = self.webrtc_shares.pop(share_id, None)
+        self.share_peers.pop(share_id, None)
+        viewer = self.share_viewers.pop(share_id, None)
+        if viewer and viewer.is_alive():
+            viewer.terminate(); viewer.join(timeout=2)
+        if media:
+            media.close()
+        if remote:
+            say("screen share ended by the other person")
 
     def share_viewer(self, peer: Peer, state: dict) -> None:
         offer, share_id = state["offer"], state["offer"]["id"]
@@ -1789,6 +1863,12 @@ class Wire:
                     if self.webrtc_shares and isinstance(packet.get("answer"), dict):
                         media = next(iter(self.webrtc_shares.values()))
                         media.call(media.remote(packet["answer"]))
+                elif kind == "share_stop":
+                    share_id = packet.get("id", "")
+                    if isinstance(share_id, str):
+                        self.stop_share_id(share_id, remote=True)
+                elif kind == "identity_backup_saved":
+                    say("encrypted identity backup saved")
                 elif kind == "accepted":
                     self.attach_relay_peer(packet["name"], packet["public"])
                 elif kind == "relay":
@@ -1851,6 +1931,7 @@ class Wire:
         for media in list(self.webrtc_shares.values()):
             media.close()
         self.webrtc_shares.clear()
+        self.share_peers.clear()
         for viewer in list(self.share_viewers.values()):
             if viewer.is_alive(): viewer.terminate()
         self.share_viewers.clear()
@@ -1942,11 +2023,11 @@ IN A ROOM: type normally.
 /send <image>  /image accept|decline <code>
 /sendfile <file-or-folder>  /file accept|decline <code>
 /preview <video> = play first 5 seconds
-/share  /share accept|decline <code>  /share stop
+/share  /share accept|decline <code>  /share stop|stats
 /group create <name> <people...>  /group list|open|add|leave
 /call  /acceptcall <name>  /declinecall <name>  /hangup
 /settings = settings list; arrows change options
-/ping  /help  /leave  /exit"""
+/ping  /update  /help  /leave  /exit"""
 
 
 def main() -> None:
@@ -1954,6 +2035,9 @@ def main() -> None:
     ensure_local_directory()
     app = Wire()
     print(f"wire  {wire_version()}\ntype help")
+    # Do not make startup depend on GitHub being reachable. The background
+    # check reports only a newer version; use /update for its full result.
+    threading.Thread(target=check_for_update, kwargs={"quiet": True}, daemon=True).start()
     # Some Windows launchers provide stdin/stdout but not a full console
     # screen buffer.  prompt_toolkit cannot attach there, so use normal
     # input() rather than crashing before Wire can start.
@@ -2095,12 +2179,16 @@ def main() -> None:
                         app.answer_share_offer(pieces[1], accept=pieces[0] == "accept")
                     elif pieces in (["stop"], ["close"]):
                         app.stop_screen_share()
+                    elif pieces == ["stats"]:
+                        app.show_share_stats()
                     else:
-                        raise ValueError("use: /share | /share accept <code> | /share decline <code> | /share stop")
+                        raise ValueError("use: /share | /share accept|decline <code> | /share stop | /share stats")
                 elif command == "ping":
                     ping_id = uuid.uuid4().hex
                     app.pending_pings[ping_id] = time.monotonic()
                     app.server_send({"type": "ping", "id": ping_id})
+                elif command == "update":
+                    check_for_update()
                 elif command == "image":
                     room_peer = app.peers.get(app.room or "")
                     pieces = argument.split(maxsplit=1)
