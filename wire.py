@@ -140,9 +140,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_latency": saved.get("stream_latency", "low")}
+        return {"notifications": bool(saved.get("notifications", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_latency": saved.get("stream_latency", "low")}
     except Exception:
-        return {"notifications": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_latency": "low"}
+        return {"notifications": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_latency": "low"}
 
 
 def save_settings(settings: dict) -> None:
@@ -733,7 +733,7 @@ class Wire:
         say("voice quality: high (48 kHz)")
         width, height = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         caps = stream_capabilities()
-        say(f"screen share: {self.settings['stream_profile']}; {width}x{height} at {STREAM_FPS[self.settings['stream_fps']]} FPS, {STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps target")
+        say(f"screen share: monitor {self.settings['stream_monitor']}; {self.settings['stream_profile']}; {width}x{height} at {STREAM_FPS[self.settings['stream_fps']]} FPS, {STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps target")
         say(f"screen codec: {self.settings['stream_codec']}; WebRTC: {'available' if caps['webrtc'] else 'not installed'}; codecs: {', '.join(caps['codecs']) or 'none'}")
         say("images: ask before download")
 
@@ -746,6 +746,13 @@ class Wire:
             return []
         channel_key = "max_input_channels" if direction == "input" else "max_output_channels"
         return [(index, str(device["name"])) for index, device in enumerate(sd.query_devices()) if device[channel_key]]
+
+    def monitor_count(self) -> int:
+        try:
+            with mss.mss() as capture:
+                return max(1, len(capture.monitors) - 1)
+        except Exception:
+            return 1
 
     def settings_menu(self) -> None:
         """Small keyboard-only menu for Command Prompt and Windows Terminal."""
@@ -766,6 +773,7 @@ class Wire:
                 ("Auto volume", "On" if self.settings["voice_gain"] else "Off"),
                 ("Microphone (next call)", input_name),
                 ("Speakers (next call)", output_name),
+                ("Share monitor", str(min(self.settings["stream_monitor"], self.monitor_count()))),
                 ("Share resolution", f"{STREAM_RESOLUTIONS[self.settings['stream_resolution']][0]}x{STREAM_RESOLUTIONS[self.settings['stream_resolution']][1]}"),
                 ("Share FPS", str(STREAM_FPS[self.settings["stream_fps"]])),
                 ("Share bitrate", f"{STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps"),
@@ -807,25 +815,27 @@ class Wire:
                             position = next((i for i, (device_id, _) in enumerate(choices) if device_id == current), -1)
                             self.settings[setting] = choices[(position + direction) % len(choices)][0]
                     elif selected == 7:
-                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
+                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 8:
-                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 9:
-                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
                     elif selected == 10:
+                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                    elif selected == 11:
                         options = list(STREAM_PROFILES)
                         self.settings["stream_profile"] = options[(options.index(self.settings["stream_profile"]) + direction) % len(options)]
                         apply_stream_profile(self.settings)
-                    elif selected == 11:
+                    elif selected == 12:
                         options = ["auto", "H264", "VP8", "VP9", "AV1", "HEVC"]
                         self.settings["stream_codec"] = options[(options.index(self.settings["stream_codec"]) + direction) % len(options)]
-                    elif selected == 12:
-                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 13:
+                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
+                    elif selected == 14:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
                     self.apply_voice_settings()
-            elif key in ("\r", "\x1b") and selected == 14:
+            elif key in ("\r", "\x1b") and selected == 15:
                 print()
                 return
             elif key == "\x1b":
@@ -935,6 +945,26 @@ class Wire:
         for record in records[-30:]:
             say(f"{record.get('from', '?')} > {record.get('text', '')}")
         say("-- end earlier messages --")
+
+    def search_history(self, query: str) -> None:
+        """Search locally decrypted history; this never contacts the directory."""
+        self.require_login()
+        query = query.strip().casefold()
+        if not query:
+            raise ValueError("use: /search <words>")
+        found = 0
+        for path in HISTORY_DIR.glob(f"{self.name.lower()}--*.wire"):
+            peer_name = path.stem.split("--", 1)[-1]
+            for record in self.read_history(peer_name):
+                text = str(record.get("text", ""))
+                if query in text.casefold():
+                    say(f"[{peer_name}] {record.get('at', '?')} {record.get('from', '?')} > {text}")
+                    found += 1
+                    if found >= 100:
+                        say("search stopped at 100 results")
+                        return
+        if not found:
+            say("no saved messages match")
 
     def send_message(self, peer: Peer, text: str) -> None:
         peer.send(text)
@@ -1187,7 +1217,7 @@ class Wire:
         share_id = uuid.uuid4().hex
         resolution = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         fps = STREAM_FPS[self.settings["stream_fps"]]
-        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps)
+        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"])
         self.webrtc_shares[share_id] = media
         self.share_peers[share_id] = peer.name
         try:
@@ -2017,7 +2047,7 @@ IN A ROOM
 HELP = """WIRE
 signup/login [name]  discover [name]  open/accept [name]
 friends  friend add/remove [name]  block/unblock [name]  blocked
-history [name]  peers  room [name]  group  leave  settings  identity  exit
+history [name]  search <words>  peers  room [name]  group  leave  settings  identity  exit
 
 IN A ROOM: type normally.
 /send <image>  /image accept|decline <code>
@@ -2123,6 +2153,8 @@ def main() -> None:
                     if not argument:
                         raise ValueError("use: history <username>")
                     app.show_history(argument)
+                elif command == "search":
+                    app.search_history(argument)
                 elif command == "group":
                     pieces = argument.split()
                     if not pieces or pieces[0] == "list":

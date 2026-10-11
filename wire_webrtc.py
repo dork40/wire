@@ -32,16 +32,18 @@ def draw_windows_cursor(frame: np.ndarray, monitor: dict) -> None:
 
 class LatestFrameCapture:
     """One-slot capture queue: slow encoders always receive the newest frame."""
-    def __init__(self, width, height, fps, stats):
+    def __init__(self, width, height, fps, stats, monitor_index=1):
         self.width, self.height, self.fps = width, height, fps
         self.stats = stats
+        self.monitor_index = monitor_index
         self.frame = None; self.lock = threading.Lock(); self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
     def start(self): self.thread.start()
     def _run(self):
         interval = 1 / self.fps
         with mss.mss() as cap:
-            mon = cap.monitors[1]
+            # mss index 0 is the virtual desktop; real displays start at 1.
+            mon = cap.monitors[min(max(1, self.monitor_index), len(cap.monitors) - 1)]
             while not self.stop.is_set():
                 began = time.monotonic()
                 shot = cap.grab(mon)
@@ -108,9 +110,10 @@ class ScreenTrack(VideoStreamTrack):
 
 
 class WebRTCShare:
-    def __init__(self, signal, on_frame, on_state, width, height, fps):
+    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1):
         self.signal, self.on_frame, self.on_state = signal, on_frame, on_state
         self.width, self.height, self.fps = width, height, fps
+        self.monitor_index = monitor_index
         self.loop = asyncio.new_event_loop(); self.pc = None; self.capture = None
         self.stats = ShareStats()
         self.closed = threading.Event(); self.close_lock = threading.Lock()
@@ -141,7 +144,7 @@ class WebRTCShare:
         except (MediaStreamError, asyncio.CancelledError):
             self.on_state("stream ended")
     async def offer(self):
-        pc = await self._pc(); self.capture = LatestFrameCapture(self.width, self.height, self.fps, self.stats); self.capture.start()
+        pc = await self._pc(); self.capture = LatestFrameCapture(self.width, self.height, self.fps, self.stats, self.monitor_index); self.capture.start()
         pc.addTrack(ScreenTrack(self.capture)); offer = await pc.createOffer(); await pc.setLocalDescription(offer)
         return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "resolution": [self.width, self.height], "fps": self.fps}
     async def answer(self, offer):
