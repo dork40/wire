@@ -43,9 +43,13 @@ from wire_webrtc import WebRTCShare
 
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.filters import Condition
+    from prompt_toolkit.layout.containers import ConditionalContainer, Window
+    from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.patch_stdout import patch_stdout
 except ImportError:
     PromptSession = None
+    Condition = ConditionalContainer = Window = FormattedTextControl = None
     patch_stdout = None
 
 try:
@@ -2433,7 +2437,11 @@ def main() -> None:
     # screen buffer.  prompt_toolkit cannot attach there, so use normal
     # input() rather than crashing before Wire can start.
     try:
-        session = PromptSession(bottom_toolbar=app.typing_label) if PromptSession else None
+        typing_toolbar = ConditionalContainer(
+            Window(content=FormattedTextControl(text=app.typing_label), height=1),
+            filter=Condition(lambda: bool(app.room and app.typing_label())),
+        )
+        session = PromptSession(top_toolbar=typing_toolbar) if PromptSession else None
     except Exception:
         session = None
     global SAFE_PROMPT_ACTIVE
