@@ -390,6 +390,8 @@ def start_update_after_exit() -> None:
     script = (
         f"$wirePid = {os.getpid()}; "
         "Wait-Process -Id $wirePid -ErrorAction SilentlyContinue; "
+        "$servers = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '*pipx\\pipx\\venvs\\wire-messenger*' -and $_.CommandLine -match 'wire-server\\.py|wire-server\\.exe' }); "
+        "if ($servers) { $servers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }; "
         f"irm {INSTALL_SCRIPT_URL} | iex; "
         "Write-Host ''; Read-Host 'Update complete. Press Enter to close this window'"
     )
@@ -437,6 +439,17 @@ def ensure_local_directory() -> None:
         time.sleep(0.2)
     except OSError:
         pass
+
+
+def local_directory_requested() -> bool:
+    """Keep the optional local directory from locking the installed updater."""
+    if os.environ.get("WIRE_LOCAL_DIRECTORY") == "1":
+        return True
+    try:
+        saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
+        return str(saved.get("host", "")).lower() in ("localhost", "127.0.0.1", "::1")
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return False
 
 
 def fingerprint(public_key: bytes) -> str:
@@ -2683,7 +2696,8 @@ Typing indicators clear automatically five seconds after typing stops."""
 
 def main() -> None:
     enable_terminal_color()
-    ensure_local_directory()
+    if local_directory_requested():
+        ensure_local_directory()
     app = Wire()
     print(f"wire  {wire_version()}\ntype help")
     # Do not make startup depend on GitHub being reachable. The background
