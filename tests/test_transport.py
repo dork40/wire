@@ -68,6 +68,30 @@ class TransportTests(unittest.TestCase):
          server.MAX_OFFLINE_QUEUE_PACKETS, server.MAX_OFFLINE_QUEUE_BYTES,
          server.RELAY_RATE_BYTES_PER_SECOND, server.RELAY_RATE_BURST_BYTES) = original
 
+    def test_attachment_pacing_reserves_one_shared_budget(self):
+        app = wire.Wire()
+        original_rate, original_monotonic, original_sleep = (
+            wire.RELAY_UPLOAD_BYTES_PER_SECOND, wire.time.monotonic, wire.time.sleep
+        )
+        clock, delays = [100.0], []
+        wire.RELAY_UPLOAD_BYTES_PER_SECOND = 1000
+        wire.time.monotonic = lambda: clock[0]
+
+        def pretend_sleep(delay):
+            delays.append(delay)
+            clock[0] += delay
+
+        wire.time.sleep = pretend_sleep
+        try:
+            app.pace_relay_upload(100)
+            app.pace_relay_upload(100)
+        finally:
+            wire.RELAY_UPLOAD_BYTES_PER_SECOND, wire.time.monotonic, wire.time.sleep = (
+                original_rate, original_monotonic, original_sleep
+            )
+        self.assertEqual(len(delays), 1)
+        self.assertGreater(delays[0], 0)
+
     def test_group_creation_respects_invite_permission(self):
         server = load_server_module()
         original = (server.STATE, server.USERS_FILE, server.GROUPS_FILE, server.QUEUES_FILE)

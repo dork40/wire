@@ -100,6 +100,13 @@ FILE_CHUNK_BYTES = 64 * 1024
 # The directory accepts up to 1 MB frames, but small chunks avoid making text,
 # voice, and control packets wait behind a huge encoded video/file packet.
 RELAY_FILE_CHUNK_BYTES = 24 * 1024
+# The directory deliberately protects itself from a single client flooding the
+# relay.  A file frame grows when it is JSON/base64/AES wrapped, so keep the
+# *raw* attachment stream below the server's 6 MiB/s allowance.  This makes
+# large transfers steady instead of accepting an initial burst and then
+# silently losing chunks to the protection limit.
+RELAY_UPLOAD_BYTES_PER_SECOND = 4 * 1024 * 1024
+RELAY_UPLOAD_EXPANSION = 1.42
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
 TRANSFER_TEMP_DIR = DATA / "transfer-temp"
 STREAM_RESOLUTIONS = [(640, 360), (854, 480), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440), (3840, 2160)]
@@ -285,7 +292,14 @@ def say(text: str) -> None:
                 # context variable.  Set it explicitly so run_in_terminal()
                 # erases and redraws the active prompt instead of printing over it.
                 with set_app(application):
-                    run_in_terminal(lambda: application.print_text(text))
+                    # prompt_toolkit 3 returns an awaitable here.  Calling it
+                    # without scheduling it means background messages only
+                    # appear after the next Enter key, and raw-input fallback
+                    # then exposes arrow-key escape sequences.  Run it on the
+                    # application's own loop so the current input redraws.
+                    application.create_background_task(
+                        run_in_terminal(lambda: application.print_text(text))
+                    )
             except Exception:
                 with PRINT_LOCK:
                     print(text, flush=True)
@@ -637,6 +651,11 @@ class Wire:
         self.listener: Optional[socket.socket] = None
         self.server: Optional[socket.socket] = None
         self.server_lock = threading.Lock()
+        # One paced budget is shared by every attachment worker.  The relay
+        # limits a user, not an individual file, so separate workers must not
+        # each assume they own the full bandwidth allowance.
+        self.relay_upload_lock = threading.Lock()
+        self.relay_next_send_at = 0.0
         self.requests: dict[str, str] = {}
         self.incoming_images: dict[str, dict] = {}
         self.pending_images: dict[str, dict] = {}
@@ -1353,6 +1372,7 @@ class Wire:
             sent, started, last_status = 0, time.monotonic(), 0.0
             with path.open("rb") as handle:
                 while chunk := handle.read(RELAY_FILE_CHUNK_BYTES):
+                    self.pace_relay_upload(len(chunk))
                     peer.send_file_frame({"kind": "chunk", "id": file_id, "data": b64(chunk)})
                     sent += len(chunk)
                     if time.monotonic() - last_status >= 0.5:
@@ -1360,6 +1380,13 @@ class Wire:
                         last_status = time.monotonic()
             peer.send_file_frame({"kind": "end", "id": file_id, "size": sent})
         except Exception as exc:
+            # Tell the receiver to discard the partial file when possible;
+            # otherwise it would wait forever for a checksum that cannot pass.
+            try:
+                self.pace_relay_upload(256)
+                peer.send_control({"kind": "file_relay_abort", "id": file_id})
+            except (OSError, ConnectionError):
+                pass
             say(f"file transfer stopped: {exc}")
             self.outgoing_files.pop(file_id, None)
             if state.get("cleanup"):
@@ -1490,6 +1517,15 @@ class Wire:
             self.incoming_files.pop(file_id, None)
             state["temp"].unlink(missing_ok=True)
             say(f"file transfer failed: {exc}")
+
+    def stop_incoming_file(self, peer: Peer, file_id: str) -> None:
+        """Discard an explicitly aborted partial relay file."""
+        state = self.incoming_files.get(file_id)
+        if not state or state.get("peer") is not peer:
+            return
+        self.incoming_files.pop(file_id, None)
+        state["temp"].unlink(missing_ok=True)
+        say(f"file transfer stopped by {peer.name}")
 
     def resume_file(self, code: str) -> None:
         matches = [key for key in self.paused_files if key.startswith(code.lower())]
@@ -1817,15 +1853,24 @@ class Wire:
         if not state:
             return
         path = state["path"]
-        peer.send_image_frame({"kind": "start", "id": image_id, "name": state["name"], "size": state["size"], "sha256": state["sha256"]})
-        with path.open("rb") as handle:
-            index = 0
-            while chunk := handle.read(IMAGE_CHUNK_BYTES):
-                peer.send_image_frame({"kind": "chunk", "id": image_id, "index": index, "data": b64(chunk)})
-                index += 1
-        peer.send_image_frame({"kind": "end", "id": image_id})
-        say(f"sent image: {path.name}")
-        self.preview_image(path)
+        try:
+            peer.send_image_frame({"kind": "start", "id": image_id, "name": state["name"], "size": state["size"], "sha256": state["sha256"]})
+            with path.open("rb") as handle:
+                index = 0
+                while chunk := handle.read(IMAGE_CHUNK_BYTES):
+                    self.pace_relay_upload(len(chunk))
+                    peer.send_image_frame({"kind": "chunk", "id": image_id, "index": index, "data": b64(chunk)})
+                    index += 1
+            peer.send_image_frame({"kind": "end", "id": image_id})
+            say(f"sent image: {path.name}")
+            self.preview_image(path)
+        except Exception as exc:
+            try:
+                self.pace_relay_upload(256)
+                peer.send_control({"kind": "image_abort", "id": image_id})
+            except (OSError, ConnectionError):
+                pass
+            say(f"image transfer stopped: {exc}")
 
     def answer_image_offer(self, peer: Peer, image_id: str, accept: bool) -> None:
         matches = [key for key in self.pending_images if key.startswith(image_id.lower())]
@@ -1897,6 +1942,14 @@ class Wire:
             say(f"\nimage received: {state['path'].name}")
             self.preview_image(state["path"])
             toast(f"image received from {peer.name}")
+
+    def stop_incoming_image(self, peer: Peer, image_id: str) -> None:
+        state = self.incoming_images.get(image_id)
+        if not state:
+            return
+        self.incoming_images.pop(image_id, None)
+        state["temp"].unlink(missing_ok=True)
+        say(f"image transfer stopped by {peer.name}")
 
     def start_call(self, peer: Peer) -> None:
         if peer.name.lower() in self.calls:
@@ -1986,6 +2039,14 @@ class Wire:
                     if state:
                         if state.get("cleanup"): state["path"].unlink(missing_ok=True)
                         say(f"file sent and verified: {state['path'].name}")
+                elif control.get("kind") == "file_relay_abort":
+                    file_id = control.get("id")
+                    if isinstance(file_id, str):
+                        self.stop_incoming_file(peer, file_id)
+                elif control.get("kind") == "image_abort":
+                    image_id = control.get("id")
+                    if isinstance(image_id, str):
+                        self.stop_incoming_image(peer, image_id)
                 elif control.get("kind") == "typing":
                     now = time.monotonic()
                     name = peer.name.lower()
@@ -2127,6 +2188,18 @@ class Wire:
             raise ConnectionError("username directory is offline")
         with self.server_lock:
             send_frame(self.server, packet)
+
+    def pace_relay_upload(self, raw_bytes: int) -> None:
+        """Reserve relay bandwidth before sending an encrypted attachment frame."""
+        expanded = max(1, int(raw_bytes * RELAY_UPLOAD_EXPANSION) + 256)
+        duration = expanded / RELAY_UPLOAD_BYTES_PER_SECOND
+        with self.relay_upload_lock:
+            now = time.monotonic()
+            scheduled = max(now, self.relay_next_send_at)
+            self.relay_next_send_at = scheduled + duration
+        delay = scheduled - now
+        if delay > 0:
+            time.sleep(delay)
 
     def relay_send(self, username: str, packet: dict) -> None:
         self.server_send({"type": "relay", "to": username, "packet": packet})
@@ -2315,7 +2388,6 @@ class Wire:
                     if isinstance(code, str) and isinstance(offer.get("name"), str) and isinstance(offer.get("size"), int):
                         self.pending_files[code] = {"from": packet.get("from"), "host": packet.get("host"), "port": packet.get("port"), "offer": offer}
                         say(f"\n{packet.get('from')} wants to send {offer['name']} ({offer['size'] // 1024 // 1024} MB)")
-                        say("Warning: Wire does not scan files and is not responsible for malware.")
                         for item in offer.get("contents", [])[:20]: say(f"  {item}")
                         say(f"Type /file accept {code[:6]} or /file decline {code[:6]}")
                         redraw_prompt()
@@ -2354,7 +2426,14 @@ class Wire:
                     if peer:
                         self.handle_message(peer, packet["packet"])
                 elif kind == "error":
-                    say(f"directory: {packet.get('message', 'error')}")
+                    message = str(packet.get("message", "error"))
+                    if packet.get("code") == "relay_rate_limited" or message.startswith("relay rate limit reached"):
+                        # Attachment workers pace themselves below the relay
+                        # allowance. Never turn a stale server/client mismatch
+                        # into noisy terminal output.
+                        pass
+                    else:
+                        say(f"directory: {message}")
         except Exception as exc:
             if self.server is sock:
                 self.server = None

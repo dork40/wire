@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.19"
+SERVER_VERSION = "1.4.20"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -574,7 +574,9 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 if not isinstance(payload, dict) or packet_size(wrapped) > MAX_RELAY_PACKET_BYTES:
                     send(sock, {"type": "error", "message": "relay packet is too large"})
                 elif not allow_relay(key, packet_size(wrapped)):
-                    send(sock, {"type": "error", "message": "relay rate limit reached; retry shortly"})
+                    # The client paces attachment frames.  Silently drop an
+                    # unpaced excess frame rather than flooding its terminal.
+                    continue
                 elif deliver_or_queue(target, wrapped):
                     continue
                 else:
