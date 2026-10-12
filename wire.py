@@ -90,6 +90,9 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_CHUNK_BYTES = 40 * 1024
 MAX_FILE_BYTES = 500 * 1024 * 1024
 FILE_CHUNK_BYTES = 64 * 1024
+# The directory accepts up to 1 MB frames, but small chunks avoid making text,
+# voice, and control packets wait behind a huge encoded video/file packet.
+RELAY_FILE_CHUNK_BYTES = 24 * 1024
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
 TRANSFER_TEMP_DIR = DATA / "transfer-temp"
 STREAM_RESOLUTIONS = [(640, 360), (854, 480), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440), (3840, 2160)]
@@ -504,6 +507,19 @@ class Peer:
         else:
             raise ConnectionError("room is no longer connected")
 
+    def send_file_frame(self, frame: dict) -> None:
+        """Send one encrypted attachment frame through the existing relay."""
+        nonce = os.urandom(12)
+        raw = json.dumps(frame, separators=(",", ":")).encode("utf-8")
+        data = AESGCM(self.key).encrypt(nonce, raw, b"wire-v1-file-relay")
+        packet = {"type": "file_relay", "nonce": b64(nonce), "data": b64(data)}
+        if self.relay:
+            self.relay(packet)
+        elif self.sock:
+            send_frame(self.sock, packet)
+        else:
+            raise ConnectionError("room is no longer connected")
+
 
 class VoiceCall:
     """One encrypted, push-to-talk audio stream. Hold F12 to transmit."""
@@ -516,6 +532,9 @@ class VoiceCall:
         self.processor = self.make_processor()
         self.far_audio = np.zeros(960, dtype=np.int16)
         self.audio_lock = threading.Lock()
+        self.error_reported: set[str] = set()
+        self.sent_frames = 0
+        self.received_frames = 0
         self.talking = threading.Event()
         self.output = sd.RawOutputStream(samplerate=48000, channels=1, dtype="int16", blocksize=960, device=settings.get("voice_output"))
         self.input = sd.RawInputStream(samplerate=48000, channels=1, dtype="int16", blocksize=960, device=settings.get("voice_input"), callback=self.capture)
@@ -556,8 +575,10 @@ class VoiceCall:
                     processor = self.processor
                 clean = processor.process(near, far)
                 self.peer.send_audio(np.asarray(clean, dtype=np.int16).tobytes())
-            except Exception:
+                self.sent_frames += 1
+            except Exception as exc:
                 self.talking.clear()
+                self.report_error("microphone", exc)
 
     def play(self, audio: bytes) -> None:
         try:
@@ -565,8 +586,15 @@ class VoiceCall:
             with self.audio_lock:
                 self.far_audio = samples.copy()
             self.output.write(audio)
-        except Exception:
-            pass
+            self.received_frames += 1
+        except Exception as exc:
+            self.report_error("speaker", exc)
+
+    def report_error(self, device: str, exc: Exception) -> None:
+        """Show the first real device error instead of silently losing audio."""
+        if device not in self.error_reported:
+            self.error_reported.add(device)
+            say(f"voice {device} error: {exc}")
 
     def close(self) -> None:
         self.talking.clear()
@@ -603,6 +631,7 @@ class Wire:
         self.pending_files: dict[str, dict] = {}
         self.paused_files: dict[str, dict] = {}
         self.outgoing_files: dict[str, dict] = {}
+        self.incoming_files: dict[str, dict] = {}
         self.pending_shares: dict[str, dict] = {}
         self.outgoing_shares: dict[str, dict] = {}
         self.webrtc_shares: dict[str, WebRTCShare] = {}
@@ -1270,27 +1299,44 @@ class Wire:
             raise ValueError("files must be 500 MB or smaller")
         file_id = uuid.uuid4().hex
         token = b64(os.urandom(24))
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("0.0.0.0", 0))
-        listener.listen(4)
-        # Keep the sender available long enough for a laptop/network hiccup.
-        listener.settimeout(600)
         offer = {
             "id": file_id, "token": token, "name": path.name, "size": size,
             "sha256": self.file_digest(path), "contents": self.zip_contents(path),
         }
-        self.outgoing_files[file_id] = {"path": path, "listener": listener, "offer": offer, "peer": peer, "cleanup": cleanup}
+        self.outgoing_files[file_id] = {"path": path, "offer": offer, "peer": peer, "cleanup": cleanup}
         try:
-            self.server_send({"type": "direct_offer", "to": peer.name, "port": listener.getsockname()[1], "offer": offer})
+            # The existing directory's offer route is only used for signalling.
+            # Bytes stay encrypted with the peer key and travel over the already
+            # connected directory relay, so this also works through NAT/firewalls.
+            self.server_send({"type": "direct_offer", "to": peer.name, "port": 1, "offer": offer})
         except Exception:
             self.outgoing_files.pop(file_id, None)
             if cleanup:
                 path.unlink(missing_ok=True)
-            listener.close()
             raise
-        threading.Thread(target=self.direct_send_worker, args=(file_id,), daemon=True).start()
         say(f"file offer sent: {path.name} (waiting for them to accept)")
+
+    def relay_send_file_worker(self, file_id: str) -> None:
+        state = self.outgoing_files.get(file_id)
+        if not state:
+            return
+        peer, offer, path = state["peer"], state["offer"], state["path"]
+        try:
+            peer.send_file_frame({"kind": "start", "id": file_id, "name": offer["name"], "size": offer["size"], "sha256": offer["sha256"]})
+            sent, started, last_status = 0, time.monotonic(), 0.0
+            with path.open("rb") as handle:
+                while chunk := handle.read(RELAY_FILE_CHUNK_BYTES):
+                    peer.send_file_frame({"kind": "chunk", "id": file_id, "data": b64(chunk)})
+                    sent += len(chunk)
+                    if time.monotonic() - last_status >= 0.5:
+                        self.transfer_status("uploading", path.name, sent, offer["size"], started)
+                        last_status = time.monotonic()
+            peer.send_file_frame({"kind": "end", "id": file_id, "size": sent})
+        except Exception as exc:
+            say(f"file transfer stopped: {exc}")
+            self.outgoing_files.pop(file_id, None)
+            if state.get("cleanup"):
+                path.unlink(missing_ok=True)
 
     def direct_send_worker(self, file_id: str) -> None:
         state = self.outgoing_files.get(file_id)
@@ -1355,17 +1401,68 @@ class Wire:
             raise ValueError("no pending file with that code")
         file_id = matches[0]
         state = self.pending_files.pop(file_id)
+        sender, offer = state.get("from"), state.get("offer")
+        peer = self.peers.get(str(sender).lower())
+        if not peer or not isinstance(offer, dict):
+            raise ValueError("open a room with that person before accepting their file")
         if not accept:
+            peer.send_control({"kind": "file_relay_decline", "id": file_id})
             say("file declined; nothing was downloaded")
             return
-        sender, host, port, offer = state.get("from"), state.get("host"), state.get("port"), state.get("offer")
-        peer = self.peers.get(str(sender).lower())
-        if not peer:
-            raise ValueError("open a room with that person before accepting their file")
-        if not isinstance(host, str) or not isinstance(port, int) or not isinstance(offer, dict):
+        name, size, expected_hash = Path(str(offer.get("name", ""))).name, offer.get("size"), offer.get("sha256")
+        if not name or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not isinstance(expected_hash, str):
             raise ValueError("invalid file offer")
-        threading.Thread(target=self.direct_receive_worker, args=(peer, host, port, offer), daemon=True).start()
-        say("accepting direct encrypted file transfer...")
+        files_dir = DOWNLOADS_DIR / "Files"
+        files_dir.mkdir(parents=True, exist_ok=True)
+        target = files_dir / name
+        stem, suffix, number = target.stem, target.suffix, 2
+        while target.exists():
+            target = files_dir / f"{stem} ({number}){suffix}"
+            number += 1
+        temp = files_dir / f".{name}.{file_id}.part"
+        temp.unlink(missing_ok=True)
+        self.incoming_files[file_id] = {"peer": peer, "offer": offer, "path": target, "temp": temp, "written": 0, "hasher": hashlib.sha256(), "started": time.monotonic(), "last_status": 0.0}
+        peer.send_control({"kind": "file_relay_accept", "id": file_id})
+        say("accepting encrypted file transfer...")
+
+    def handle_file_relay(self, peer: Peer, packet: dict) -> None:
+        """Receive a bounded, end-to-end encrypted file stream via the relay."""
+        frame = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-file-relay").decode("utf-8"))
+        file_id, kind = frame.get("id"), frame.get("kind")
+        state = self.incoming_files.get(file_id) if isinstance(file_id, str) else None
+        if not state or state["peer"] is not peer:
+            return
+        offer = state["offer"]
+        try:
+            if kind == "start":
+                if frame.get("name") != offer["name"] or frame.get("size") != offer["size"] or frame.get("sha256") != offer["sha256"]:
+                    raise ValueError("sender changed the file offer")
+                state["temp"].write_bytes(b"")
+            elif kind == "chunk":
+                chunk = unb64(frame.get("data", ""))
+                if not chunk or len(chunk) > RELAY_FILE_CHUNK_BYTES or state["written"] + len(chunk) > offer["size"]:
+                    raise ValueError("invalid file chunk")
+                with state["temp"].open("ab") as handle:
+                    handle.write(chunk)
+                state["hasher"].update(chunk)
+                state["written"] += len(chunk)
+                if time.monotonic() - state["last_status"] >= 0.5:
+                    self.transfer_status("downloading", offer["name"], state["written"], offer["size"], state["started"])
+                    state["last_status"] = time.monotonic()
+            elif kind == "end":
+                if frame.get("size") != state["written"] or state["written"] != offer["size"] or not hmac.compare_digest(state["hasher"].hexdigest(), offer["sha256"]):
+                    raise ValueError("file failed verification")
+                state["temp"].replace(state["path"])
+                self.incoming_files.pop(file_id, None)
+                peer.send_control({"kind": "file_relay_complete", "id": file_id})
+                say(f"\nfile received and verified: {state['path']}")
+                toast(f"file received from {peer.name}: {offer['name']}")
+                if state["path"].suffix.lower() in VIDEO_EXTENSIONS:
+                    say(f"video received. Type /preview \"{state['path']}\" to watch its first 5 seconds.")
+        except Exception as exc:
+            self.incoming_files.pop(file_id, None)
+            state["temp"].unlink(missing_ok=True)
+            say(f"file transfer failed: {exc}")
 
     def resume_file(self, code: str) -> None:
         matches = [key for key in self.paused_files if key.startswith(code.lower())]
@@ -1893,7 +1990,15 @@ class Wire:
         if peer.name.lower() in self.calls:
             return
         self.calls[peer.name.lower()] = VoiceCall(peer, self.settings)
-        say(f"voice call connected with {peer.name}; hold F12 to talk, /hangup to end")
+        activation = "always on" if self.settings.get("voice_mode") == "open" else "hold F12 to talk"
+        say(f"voice call connected with {peer.name}; {activation}, /hangup to end")
+
+    def show_call_stats(self) -> None:
+        if not self.calls:
+            say("no active voice call")
+            return
+        for name, call in self.calls.items():
+            say(f"voice {name}: sent {call.sent_frames} frames, received {call.received_frames} frames")
 
     def request_call(self, peer: Peer) -> None:
         peer.send_voice_frame({"kind": "offer"})
@@ -1952,6 +2057,23 @@ class Wire:
                     if media: media.call(media.remote(control["answer"]))
                 elif control.get("kind") in ("message_react", "message_edit", "message_delete", "message_delivered", "message_read"):
                     self.apply_message_control(peer, control)
+                elif control.get("kind") == "file_relay_accept":
+                    file_id = control.get("id")
+                    state = self.outgoing_files.get(file_id) if isinstance(file_id, str) else None
+                    if state and state["peer"] is peer:
+                        threading.Thread(target=self.relay_send_file_worker, args=(file_id,), daemon=True).start()
+                elif control.get("kind") == "file_relay_decline":
+                    file_id = control.get("id")
+                    state = self.outgoing_files.pop(file_id, None) if isinstance(file_id, str) else None
+                    if state:
+                        if state.get("cleanup"): state["path"].unlink(missing_ok=True)
+                        say("file offer declined")
+                elif control.get("kind") == "file_relay_complete":
+                    file_id = control.get("id")
+                    state = self.outgoing_files.pop(file_id, None) if isinstance(file_id, str) else None
+                    if state:
+                        if state.get("cleanup"): state["path"].unlink(missing_ok=True)
+                        say(f"file sent and verified: {state['path'].name}")
                 elif control.get("kind") == "typing":
                     now = time.monotonic()
                     name = peer.name.lower()
@@ -1978,6 +2100,9 @@ class Wire:
             return
         if packet.get("type") == "audio":
             self.handle_audio(peer, packet)
+            return
+        if packet.get("type") == "file_relay":
+            self.handle_file_relay(peer, packet)
             return
         if packet.get("type") != "msg":
             return
@@ -2464,7 +2589,7 @@ IN A ROOM
   Type normally and press Enter to send a message.
   Use /send <image path> to offer an encrypted image.
   Use /image accept <code> or /image decline <code> for image offers.
-  Use /call, /acceptcall <name>, /declinecall <name>, and /hangup for voice.
+  Use /call, /acceptcall <name>, /declinecall <name>, /hangup, and /call stats for voice.
   Use /help, /leave, or /exit for commands while chatting."""
 
 
@@ -2496,9 +2621,9 @@ FILES AND MEDIA
                                       Images use the image flow; everything else uses file transfer.
   /image accept|decline <code>       Answer an image offer.
   /sendfile <path>                   Older alias for /send.
-  /file accept|decline|resume <code> Answer or resume a file transfer.
+  /file accept|decline <code>        Answer an encrypted file transfer.
   /preview <video path>              Play the first five seconds locally.
-  /call / /acceptcall <name> / /declinecall <name> / /hangup
+  /call / /call stats / /acceptcall <name> / /declinecall <name> / /hangup
   /share                             Start sharing your selected monitor.
   /share accept|decline <code>       Answer a screen-share request.
   /share stop|close / /share stats   Stop sharing or show live share statistics.
@@ -2761,7 +2886,11 @@ def main() -> None:
                     if not room_peer or len(pieces) != 2 or pieces[0] not in ("accept", "decline"):
                         raise ValueError("use: /image accept <code> or /image decline <code>")
                     app.answer_image_offer(room_peer, pieces[1], accept=pieces[0] == "accept")
+                elif command == "call" and argument.strip().lower() == "stats":
+                    app.show_call_stats()
                 elif command == "call":
+                    if argument:
+                        raise ValueError("use: /call or /call stats")
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
                         raise ValueError("open a room before calling")
