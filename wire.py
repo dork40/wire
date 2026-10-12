@@ -2443,10 +2443,13 @@ class Wire:
                         say(f"Type /share accept {code[:6]} or /share decline {code[:6]}")
                         redraw_prompt()
                 elif kind == "share_answer":
-                    # Sender owns the offer identified by its only active WebRTC share.
-                    if self.webrtc_shares and isinstance(packet.get("answer"), dict):
-                        media = next(iter(self.webrtc_shares.values()))
-                        media.call(media.remote(packet["answer"]))
+                    # Match the answer to its exact offer. A person can be viewing
+                    # one share while offering another, so insertion order is not
+                    # a safe way to choose a WebRTC connection.
+                    share_id, answer = packet.get("id"), packet.get("answer")
+                    media = self.webrtc_shares.get(share_id) if isinstance(share_id, str) else None
+                    if media and isinstance(answer, dict):
+                        media.call(media.remote(answer))
                 elif kind == "share_stop":
                     share_id = packet.get("id", "")
                     if isinstance(share_id, str):
