@@ -43,12 +43,14 @@ from wire_webrtc import WebRTCShare
 
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.application import run_in_terminal
     from prompt_toolkit.filters import Condition
     from prompt_toolkit.layout.containers import ConditionalContainer, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.patch_stdout import patch_stdout
 except ImportError:
     PromptSession = None
+    run_in_terminal = None
     Condition = ConditionalContainer = Window = FormattedTextControl = None
     patch_stdout = None
 
@@ -96,6 +98,7 @@ STREAM_PROFILES = ("auto", "low-resource", "balanced", "smooth", "gaming", "ultr
 PRINT_LOCK = threading.Lock()
 ACTIVE_PROMPT = "wire"
 SAFE_PROMPT_ACTIVE = False
+PROMPT_APPLICATION = None
 
 
 def migrate_portable_data() -> None:
@@ -248,6 +251,20 @@ def recv_frame(sock: socket.socket) -> dict:
 
 
 def say(text: str) -> None:
+    """Print background output without damaging the active prompt buffer."""
+    application = PROMPT_APPLICATION
+    if application and application.is_running and getattr(application, "loop", None) and run_in_terminal:
+        def render_above_prompt() -> None:
+            try:
+                run_in_terminal(lambda: application.print_text(text))
+            except Exception:
+                with PRINT_LOCK:
+                    print(text, flush=True)
+        try:
+            application.loop.call_soon_threadsafe(render_above_prompt)
+            return
+        except RuntimeError:
+            pass
     with PRINT_LOCK:
         print(text, flush=True)
 
@@ -643,6 +660,8 @@ class Wire:
         try:
             try:
                 saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8")); host, port = saved["host"], int(saved["port"])
+                if str(host).lower() in ("localhost", "127.0.0.1", "::1"):
+                    host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
             sock = socket.create_connection((host, port), timeout=10)
@@ -2009,6 +2028,8 @@ class Wire:
             try:
                 saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
                 host, port = saved["host"], int(saved["port"])
+                if str(host).lower() in ("localhost", "127.0.0.1", "::1"):
+                    host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
         port = port or DEFAULT_DIRECTORY_PORT
@@ -2497,9 +2518,10 @@ def main() -> None:
         session = PromptSession(top_toolbar=typing_toolbar) if PromptSession else None
     except Exception:
         session = None
-    global SAFE_PROMPT_ACTIVE
+    global SAFE_PROMPT_ACTIVE, PROMPT_APPLICATION
     SAFE_PROMPT_ACTIVE = session is not None
     if session:
+        PROMPT_APPLICATION = session.app
         app.typing_notifier = session.app.invalidate
         def announce_typing(_buffer: object) -> None:
             try:
@@ -2507,12 +2529,6 @@ def main() -> None:
             except (OSError, ConnectionError):
                 pass
         session.default_buffer.on_text_changed += announce_typing
-    # Keep prompt_toolkit's stdout proxy active for the whole app, not only
-    # while prompt() is running. Directory replies can arrive in the tiny gap
-    # between commands; without this, they print but leave no visible prompt.
-    stdout_proxy = patch_stdout() if session and patch_stdout else None
-    if stdout_proxy:
-        stdout_proxy.__enter__()
     try:
         while True:
             try:
@@ -2575,7 +2591,10 @@ def main() -> None:
                 elif command == "friends":
                     app.show_friends()
                 elif command == "friend":
-                    action, username = argument.split(maxsplit=1)
+                    friend_parts = argument.split(maxsplit=1)
+                    if len(friend_parts) != 2:
+                        raise ValueError("use: /friend add|accept|decline|remove <username>")
+                    action, username = friend_parts
                     if action == "add":
                         app.server_send({"type": "friend_request", "to": username})
                     elif action in ("accept", "decline"):
@@ -2800,8 +2819,7 @@ def main() -> None:
                 print(f"error: {exc}")
     finally:
         app.close()
-        if stdout_proxy:
-            stdout_proxy.__exit__(None, None, None)
+        PROMPT_APPLICATION = None
 
 
 if __name__ == "__main__":
