@@ -16,15 +16,17 @@ instead:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/dork40/wire/main/install-wire.ps1 | iex"
 ```
 
-On Linux later, the equivalent is:
+On Linux (Ubuntu, Fedora, or Arch), use:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/dork40/wire/main/install-wire.sh | sh
 ```
 
-The Linux package command is prepared, but Linux screen capture is not yet
-implemented; it will need a PipeWire/XDG Desktop Portal backend for Wayland
-and an X11 backend where applicable.
+The installer adds Wire as the `wire` terminal command and installs its normal
+chat/voice/file dependencies. Chat, encrypted file transfers, groups, friends,
+and encrypted identity recovery are supported on Linux. X11 screen capture may
+work through MSS; Wayland screen capture is deliberately unavailable until a
+PipeWire/XDG Desktop Portal backend is implemented and tested.
 
 `wire` is a command-line encrypted chat with usernames and rooms.
 New installs automatically connect to the Wire username directory at

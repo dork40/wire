@@ -7,7 +7,6 @@ import ctypes
 import io
 import multiprocessing as mp
 import queue
-import tkinter as tk
 import getpass
 import hashlib
 import hmac
@@ -35,7 +34,14 @@ from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from PIL import Image, ImageDraw
-from PIL import ImageTk
+try:
+    import tkinter as tk
+    from PIL import ImageTk
+except ImportError:
+    # Chat, encrypted files, and identity recovery must work on minimal Linux
+    # installs even when an optional graphical screen-share viewer is absent.
+    tk = None
+    ImageTk = None
 import numpy as np
 from pywebrtc_audio import AudioProcessor
 import mss
@@ -329,6 +335,8 @@ def refresh_prompt_display() -> None:
 
 def screen_viewer_process(frames: object, title: str, stop: object) -> None:
     """Tk owns its interpreter in this process; never create it on a worker thread."""
+    if tk is None or ImageTk is None:
+        return
     root = tk.Tk(); root.title(title)
     label = tk.Label(root, text="Connecting encrypted WebRTC video...", bg="black", fg="white"); label.pack()
     closed = False
@@ -1593,6 +1601,8 @@ class Wire:
         say(f"playing the first 5 seconds of {path.name}")
 
     def start_share(self, peer: Peer) -> None:
+        if os.name != "nt" and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+            raise ValueError("Linux Wayland screen sharing needs the future PipeWire portal backend; chat and files are supported now")
         if self.webrtc_shares:
             raise ValueError("you are already sharing a screen")
         share_id = uuid.uuid4().hex
