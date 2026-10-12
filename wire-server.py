@@ -9,6 +9,7 @@ import json
 import socket
 import struct
 import threading
+import time
 import os
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.16"
+SERVER_VERSION = "1.4.17"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -32,6 +33,14 @@ ONLINE: dict[str, tuple[str, socket.socket, str, str]] = {}
 # Keep a small lock per socket so every packet remains one complete frame.
 SEND_LOCKS: dict[int, threading.Lock] = {}
 SEND_LOCKS_LOCK = threading.Lock()
+MAX_RELAY_PACKET_BYTES = 100 * 1024
+MAX_CLIENT_FRAME_BYTES = 256 * 1024
+MAX_OFFLINE_QUEUE_PACKETS = 250
+MAX_OFFLINE_QUEUE_BYTES = 5 * 1024 * 1024
+MAX_GROUP_MEMBERS = 100
+RELAY_RATE_BYTES_PER_SECOND = 6 * 1024 * 1024
+RELAY_RATE_BURST_BYTES = 12 * 1024 * 1024
+RELAY_BUDGETS: dict[str, tuple[float, float]] = {}
 
 
 def receive_exact(sock: socket.socket, count: int) -> bytes:
@@ -46,7 +55,7 @@ def receive_exact(sock: socket.socket, count: int) -> bytes:
 
 def receive(sock: socket.socket) -> dict:
     size = struct.unpack("!I", receive_exact(sock, 4))[0]
-    if size > 1_000_000:
+    if size > MAX_CLIENT_FRAME_BYTES:
         raise ValueError("packet too large")
     return json.loads(receive_exact(sock, size).decode("utf-8"))
 
@@ -154,6 +163,23 @@ def recovery_proof(secret: bytes) -> str:
     return hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
 
 
+def packet_size(packet: dict) -> int:
+    return len(json.dumps(packet, separators=(",", ":")).encode("utf-8"))
+
+
+def allow_relay(sender: str, size: int) -> bool:
+    """Token bucket: file relay remains fast, but cannot monopolize the server."""
+    now = time.monotonic()
+    with LOCK:
+        tokens, previous = RELAY_BUDGETS.get(sender, (float(RELAY_RATE_BURST_BYTES), now))
+        tokens = min(float(RELAY_RATE_BURST_BYTES), tokens + (now - previous) * RELAY_RATE_BYTES_PER_SECOND)
+        if size > tokens:
+            RELAY_BUDGETS[sender] = (tokens, now)
+            return False
+        RELAY_BUDGETS[sender] = (tokens - size, now)
+        return True
+
+
 def deliver(username: str, packet: dict) -> bool:
     with LOCK:
         connection = ONLINE.get(username.lower())
@@ -168,14 +194,17 @@ def deliver(username: str, packet: dict) -> bool:
 
 def deliver_or_queue(username: str, packet: dict) -> bool:
     """The directory queues encrypted relay packets only; it cannot read them."""
+    size = packet_size(packet)
+    if size > MAX_RELAY_PACKET_BYTES:
+        return False
     if deliver(username, packet):
         return True
     key = username.lower()
     with LOCK:
-        if key not in load_users() or len(json.dumps(packet, separators=(",", ":"))) > 100_000:
+        if key not in load_users():
             return False
         queues = load_queues(); pending = queues.setdefault(key, [])
-        if len(pending) >= 1_000:
+        if len(pending) >= MAX_OFFLINE_QUEUE_PACKETS or sum(packet_size(item) for item in pending if isinstance(item, dict)) + size > MAX_OFFLINE_QUEUE_BYTES:
             return False
         pending.append(packet); save_queues(queues)
     return True
@@ -375,6 +404,9 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         send(sock, {"type": "error", "message": "that group already exists"})
                         continue
                     members = list(dict.fromkeys([key] + [item for item in requested_keys if item in users]))
+                    if len(members) > MAX_GROUP_MEMBERS:
+                        send(sock, {"type": "error", "message": f"groups support up to {MAX_GROUP_MEMBERS} members"})
+                        continue
                     groups[group_key] = {"name": group_name, "owner": key, "admins": [key], "members": members, "invites": [], "pins": []}
                     save_groups(groups)
                     detail = group_details(groups[group_key], users, set(ONLINE))
@@ -395,6 +427,9 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         continue
                     if member not in users:
                         send(sock, {"type": "error", "message": "that username does not exist"})
+                        continue
+                    if member not in group["members"] and len(group["members"]) >= MAX_GROUP_MEMBERS:
+                        send(sock, {"type": "error", "message": f"groups support up to {MAX_GROUP_MEMBERS} members"})
                         continue
                     if member not in group["members"]:
                         group["members"].append(member)
@@ -524,9 +559,15 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             elif kind == "relay":
                 target = packet.get("to", "").lower()
                 payload = packet.get("packet")
-                if isinstance(payload, dict) and deliver_or_queue(target, {"type": "relay", "from": name, "packet": payload}):
+                wrapped = {"type": "relay", "from": name, "packet": payload}
+                if not isinstance(payload, dict) or packet_size(wrapped) > MAX_RELAY_PACKET_BYTES:
+                    send(sock, {"type": "error", "message": "relay packet is too large"})
+                elif not allow_relay(key, packet_size(wrapped)):
+                    send(sock, {"type": "error", "message": "relay rate limit reached; retry shortly"})
+                elif deliver_or_queue(target, wrapped):
                     continue
-                send(sock, {"type": "error", "message": "person is unavailable or their offline queue is full"})
+                else:
+                    send(sock, {"type": "error", "message": "person is unavailable or their offline queue is full"})
             else:
                 send(sock, {"type": "error", "message": "unknown request"})
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError):

@@ -43,6 +43,29 @@ class TransportTests(unittest.TestCase):
                 client.close(); worker.join(timeout=5)
         server.STATE, server.BACKUPS_FILE = original_state, original_backups
 
+    def test_relay_limits_reject_queue_floods_and_rate_bursts(self):
+        server = load_server_module()
+        original = (server.STATE, server.USERS_FILE, server.QUEUES_FILE,
+                    server.MAX_OFFLINE_QUEUE_PACKETS, server.MAX_OFFLINE_QUEUE_BYTES,
+                    server.RELAY_RATE_BYTES_PER_SECOND, server.RELAY_RATE_BURST_BYTES)
+        with tempfile.TemporaryDirectory() as temporary:
+            server.STATE = Path(temporary)
+            server.USERS_FILE, server.QUEUES_FILE = server.STATE / "users.json", server.STATE / "offline-queue.json"
+            server.save_users({"target": {"name": "target"}})
+            server.ONLINE.clear()
+            server.MAX_OFFLINE_QUEUE_PACKETS, server.MAX_OFFLINE_QUEUE_BYTES = 2, 100
+            packet = {"type": "relay", "payload": "x" * 20}
+            self.assertTrue(server.deliver_or_queue("target", packet))
+            self.assertTrue(server.deliver_or_queue("target", packet))
+            self.assertFalse(server.deliver_or_queue("target", packet))
+            server.RELAY_RATE_BYTES_PER_SECOND, server.RELAY_RATE_BURST_BYTES = 1, 10
+            server.RELAY_BUDGETS.clear()
+            self.assertTrue(server.allow_relay("sender", 8))
+            self.assertFalse(server.allow_relay("sender", 8))
+        (server.STATE, server.USERS_FILE, server.QUEUES_FILE,
+         server.MAX_OFFLINE_QUEUE_PACKETS, server.MAX_OFFLINE_QUEUE_BYTES,
+         server.RELAY_RATE_BYTES_PER_SECOND, server.RELAY_RATE_BURST_BYTES) = original
+
     def test_server_packets_do_not_interleave(self):
         server = load_server_module()
         sender, receiver = socket.socketpair()
