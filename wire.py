@@ -748,6 +748,7 @@ class Wire:
             stats = media.snapshot()
             bitrate = (stats.get("bitrate_bytes", 0) * 8 / max(1, stats["seconds"]) / 1_000_000)
             line = (f"share {share_id[:6]}: {stats['state']}; "
+                    f"codec {media.codec_used}; target {media.target_bitrate / 1_000_000:.1f} Mbps; "
                     f"capture {stats['capture_fps']:.1f} fps ({stats['capture_ms']:.1f} ms); "
                     f"encode {stats['send_fps']:.1f} fps ({stats['encode_ms']:.1f} ms); "
                     f"receive {stats['receive_fps']:.1f} fps; {bitrate:.2f} Mbps")
@@ -910,7 +911,7 @@ class Wire:
                 ("Share monitor", str(min(self.settings["stream_monitor"], self.monitor_count()))),
                 ("Share resolution", f"{STREAM_RESOLUTIONS[self.settings['stream_resolution']][0]}x{STREAM_RESOLUTIONS[self.settings['stream_resolution']][1]}"),
                 ("Share FPS", str(STREAM_FPS[self.settings["stream_fps"]])),
-                ("Share bitrate", f"{STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps"),
+                ("Share bitrate", f"{STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps" + (" (20 max)" if STREAM_BITRATES[self.settings['stream_bitrate']] > 20 else "")),
                 ("Share profile", self.settings["stream_profile"]),
                 ("Share codec", self.settings["stream_codec"]),
                 ("Hardware acceleration", "On" if self.settings["stream_hardware"] else "Off"),
@@ -930,7 +931,7 @@ class Wire:
                 "Selects which display /share captures.",
                 "Higher resolutions need more encoder and network capacity.",
                 "Higher FPS needs more encoder and network capacity.",
-                "A target rate; WebRTC can adapt to the connection.",
+                "A target rate; WebRTC can adapt. This encoder currently caps at 20 Mbps.",
                 "Profiles choose sensible resolution, FPS, and bitrate starting points.",
                 "Auto selects a compatible WebRTC codec when possible.",
                 "Uses supported GPU acceleration where the active WebRTC stack provides it.",
@@ -1583,7 +1584,7 @@ class Wire:
         share_id = uuid.uuid4().hex
         resolution = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         fps = STREAM_FPS[self.settings["stream_fps"]]
-        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"])
+        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000)
         self.webrtc_shares[share_id] = media
         self.share_peers[share_id] = peer.name
         try:
@@ -1724,7 +1725,7 @@ class Wire:
         def on_state(status: str) -> None:
             say(f"screen share: {status}")
             if status in ("closed", "failed", "stream ended"): stream_ended.set()
-        media = WebRTCShare(lambda _: None, on_frame, on_state, *(offer.get("resolution") or [1280, 720]), int(offer.get("fps", 30)))
+        media = WebRTCShare(lambda _: None, on_frame, on_state, *(offer.get("resolution") or [1280, 720]), int(offer.get("fps", 30)), codec=offer.get("codec", "auto"))
         self.webrtc_shares[share_id] = media
         self.share_peers[share_id] = peer.name
         try:

@@ -9,6 +9,7 @@ from fractions import Fraction
 import mss
 import numpy as np
 from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, MediaStreamError
+from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 
@@ -110,10 +111,16 @@ class ScreenTrack(VideoStreamTrack):
 
 
 class WebRTCShare:
-    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1):
+    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000):
         self.signal, self.on_frame, self.on_state = signal, on_frame, on_state
         self.width, self.height, self.fps = width, height, fps
         self.monitor_index = monitor_index
+        self.codec_requested = str(codec).upper()
+        self.codec_used = "auto"
+        # aiortc's bundled video encoders cap their validated operating range
+        # at 0.5-20 Mbps. WebRTC congestion control can lower this as needed.
+        self.target_bitrate = max(500_000, min(int(bitrate), 20_000_000))
+        self.sender = None
         self.loop = asyncio.new_event_loop(); self.pc = None; self.capture = None
         self.stats = ShareStats()
         self.closed = threading.Event(); self.close_lock = threading.Lock()
@@ -124,6 +131,25 @@ class WebRTCShare:
         self.loop.run_until_complete(self.loop.shutdown_asyncgens())
         self.loop.close()
     def call(self, coro): return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def codec_preferences(self):
+        """Return only codecs the local aiortc/PyAV stack can actually use."""
+        try:
+            codecs = [item for item in RTCRtpSender.getCapabilities("video").codecs
+                      if item.mimeType.lower() not in ("video/rtx", "video/red", "video/ulpfec")]
+        except Exception:
+            return []
+        requested = self.codec_requested
+        available = {item.mimeType.rsplit("/", 1)[-1].upper() for item in codecs}
+        # H.264 is broadly interoperable and, in this packaged stack, probes
+        # NVENC then falls back to x264. Never require a GPU to share.
+        preferred = "H264" if requested == "AUTO" and "H264" in available else requested
+        selected = [item for item in codecs if item.mimeType.rsplit("/", 1)[-1].upper() == preferred]
+        if not selected:
+            selected = codecs
+            preferred = selected[0].mimeType.rsplit("/", 1)[-1].upper() if selected else "auto"
+        self.codec_used = preferred
+        return selected
     async def _pc(self):
         if self.pc: return self.pc
         self.pc = RTCPeerConnection()
@@ -145,13 +171,31 @@ class WebRTCShare:
             self.on_state("stream ended")
     async def offer(self):
         pc = await self._pc(); self.capture = LatestFrameCapture(self.width, self.height, self.fps, self.stats, self.monitor_index); self.capture.start()
-        pc.addTrack(ScreenTrack(self.capture)); offer = await pc.createOffer(); await pc.setLocalDescription(offer)
-        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "resolution": [self.width, self.height], "fps": self.fps}
+        transceiver = pc.addTransceiver(ScreenTrack(self.capture), direction="sendonly")
+        self.sender = transceiver.sender
+        preferences = self.codec_preferences()
+        if preferences:
+            transceiver.setCodecPreferences(preferences)
+        offer = await pc.createOffer(); await pc.setLocalDescription(offer)
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "resolution": [self.width, self.height], "fps": self.fps, "codec": self.codec_used, "bitrate": self.target_bitrate}
     async def answer(self, offer):
         pc = await self._pc(); await pc.setRemoteDescription(RTCSessionDescription(offer["sdp"], offer["type"]))
         answer = await pc.createAnswer(); await pc.setLocalDescription(answer)
         return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
-    async def remote(self, answer): await self.pc.setRemoteDescription(RTCSessionDescription(answer["sdp"], answer["type"]))
+    async def remote(self, answer):
+        await self.pc.setRemoteDescription(RTCSessionDescription(answer["sdp"], answer["type"]))
+        asyncio.create_task(self._apply_encoder_bitrate())
+
+    async def _apply_encoder_bitrate(self):
+        """Apply the chosen starting rate once aiortc creates its encoder."""
+        for _ in range(100):
+            if self.closed.is_set():
+                return
+            encoder = getattr(self.sender, "_RTCRtpSender__encoder", None) if self.sender else None
+            if encoder and hasattr(encoder, "target_bitrate"):
+                encoder.target_bitrate = self.target_bitrate
+                return
+            await asyncio.sleep(0.05)
     async def _stats(self):
         result = self.stats.snapshot()
         if not self.pc:
