@@ -8,7 +8,7 @@ import asyncio, ctypes, os, threading, time
 from fractions import Fraction
 import mss
 import numpy as np
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, MediaStreamError
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, MediaStreamError
 from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
@@ -17,6 +17,21 @@ try:
     import dxcam
 except ImportError:
     dxcam = None
+
+
+def ice_configuration():
+    """Use STUN for direct internet candidates; TURN is opt-in by environment.
+
+    The directory only signals encrypted SDP. STUN lets endpoints learn their
+    public UDP mapping; media remains DTLS-SRTP encrypted peer-to-peer. A host
+    can provide its own TURN service without baking credentials into Wire:
+    WIRE_TURN_URL, WIRE_TURN_USERNAME, and WIRE_TURN_CREDENTIAL.
+    """
+    servers = [RTCIceServer(urls=["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"])]
+    turn_url = os.environ.get("WIRE_TURN_URL", "").strip()
+    if turn_url:
+        servers.append(RTCIceServer(urls=[turn_url], username=os.environ.get("WIRE_TURN_USERNAME"), credential=os.environ.get("WIRE_TURN_CREDENTIAL")))
+    return RTCConfiguration(iceServers=servers)
 
 
 def draw_windows_cursor(frame: np.ndarray, monitor: dict) -> None:
@@ -234,7 +249,7 @@ class WebRTCShare:
         return selected
     async def _pc(self):
         if self.pc: return self.pc
-        self.pc = RTCPeerConnection()
+        self.pc = RTCPeerConnection(ice_configuration())
         @self.pc.on("connectionstatechange")
         async def state():
             self.stats.state = self.pc.connectionState

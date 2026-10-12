@@ -52,13 +52,15 @@ accept <username>                 accept their room request
 
 When the other person accepts, a room opens automatically. Type normally; every line is sent as a message. Use `/help`, `/leave`, and `/exit` while in a room.
 
-File transfers use end-to-end encryption and SHA-256 verification. If a transfer
-briefly disconnects, Wire retries automatically; if it remains paused, use
-`/file resume <code>` within ten minutes.
+File transfers use end-to-end encryption, bounded relay chunks, and SHA-256
+verification. The recipient must be online while a transfer is active.
 
 During a screen share, `/share stats` shows measured capture, encode, receive,
 bitrate, packet-loss, and RTT data. `/share stop` tells the other Wire client to
-close the viewer as well.
+close the viewer as well. Wire uses STUN to discover public candidates for direct
+internet sharing while keeping media encrypted with DTLS-SRTP. Hosts can configure
+their own TURN relay with `WIRE_TURN_URL`, `WIRE_TURN_USERNAME`, and
+`WIRE_TURN_CREDENTIAL` when direct UDP cannot connect.
 
 The directory address is saved after `server <host> [port]` is used once. In a normal release, the official directory address would be built in, so chat users never need to enter an IP address.
 
