@@ -1897,9 +1897,18 @@ class Wire:
                     self.apply_message_control(peer, control)
                 elif control.get("kind") == "typing":
                     now = time.monotonic()
-                    self.typing_until[peer.name.lower()] = now + 5
-                    self.refresh_typing_status()
-                    expiry_refresh = threading.Timer(5.05, self.refresh_typing_status)
+                    name = peer.name.lower()
+                    was_typing = self.typing_until.get(name, 0) > now
+                    expires = now + 5
+                    self.typing_until[name] = expires
+                    # Redraw only at the beginning and end of a typing run.
+                    # Repainting the prompt for every typing packet disrupts text entry.
+                    if not was_typing:
+                        self.refresh_typing_status()
+                    def refresh_when_expired() -> None:
+                        if self.typing_until.get(name, 0) <= expires:
+                            self.refresh_typing_status()
+                    expiry_refresh = threading.Timer(5.05, refresh_when_expired)
                     expiry_refresh.daemon = True
                     expiry_refresh.start()
             except Exception: pass
@@ -2469,7 +2478,7 @@ def main() -> None:
                 if session and patch_stdout:
                     # Incoming messages print above the prompt, then this redraws
                     # whatever the person was already typing without losing it.
-                    with patch_stdout(raw=True):
+                    with patch_stdout():
                         line = session.prompt(f"{prompt} > ").strip()
                 else:
                     line = input(f"{prompt} > ").strip()
@@ -2495,6 +2504,10 @@ def main() -> None:
                 continue
             if line.startswith("/"):
                 line = line[1:]
+            # An asynchronous status update can coincide with a bare slash.
+            # Do not let that turn into an empty command and crash Wire.
+            if not line.strip():
+                continue
             command, *rest = line.split(maxsplit=1)
             argument = rest[0] if rest else ""
             try:
