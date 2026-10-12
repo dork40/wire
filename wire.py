@@ -99,6 +99,8 @@ PRINT_LOCK = threading.Lock()
 ACTIVE_PROMPT = "wire"
 SAFE_PROMPT_ACTIVE = False
 PROMPT_APPLICATION = None
+PROMPT_WAITING = False
+PENDING_OUTPUT: list[str] = []
 
 
 def migrate_portable_data() -> None:
@@ -253,7 +255,7 @@ def recv_frame(sock: socket.socket) -> dict:
 def say(text: str) -> None:
     """Print background output without damaging the active prompt buffer."""
     application = PROMPT_APPLICATION
-    if application and application.is_running and getattr(application, "loop", None) and run_in_terminal:
+    if application and PROMPT_WAITING and application.is_running and getattr(application, "loop", None) and run_in_terminal:
         def render_above_prompt() -> None:
             try:
                 run_in_terminal(lambda: application.print_text(text))
@@ -265,7 +267,21 @@ def say(text: str) -> None:
             return
         except RuntimeError:
             pass
+    if SAFE_PROMPT_ACTIVE:
+        # Between commands prompt_toolkit is not drawing. Queue output until
+        # main can print it immediately before the next clean prompt.
+        with PRINT_LOCK:
+            PENDING_OUTPUT.append(text)
+        return
     with PRINT_LOCK:
+        print(text, flush=True)
+
+
+def flush_pending_output() -> None:
+    with PRINT_LOCK:
+        pending = PENDING_OUTPUT[:]
+        PENDING_OUTPUT.clear()
+    for text in pending:
         print(text, flush=True)
 
 
@@ -2518,7 +2534,7 @@ def main() -> None:
         session = PromptSession(top_toolbar=typing_toolbar) if PromptSession else None
     except Exception:
         session = None
-    global SAFE_PROMPT_ACTIVE, PROMPT_APPLICATION
+    global SAFE_PROMPT_ACTIVE, PROMPT_APPLICATION, PROMPT_WAITING
     SAFE_PROMPT_ACTIVE = session is not None
     if session:
         PROMPT_APPLICATION = session.app
@@ -2536,10 +2552,15 @@ def main() -> None:
                 prompt = app.name or "wire"
                 global ACTIVE_PROMPT
                 ACTIVE_PROMPT = prompt
+                flush_pending_output()
                 if session:
                     # Incoming messages print above the prompt, then this redraws
                     # whatever the person was already typing without losing it.
-                    line = session.prompt(f"{prompt} > ").strip()
+                    PROMPT_WAITING = True
+                    try:
+                        line = session.prompt(f"{prompt} > ").strip()
+                    finally:
+                        PROMPT_WAITING = False
                 else:
                     line = input(f"{prompt} > ").strip()
             except (EOFError, KeyboardInterrupt):
@@ -2820,6 +2841,7 @@ def main() -> None:
     finally:
         app.close()
         PROMPT_APPLICATION = None
+        PROMPT_WAITING = False
 
 
 if __name__ == "__main__":
