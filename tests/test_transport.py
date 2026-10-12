@@ -100,6 +100,31 @@ class TransportTests(unittest.TestCase):
             client.close(); worker.join(timeout=5)
         server.STATE, server.USERS_FILE, server.GROUPS_FILE, server.QUEUES_FILE = original
 
+    def test_server_rejects_slow_unauthed_connections_and_caps_workers(self):
+        server = load_server_module()
+
+        class SlowSocket:
+            def __init__(self): self.timeouts = []; self.closed = False
+            def settimeout(self, value): self.timeouts.append(value)
+            def close(self): self.closed = True
+
+        slow = SlowSocket()
+        original_receive = server.receive
+        server.receive = lambda _: (_ for _ in ()).throw(socket.timeout())
+        try:
+            server.handle(slow, ("127.0.0.1", 1))
+        finally:
+            server.receive = original_receive
+        self.assertEqual(slow.timeouts, [15])
+        self.assertTrue(slow.closed)
+
+        acquired = [server.CONNECTION_SLOTS.acquire(blocking=False) for _ in range(server.MAX_CONNECTIONS)]
+        try:
+            self.assertTrue(all(acquired))
+            self.assertFalse(server.CONNECTION_SLOTS.acquire(blocking=False))
+        finally:
+            for _ in acquired: server.CONNECTION_SLOTS.release()
+
     def test_server_packets_do_not_interleave(self):
         server = load_server_module()
         sender, receiver = socket.socketpair()

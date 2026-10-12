@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.18"
+SERVER_VERSION = "1.4.19"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -41,6 +41,8 @@ MAX_GROUP_MEMBERS = 100
 RELAY_RATE_BYTES_PER_SECOND = 6 * 1024 * 1024
 RELAY_RATE_BURST_BYTES = 12 * 1024 * 1024
 RELAY_BUDGETS: dict[str, tuple[float, float]] = {}
+MAX_CONNECTIONS = 256
+CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
 
 
 def receive_exact(sock: socket.socket, count: int) -> bytes:
@@ -213,6 +215,9 @@ def deliver_or_queue(username: str, packet: dict) -> bool:
 def handle(sock: socket.socket, address: tuple[str, int]) -> None:
     key: str | None = None
     try:
+        # Do not let unauthenticated or half-open sockets occupy a worker
+        # forever. Authenticated chat connections become idle-friendly below.
+        sock.settimeout(15)
         hello = receive(sock)
         # Recovery is a two-step password-proof exchange. The server never
         # releases an encrypted identity blob to an unauthenticated requester.
@@ -276,6 +281,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             queued_packets = queues.pop(key, [])
             if queued_packets: save_queues(queues)
         send(sock, {"type": "ready", "name": name, "version": SERVER_VERSION})
+        sock.settimeout(None)
         for queued in queued_packets:
             if isinstance(queued, dict): send(sock, queued)
         print(f"online  {name}  {address[0]}")
@@ -600,7 +606,15 @@ def main() -> None:
     try:
         while True:
             sock, address = listener.accept()
-            threading.Thread(target=handle, args=(sock, address), daemon=True).start()
+            if not CONNECTION_SLOTS.acquire(blocking=False):
+                sock.close()
+                continue
+            def serve(connection: socket.socket, peer_address: tuple[str, int]) -> None:
+                try:
+                    handle(connection, peer_address)
+                finally:
+                    CONNECTION_SLOTS.release()
+            threading.Thread(target=serve, args=(sock, address), daemon=True).start()
     except KeyboardInterrupt:
         pass
     finally:
