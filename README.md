@@ -38,8 +38,9 @@ Open Command Prompt and run:
 wire
 ```
 
-Wire automatically starts its bundled local directory when one is not already
-running. Create an account with `signup kai`, then sign in using `login kai`.
+Wire connects to the shared Wire directory at `wirecmd.ddns.net` by default.
+Create an account with `signup kai`, then sign in using `login kai`. A local
+directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
