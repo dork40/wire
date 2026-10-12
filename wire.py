@@ -24,7 +24,7 @@ import time
 import urllib.request
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Callable, Optional
@@ -468,60 +468,51 @@ class Peer:
     key: bytes
     public_key: bytes
     relay: Optional[Callable[[dict], None]] = None
+    # Voice capture, acknowledgements, file workers, and the command loop can
+    # all send at once.  A direct socket is a byte stream, so protect its
+    # length-prefixed packets from being interleaved by those threads.
+    send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def _send_packet(self, packet: dict) -> None:
+        if self.relay:
+            self.relay(packet)
+        elif self.sock:
+            with self.send_lock:
+                send_frame(self.sock, packet)
+        else:
+            raise ConnectionError("room is no longer connected")
 
     def send(self, text: str, message_id: str, reply_to: str | None = None) -> None:
         nonce = os.urandom(12)
         data = AESGCM(self.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
         packet = {"type": "msg", "id": message_id, "reply_to": reply_to, "nonce": b64(nonce), "data": b64(data)}
-        if self.relay:
-            self.relay(packet)
-        elif self.sock:
-            send_frame(self.sock, packet)
-        else:
-            raise ConnectionError("room is no longer connected")
+        self._send_packet(packet)
 
     def send_image_frame(self, frame: dict) -> None:
         nonce = os.urandom(12)
         raw = json.dumps(frame, separators=(",", ":")).encode("utf-8")
         data = AESGCM(self.key).encrypt(nonce, raw, b"wire-v1-image")
         packet = {"type": "image", "nonce": b64(nonce), "data": b64(data)}
-        if self.relay:
-            self.relay(packet)
-        elif self.sock:
-            send_frame(self.sock, packet)
-        else:
-            raise ConnectionError("room is no longer connected")
+        self._send_packet(packet)
 
     def send_voice_frame(self, frame: dict) -> None:
         nonce = os.urandom(12)
         data = AESGCM(self.key).encrypt(nonce, json.dumps(frame, separators=(",", ":")).encode("utf-8"), b"wire-v1-voice")
         packet = {"type": "voice", "nonce": b64(nonce), "data": b64(data)}
-        if self.relay:
-            self.relay(packet)
-        elif self.sock:
-            send_frame(self.sock, packet)
-        else:
-            raise ConnectionError("room is no longer connected")
+        self._send_packet(packet)
 
     def send_control(self, frame: dict) -> None:
         """Small encrypted control message; works through every deployed relay."""
         nonce = os.urandom(12)
         data = AESGCM(self.key).encrypt(nonce, json.dumps(frame, separators=(",", ":")).encode("utf-8"), b"wire-v1-control")
         packet = {"type": "control", "nonce": b64(nonce), "data": b64(data)}
-        if self.relay: self.relay(packet)
-        elif self.sock: send_frame(self.sock, packet)
-        else: raise ConnectionError("room is no longer connected")
+        self._send_packet(packet)
 
     def send_audio(self, audio: bytes) -> None:
         nonce = os.urandom(12)
         data = AESGCM(self.key).encrypt(nonce, audio, b"wire-v1-audio")
         packet = {"type": "audio", "nonce": b64(nonce), "data": b64(data)}
-        if self.relay:
-            self.relay(packet)
-        elif self.sock:
-            send_frame(self.sock, packet)
-        else:
-            raise ConnectionError("room is no longer connected")
+        self._send_packet(packet)
 
     def send_file_frame(self, frame: dict) -> None:
         """Send one encrypted attachment frame through the existing relay."""
@@ -529,12 +520,7 @@ class Peer:
         raw = json.dumps(frame, separators=(",", ":")).encode("utf-8")
         data = AESGCM(self.key).encrypt(nonce, raw, b"wire-v1-file-relay")
         packet = {"type": "file_relay", "nonce": b64(nonce), "data": b64(data)}
-        if self.relay:
-            self.relay(packet)
-        elif self.sock:
-            send_frame(self.sock, packet)
-        else:
-            raise ConnectionError("room is no longer connected")
+        self._send_packet(packet)
 
 
 class VoiceCall:
