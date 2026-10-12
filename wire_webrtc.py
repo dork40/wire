@@ -37,7 +37,7 @@ class LatestFrameCapture:
         self.width, self.height, self.fps = width, height, fps
         self.stats = stats
         self.monitor_index = monitor_index
-        self.frame = None; self.lock = threading.Lock(); self.stop = threading.Event()
+        self.frame = None; self.sequence = 0; self.lock = threading.Lock(); self.stop = threading.Event()
         self.thread = threading.Thread(target=self._run, daemon=True)
     def start(self): self.thread.start()
     def _run(self):
@@ -51,7 +51,9 @@ class LatestFrameCapture:
                 # BGRA buffer is passed straight to PyAV; no Pillow/JPEG/base64 step.
                 raw = np.asarray(shot).copy()
                 draw_windows_cursor(raw, mon)
-                with self.lock: self.frame = (raw, shot.size)
+                with self.lock:
+                    self.sequence += 1
+                    self.frame = (raw, shot.size, self.sequence)
                 self.stats.record_capture(time.monotonic() - began)
                 time.sleep(max(0, interval - (time.monotonic() - began)))
     def latest(self):
@@ -96,18 +98,33 @@ class ShareStats:
 
 class ScreenTrack(VideoStreamTrack):
     kind = "video"
-    def __init__(self, capture): super().__init__(); self.capture = capture
+    def __init__(self, capture):
+        super().__init__()
+        self.capture = capture
+        self.last_sequence = -1
+        self.next_frame_at = time.monotonic()
     async def recv(self):
-        began = time.monotonic()
-        await asyncio.sleep(1 / self.capture.fps)
-        item = self.capture.latest()
-        if item is None: return await self.recv()
-        raw, size = item
-        frame = VideoFrame.from_ndarray(raw, format="bgra")
-        frame = frame.reformat(width=self.capture.width, height=self.capture.height, format="yuv420p")
-        frame.pts = int(time.time() * 90000); frame.time_base = Fraction(1, 90000)
-        self.capture.stats.record_sent(time.monotonic() - began)
-        return frame
+        # Do not encode the same desktop frame repeatedly when capture is the
+        # bottleneck. Repeated frames consumed CPU/GPU without making motion
+        # smoother and made weak PCs fall further behind.
+        interval = 1 / self.capture.fps
+        while True:
+            now = time.monotonic()
+            if now < self.next_frame_at:
+                await asyncio.sleep(self.next_frame_at - now)
+            began = time.monotonic()
+            item = self.capture.latest()
+            if item is None or item[2] == self.last_sequence:
+                await asyncio.sleep(min(0.005, interval))
+                continue
+            raw, _size, sequence = item
+            self.last_sequence = sequence
+            self.next_frame_at = max(self.next_frame_at + interval, time.monotonic())
+            frame = VideoFrame.from_ndarray(raw, format="bgra")
+            frame = frame.reformat(width=self.capture.width, height=self.capture.height, format="yuv420p")
+            frame.pts = int(time.time() * 90000); frame.time_base = Fraction(1, 90000)
+            self.capture.stats.record_sent(time.monotonic() - began)
+            return frame
 
 
 class WebRTCShare:
@@ -121,6 +138,7 @@ class WebRTCShare:
         # at 0.5-20 Mbps. WebRTC congestion control can lower this as needed.
         self.target_bitrate = max(500_000, min(int(bitrate), 20_000_000))
         self.sender = None
+        self.encoder_used = "pending"
         self.loop = asyncio.new_event_loop(); self.pc = None; self.capture = None
         self.stats = ShareStats()
         self.closed = threading.Event(); self.close_lock = threading.Lock()
@@ -194,6 +212,8 @@ class WebRTCShare:
             encoder = getattr(self.sender, "_RTCRtpSender__encoder", None) if self.sender else None
             if encoder and hasattr(encoder, "target_bitrate"):
                 encoder.target_bitrate = self.target_bitrate
+                context = getattr(encoder, "codec", None)
+                self.encoder_used = str(getattr(context, "name", "software"))
                 return
             await asyncio.sleep(0.05)
     async def _stats(self):
