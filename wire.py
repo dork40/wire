@@ -44,6 +44,7 @@ from wire_webrtc import WebRTCShare
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.application import run_in_terminal
+    from prompt_toolkit.application.current import set_app
     from prompt_toolkit.filters import Condition
     from prompt_toolkit.layout.containers import ConditionalContainer, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
@@ -51,6 +52,7 @@ try:
 except ImportError:
     PromptSession = None
     run_in_terminal = None
+    set_app = None
     Condition = ConditionalContainer = Window = FormattedTextControl = None
     patch_stdout = None
 
@@ -255,10 +257,14 @@ def recv_frame(sock: socket.socket) -> dict:
 def say(text: str) -> None:
     """Print background output without damaging the active prompt buffer."""
     application = PROMPT_APPLICATION
-    if application and PROMPT_WAITING and application.is_running and getattr(application, "loop", None) and run_in_terminal:
+    if application and PROMPT_WAITING and application.is_running and getattr(application, "loop", None) and run_in_terminal and set_app:
         def render_above_prompt() -> None:
             try:
-                run_in_terminal(lambda: application.print_text(text))
+                # This callback runs on the application's loop, but not in its
+                # context variable.  Set it explicitly so run_in_terminal()
+                # erases and redraws the active prompt instead of printing over it.
+                with set_app(application):
+                    run_in_terminal(lambda: application.print_text(text))
             except Exception:
                 with PRINT_LOCK:
                     print(text, flush=True)
@@ -1092,13 +1098,13 @@ class Wire:
             suffix += "  " + " ".join(str(item) for item in reactions[:12])
         return f"{record.get('from', '?')} > {text}{suffix}"
 
-    def show_history(self, peer_name: str) -> None:
+    def show_history(self, peer_name: str, show_ids: bool = False) -> None:
         records = self.read_history(peer_name)
         if not records:
             return
         say("-- earlier messages --")
         for record in records[-30:]:
-            say(self.render_record(record, show_id=True))
+            say(self.render_record(record, show_id=show_ids))
         say("-- end earlier messages --")
 
     def search_history(self, query: str) -> None:
@@ -2294,7 +2300,9 @@ class Wire:
                     if isinstance(share_id, str):
                         self.stop_share_id(share_id, remote=True)
                 elif kind == "identity_backup_saved":
-                    say("encrypted identity backup saved")
+                    # Routine login backup succeeded. Avoid an async startup
+                    # line here; it can arrive exactly as the first prompt opens.
+                    pass
                 elif kind == "accepted":
                     self.attach_relay_peer(packet["name"], packet["public"])
                 elif kind == "relay":
@@ -2473,7 +2481,8 @@ ACCOUNT AND PEOPLE
 
 CHAT
   Type normally in an open room to send a message.
-  /history <name>                    Show saved messages and their short message codes.
+  /history <name>                    Show saved messages without cluttering chat with IDs.
+  /history <name> ids                Show saved messages with message codes for reply/edit/react.
   /search <words>                    Search your saved messages locally.
   /reply <code> <text>               Reply to a saved message.
   /react <code> <emoji>              Add or replace your reaction.
@@ -2635,7 +2644,10 @@ def main() -> None:
                 elif command == "history":
                     if not argument:
                         raise ValueError("use: history <username>")
-                    app.show_history(argument)
+                    pieces = argument.split()
+                    if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
+                        raise ValueError("use: /history <username> [ids]")
+                    app.show_history(pieces[0], show_ids=len(pieces) == 2)
                 elif command == "search":
                     app.search_history(argument)
                 elif command == "group":
