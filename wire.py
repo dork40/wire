@@ -747,8 +747,9 @@ class Wire:
         for share_id, media in self.webrtc_shares.items():
             stats = media.snapshot()
             bitrate = (stats.get("bitrate_bytes", 0) * 8 / max(1, stats["seconds"]) / 1_000_000)
+            backend = media.capture.backend if media.capture else "waiting"
             line = (f"share {share_id[:6]}: {stats['state']}; "
-                    f"codec {media.codec_used}/{media.encoder_used}; target {media.target_bitrate / 1_000_000:.1f} Mbps; "
+                    f"{backend}; codec {media.codec_used}/{media.encoder_used}; target {media.target_bitrate / 1_000_000:.1f} Mbps; "
                     f"capture {stats['capture_fps']:.1f} fps ({stats['capture_ms']:.1f} ms); "
                     f"encode {stats['send_fps']:.1f} fps ({stats['encode_ms']:.1f} ms); "
                     f"receive {stats['receive_fps']:.1f} fps; {bitrate:.2f} Mbps")

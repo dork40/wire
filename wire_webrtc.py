@@ -13,6 +13,11 @@ from aiortc.rtcrtpsender import RTCRtpSender
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 
+try:
+    import dxcam
+except ImportError:
+    dxcam = None
+
 
 def draw_windows_cursor(frame: np.ndarray, monitor: dict) -> None:
     """Paint a small high-contrast arrow into the BGRA frame without image conversion."""
@@ -38,9 +43,49 @@ class LatestFrameCapture:
         self.stats = stats
         self.monitor_index = monitor_index
         self.frame = None; self.sequence = 0; self.lock = threading.Lock(); self.stop = threading.Event()
+        self.backend = "mss"
         self.thread = threading.Thread(target=self._run, daemon=True)
     def start(self): self.thread.start()
-    def _run(self):
+    def _publish(self, raw, monitor):
+        began = time.monotonic()
+        draw_windows_cursor(raw, monitor)
+        with self.lock:
+            self.sequence += 1
+            self.frame = (raw, (raw.shape[1], raw.shape[0]), self.sequence)
+        self.stats.record_capture(time.monotonic() - began)
+
+    def _run_dxcam(self):
+        # DXcam uses Windows Desktop Duplication. It is much faster than a GDI
+        # screenshot on high-refresh displays, but may be unavailable on older
+        # drivers / remote desktop sessions, where MSS remains the fallback.
+        with mss.mss() as cap:
+            monitors = cap.monitors
+            mon = monitors[min(max(1, self.monitor_index), len(monitors) - 1)]
+        camera = dxcam.create(output_idx=max(0, self.monitor_index - 1), output_color="BGRA", max_buffer_len=2)
+        try:
+            camera.start(target_fps=min(self.fps, 120), video_mode=False)
+            timestamp = None
+            while not self.stop.is_set():
+                item = camera.get_latest_frame(with_timestamp=True)
+                if item is None:
+                    time.sleep(0.001)
+                    continue
+                raw, next_timestamp = item
+                if next_timestamp == timestamp:
+                    time.sleep(0.001)
+                    continue
+                timestamp = next_timestamp
+                # DXcam owns a small ring buffer. Copy once before handing the
+                # frame to the asynchronous encoder so it cannot be overwritten.
+                self._publish(raw.copy(), mon)
+        finally:
+            try:
+                camera.stop()
+                camera.release()
+            except Exception:
+                pass
+
+    def _run_mss(self):
         interval = 1 / self.fps
         with mss.mss() as cap:
             # mss index 0 is the virtual desktop; real displays start at 1.
@@ -50,12 +95,20 @@ class LatestFrameCapture:
                 shot = cap.grab(mon)
                 # BGRA buffer is passed straight to PyAV; no Pillow/JPEG/base64 step.
                 raw = np.asarray(shot).copy()
-                draw_windows_cursor(raw, mon)
-                with self.lock:
-                    self.sequence += 1
-                    self.frame = (raw, shot.size, self.sequence)
-                self.stats.record_capture(time.monotonic() - began)
+                self._publish(raw, mon)
                 time.sleep(max(0, interval - (time.monotonic() - began)))
+
+    def _run(self):
+        if os.name == "nt" and dxcam is not None:
+            try:
+                self.backend = "dxgi"
+                self._run_dxcam()
+                return
+            except Exception:
+                # A capture backend must never prevent sharing on a low-end
+                # PC, virtual machine, RDP session, or unsupported adapter.
+                self.backend = "mss"
+        self._run_mss()
     def latest(self):
         with self.lock: return self.frame
     def close(self):
@@ -83,6 +136,12 @@ class ShareStats:
     def record_received(self):
         with self.lock: self.received_frames += 1
 
+    def reset(self):
+        with self.lock:
+            self.started = time.monotonic()
+            self.capture_frames = self.sent_frames = self.received_frames = 0
+            self.capture_ms = self.encode_ms = 0.0
+
     def snapshot(self):
         with self.lock:
             seconds = max(0.001, time.monotonic() - self.started)
@@ -103,6 +162,7 @@ class ScreenTrack(VideoStreamTrack):
         self.capture = capture
         self.last_sequence = -1
         self.next_frame_at = time.monotonic()
+        self.timestamp = 0
     async def recv(self):
         # Do not encode the same desktop frame repeatedly when capture is the
         # bottleneck. Repeated frames consumed CPU/GPU without making motion
@@ -122,7 +182,11 @@ class ScreenTrack(VideoStreamTrack):
             self.next_frame_at = max(self.next_frame_at + interval, time.monotonic())
             frame = VideoFrame.from_ndarray(raw, format="bgra")
             frame = frame.reformat(width=self.capture.width, height=self.capture.height, format="yuv420p")
-            frame.pts = int(time.time() * 90000); frame.time_base = Fraction(1, 90000)
+            # RTP timestamps must be a small, monotonic media timeline. Using
+            # Unix wall-clock values made FFmpeg/WebRTC pace some shares at a
+            # few FPS despite capture and encode being fast enough.
+            self.timestamp += round(90_000 / self.capture.fps)
+            frame.pts = self.timestamp; frame.time_base = Fraction(1, 90_000)
             self.capture.stats.record_sent(time.monotonic() - began)
             return frame
 
@@ -174,6 +238,10 @@ class WebRTCShare:
         @self.pc.on("connectionstatechange")
         async def state():
             self.stats.state = self.pc.connectionState
+            if self.pc.connectionState == "connected":
+                # ICE setup can take several seconds; /share stats should
+                # describe the active share, not the connection wait.
+                self.stats.reset()
             self.on_state(self.pc.connectionState)
         @self.pc.on("track")
         def track(track):
@@ -212,11 +280,17 @@ class WebRTCShare:
             encoder = getattr(self.sender, "_RTCRtpSender__encoder", None) if self.sender else None
             if encoder and hasattr(encoder, "target_bitrate"):
                 encoder.target_bitrate = self.target_bitrate
-                context = getattr(encoder, "codec", None)
-                self.encoder_used = str(getattr(context, "name", "software"))
+                self._update_encoder_name(encoder)
                 return
             await asyncio.sleep(0.05)
+
+    def _update_encoder_name(self, encoder=None):
+        encoder = encoder or (getattr(self.sender, "_RTCRtpSender__encoder", None) if self.sender else None)
+        context = getattr(encoder, "codec", None)
+        if context and getattr(context, "name", None):
+            self.encoder_used = str(context.name)
     async def _stats(self):
+        self._update_encoder_name()
         result = self.stats.snapshot()
         if not self.pc:
             return result
