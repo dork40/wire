@@ -302,6 +302,19 @@ def redraw_prompt() -> None:
         print(f"{ACTIVE_PROMPT} > ", end="", flush=True)
 
 
+def refresh_prompt_display() -> None:
+    """Request a prompt_toolkit redraw from its owning event-loop thread."""
+    application = PROMPT_APPLICATION
+    loop = getattr(application, "loop", None) if application else None
+    if not application or not application.is_running or not loop:
+        return
+    try:
+        loop.call_soon_threadsafe(application.invalidate)
+    except RuntimeError:
+        # Wire can be shutting down while a typing-expiry timer fires.
+        pass
+
+
 def draw_mouse_cursor(image: Image.Image, monitor: dict) -> None:
     """Draw a clear cursor into a captured desktop frame on Windows."""
     if os.name != "nt":
@@ -2707,7 +2720,9 @@ def main() -> None:
     SAFE_PROMPT_ACTIVE = session is not None
     if session:
         PROMPT_APPLICATION = session.app
-        app.typing_notifier = session.app.invalidate
+        # Typing packets and their expiry timers run on worker threads. Never
+        # mutate prompt_toolkit's renderer from those threads directly.
+        app.typing_notifier = refresh_prompt_display
         def announce_typing(_buffer: object) -> None:
             try:
                 app.send_typing()
