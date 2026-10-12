@@ -321,16 +321,19 @@ def draw_mouse_cursor(image: Image.Image, monitor: dict) -> None:
     draw.polygon(arrow, fill="white")
 
 
-def screen_viewer_process(frames: object, title: str) -> None:
+def screen_viewer_process(frames: object, title: str, stop: object) -> None:
     """Tk owns its interpreter in this process; never create it on a worker thread."""
     root = tk.Tk(); root.title(title)
-    label = tk.Label(root, text="Connecting encrypted WebRTC video…", bg="black", fg="white"); label.pack()
+    label = tk.Label(root, text="Connecting encrypted WebRTC video...", bg="black", fg="white"); label.pack()
     closed = False
     def close() -> None:
         nonlocal closed
         closed = True; root.destroy()
     def draw() -> None:
         if closed: return
+        if stop.is_set():
+            close()
+            return
         newest = None
         try:
             while True: newest = frames.get_nowait()
@@ -637,6 +640,7 @@ class Wire:
         self.webrtc_shares: dict[str, WebRTCShare] = {}
         self.share_peers: dict[str, str] = {}
         self.share_viewers: dict[str, mp.Process] = {}
+        self.share_viewer_stops: dict[str, object] = {}
         self.groups: dict[str, dict] = {}
         self.group_invites: dict[str, str] = {}
         self.typing_until: dict[str, float] = {}
@@ -1673,9 +1677,13 @@ class Wire:
             media.close()
         self.webrtc_shares.clear()
         self.share_peers.clear()
+        for stop in list(self.share_viewer_stops.values()):
+            stop.set()
         for viewer in list(self.share_viewers.values()):
+            if viewer.is_alive(): viewer.join(timeout=3)
             if viewer.is_alive(): viewer.terminate()
         self.share_viewers.clear()
+        self.share_viewer_stops.clear()
         states = list(self.outgoing_shares.values())
         if not states and not had_webrtc:
             say("no screen share is active")
@@ -1724,14 +1732,20 @@ class Wire:
             # Relay the answer end-to-end so the deployed directory never sees SDP
             # and older directories do not need a protocol upgrade.
             peer.send_control({"kind": "webrtc_answer", "id": share_id, "answer": answer})
-            viewer = mp.Process(target=screen_viewer_process, args=(frames, f"Wire screen share — {peer.name}"), daemon=True)
-            self.share_viewers[share_id] = viewer; viewer.start()
+            viewer_stop = mp.Event()
+            viewer = mp.Process(target=screen_viewer_process, args=(frames, f"Wire screen share - {peer.name}", viewer_stop), daemon=True)
+            self.share_viewers[share_id] = viewer
+            self.share_viewer_stops[share_id] = viewer_stop
+            viewer.start()
             while viewer.is_alive() and not stream_ended.wait(0.2): pass
+            viewer_stop.set()
+            if viewer.is_alive(): viewer.join(timeout=3)
             if viewer.is_alive(): viewer.terminate()
         except Exception as exc:
             say(f"screen share failed: {exc}")
         finally:
             self.share_viewers.pop(share_id, None)
+            self.share_viewer_stops.pop(share_id, None)
             self.share_peers.pop(share_id, None)
             self.webrtc_shares.pop(share_id, media).close()
 
@@ -1739,6 +1753,11 @@ class Wire:
         media = self.webrtc_shares.pop(share_id, None)
         self.share_peers.pop(share_id, None)
         viewer = self.share_viewers.pop(share_id, None)
+        viewer_stop = self.share_viewer_stops.pop(share_id, None)
+        if viewer_stop:
+            viewer_stop.set()
+        if viewer and viewer.is_alive():
+            viewer.join(timeout=3)
         if viewer and viewer.is_alive():
             viewer.terminate(); viewer.join(timeout=2)
         if media:
@@ -1809,6 +1828,13 @@ class Wire:
 
     def preview_image(self, path: Path) -> None:
         try:
+            # CMD's ANSI/color support is inconsistent and the old text card
+            # could become mojibake or a wall of # characters. On Windows use
+            # the user's normal image viewer, which keeps the chat readable.
+            if os.name == "nt":
+                os.startfile(path)
+                say(f"opened image: {path.name}")
+                return
             with Image.open(path) as image:
                 image = image.convert("RGB")
                 if os.environ.get("WT_SESSION"):
@@ -2491,9 +2517,13 @@ class Wire:
             media.close()
         self.webrtc_shares.clear()
         self.share_peers.clear()
+        for stop in list(self.share_viewer_stops.values()):
+            stop.set()
         for viewer in list(self.share_viewers.values()):
+            if viewer.is_alive(): viewer.join(timeout=3)
             if viewer.is_alive(): viewer.terminate()
         self.share_viewers.clear()
+        self.share_viewer_stops.clear()
         if self.listener:
             self.listener.close()
         if self.server:
