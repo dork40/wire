@@ -2,6 +2,7 @@ import importlib.util
 import os
 import socket
 import threading
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -18,6 +19,30 @@ def load_server_module():
 
 
 class TransportTests(unittest.TestCase):
+    def test_identity_recovery_requires_password_proof(self):
+        server = load_server_module()
+        original_state, original_backups = server.STATE, server.BACKUPS_FILE
+        secret = b"s" * 32
+        backup = {"salt": "c2FsdA==", "ciphertext": "encrypted-account", "recovery_proof": server.recovery_proof(secret)}
+        with tempfile.TemporaryDirectory() as temporary:
+            server.STATE = Path(temporary)
+            server.BACKUPS_FILE = server.STATE / "identity-backups.json"
+            server.save_backups({"alice": backup})
+            for proof, expected in ((backup["recovery_proof"], "identity_backup"), ("0" * 64, "error")):
+                client, service = socket.socketpair()
+                worker = threading.Thread(target=server.handle, args=(service, ("127.0.0.1", 1)))
+                worker.start()
+                server.send(client, {"type": "identity_fetch", "name": "alice"})
+                challenge = server.receive(client)
+                self.assertEqual(challenge["type"], "identity_recovery_challenge")
+                self.assertNotIn("ciphertext", challenge)
+                server.send(client, {"type": "identity_fetch_prove", "proof": proof})
+                reply = server.receive(client)
+                self.assertEqual(reply["type"], expected)
+                if expected == "error": self.assertNotIn("backup", reply)
+                client.close(); worker.join(timeout=5)
+        server.STATE, server.BACKUPS_FILE = original_state, original_backups
+
     def test_server_packets_do_not_interleave(self):
         server = load_server_module()
         sender, receiver = socket.socketpair()

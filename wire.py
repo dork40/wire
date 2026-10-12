@@ -715,7 +715,7 @@ class Wire:
             say(f"directory offline ({exc})")
 
     def restore_identity(self, name: str, password: str) -> dict:
-        """Fetch a password-encrypted identity backup for a fresh computer."""
+        """Recover an identity only after proving knowledge of its password."""
         try:
             try:
                 saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8")); host, port = saved["host"], int(saved["port"])
@@ -725,10 +725,18 @@ class Wire:
                 host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
             sock = socket.create_connection((host, port), timeout=10)
             send_frame(sock, {"type": "identity_fetch", "name": name})
+            reply = recv_frame(sock)
+            if reply.get("type") != "identity_recovery_challenge" or not isinstance(reply.get("salt"), str):
+                raise ValueError("identity recovery is unavailable")
+            challenge_salt = reply["salt"]
+            secret = derive(password, unb64(challenge_salt))
+            proof = hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
+            send_frame(sock, {"type": "identity_fetch_prove", "proof": proof})
             reply = recv_frame(sock); sock.close()
             backup = reply.get("backup") if reply.get("type") == "identity_backup" else None
             if not isinstance(backup, dict): raise ValueError("no encrypted backup found")
-            secret = derive(password, unb64(backup["salt"]))
+            if not isinstance(backup.get("salt"), str) or not hmac.compare_digest(backup["salt"], challenge_salt):
+                raise ValueError("backup salt did not match recovery challenge")
             account = json.loads(Fernet(base64.urlsafe_b64encode(secret)).decrypt(backup["ciphertext"].encode("ascii")).decode("utf-8"))
             if not isinstance(account, dict) or str(account.get("name", "")).lower() != name.lower(): raise ValueError("backup does not match that username")
             users = load_users(); users[name.lower()] = account; save_users(users)
@@ -742,7 +750,8 @@ class Wire:
         account = load_users().get(self.name.lower())
         if not account: return
         encrypted = Fernet(base64.urlsafe_b64encode(self.account_secret)).encrypt(json.dumps(account, separators=(",", ":")).encode("utf-8")).decode("ascii")
-        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "ciphertext": encrypted}})
+        recovery = hmac.new(self.account_secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
+        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "ciphertext": encrypted, "recovery_proof": recovery}})
 
     def show_share_stats(self) -> None:
         if not self.webrtc_shares:

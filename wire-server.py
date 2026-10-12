@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import hmac
+import hashlib
 import json
 import socket
 import struct
@@ -15,7 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.15"
+SERVER_VERSION = "1.4.16"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -147,6 +149,11 @@ def login_proof_bytes(name: str, nonce: bytes) -> bytes:
     return b"wire-login-v1\0" + name.lower().encode("utf-8") + b"\0" + nonce
 
 
+def recovery_proof(secret: bytes) -> str:
+    """A password-derived proof used only to release the encrypted backup."""
+    return hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
+
+
 def deliver(username: str, packet: dict) -> bool:
     with LOCK:
         connection = ONLINE.get(username.lower())
@@ -178,12 +185,23 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
     key: str | None = None
     try:
         hello = receive(sock)
-        # The blob is encrypted with the user's password before it reaches us.
-        # This unauthenticated lookup supports recovery on a new computer.
+        # Recovery is a two-step password-proof exchange. The server never
+        # releases an encrypted identity blob to an unauthenticated requester.
         if hello.get("type") == "identity_fetch":
-            name = hello.get("name", "").lower()
-            with LOCK: backup = load_backups().get(name)
-            send(sock, {"type": "identity_backup", "backup": backup} if isinstance(backup, dict) else {"type": "error", "message": "no encrypted backup for that user"})
+            name = hello.get("name", "")
+            key = name.lower() if isinstance(name, str) else ""
+            with LOCK:
+                backup = load_backups().get(key)
+            if not isinstance(backup, dict) or not isinstance(backup.get("salt"), str) or not isinstance(backup.get("recovery_proof"), str):
+                send(sock, {"type": "error", "message": "identity recovery is unavailable"})
+                return
+            send(sock, {"type": "identity_recovery_challenge", "salt": backup["salt"]})
+            proof = receive(sock)
+            supplied = proof.get("proof") if proof.get("type") == "identity_fetch_prove" else None
+            if not isinstance(supplied, str) or not hmac.compare_digest(supplied, backup["recovery_proof"]):
+                send(sock, {"type": "error", "message": "identity recovery is unavailable"})
+                return
+            send(sock, {"type": "identity_backup", "backup": backup})
             return
         if hello.get("type") != "hello" or not (details := valid_hello(hello)):
             send(sock, {"type": "error", "message": "bad login"})
@@ -334,7 +352,10 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         save_users(users)
             elif kind == "identity_backup":
                 backup = packet.get("backup")
-                if not isinstance(backup, dict) or not isinstance(backup.get("salt"), str) or not isinstance(backup.get("ciphertext"), str) or len(json.dumps(backup)) > 20000:
+                if (not isinstance(backup, dict) or not isinstance(backup.get("salt"), str)
+                        or not isinstance(backup.get("ciphertext"), str)
+                        or not isinstance(backup.get("recovery_proof"), str)
+                        or len(backup["recovery_proof"]) != 64 or len(json.dumps(backup)) > 20000):
                     send(sock, {"type": "error", "message": "invalid encrypted backup"})
                     continue
                 with LOCK:
