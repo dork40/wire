@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.17"
+SERVER_VERSION = "1.4.18"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -397,21 +397,22 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "error", "message": "invalid group name or members"})
                     continue
                 group_key = group_name.lower()
-                requested_keys = [item.lower() for item in requested if isinstance(item, str) and item.isalnum()]
+                requested_keys = [item.lower() for item in requested[:MAX_GROUP_MEMBERS] if isinstance(item, str) and item.isalnum()]
                 with LOCK:
                     users, groups = load_users(), load_groups()
                     if group_key in groups:
                         send(sock, {"type": "error", "message": "that group already exists"})
                         continue
-                    members = list(dict.fromkeys([key] + [item for item in requested_keys if item in users]))
-                    if len(members) > MAX_GROUP_MEMBERS:
-                        send(sock, {"type": "error", "message": f"groups support up to {MAX_GROUP_MEMBERS} members"})
-                        continue
-                    groups[group_key] = {"name": group_name, "owner": key, "admins": [key], "members": members, "invites": [], "pins": []}
+                    # Creation is not an implicit membership grant. The same
+                    # consent rule applies here as to later group invitations.
+                    invitees = list(dict.fromkeys(item for item in requested_keys if item in users and item != key
+                                                   and bool(users[item].get("allow_group_invites", True))))
+                    groups[group_key] = {"name": group_name, "owner": key, "admins": [key], "members": [key], "invites": invitees, "pins": []}
                     save_groups(groups)
                     detail = group_details(groups[group_key], users, set(ONLINE))
-                for member_key in members:
-                    deliver(member_key, {"type": "group_list", "groups": [detail]})
+                deliver(key, {"type": "group_list", "groups": [detail]})
+                for member_key in invitees:
+                    deliver(member_key, {"type": "group_invite", "group": group_name, "from": name})
             elif kind == "group_list":
                 with LOCK:
                     users, groups = load_users(), load_groups()
@@ -448,6 +449,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     if not bool(users[member].get("allow_group_invites", True)):
                         send(sock, {"type": "error", "message": "that person does not allow group invites"}); continue
                     group.setdefault("invites", [])
+                    if member not in group["invites"] and len(group["invites"]) >= MAX_GROUP_MEMBERS:
+                        send(sock, {"type": "error", "message": "too many pending group invites"}); continue
                     if member not in group["invites"]: group["invites"].append(member); save_groups(groups)
                     inviter = name
                 if not deliver(member, {"type": "group_invite", "group": group["name"], "from": inviter}):
@@ -458,6 +461,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     users, groups = load_users(), load_groups(); group = groups.get(group_key)
                     if not group or key not in group.get("invites", []):
                         send(sock, {"type": "error", "message": "no pending group invite"}); continue
+                    if len(group.get("members", [])) >= MAX_GROUP_MEMBERS:
+                        send(sock, {"type": "error", "message": f"groups support up to {MAX_GROUP_MEMBERS} members"}); continue
                     group["invites"].remove(key); group["members"].append(key); save_groups(groups)
                     detail = group_details(group, users, set(ONLINE))
                 for member_key in group["members"]: deliver(member_key, {"type": "group_list", "groups": [detail]})

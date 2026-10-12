@@ -1,4 +1,5 @@
 import importlib.util
+import base64
 import os
 import socket
 import threading
@@ -7,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import wire
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 
 def load_server_module():
@@ -65,6 +67,38 @@ class TransportTests(unittest.TestCase):
         (server.STATE, server.USERS_FILE, server.QUEUES_FILE,
          server.MAX_OFFLINE_QUEUE_PACKETS, server.MAX_OFFLINE_QUEUE_BYTES,
          server.RELAY_RATE_BYTES_PER_SECOND, server.RELAY_RATE_BURST_BYTES) = original
+
+    def test_group_creation_respects_invite_permission(self):
+        server = load_server_module()
+        original = (server.STATE, server.USERS_FILE, server.GROUPS_FILE, server.QUEUES_FILE)
+        signing = ed25519.Ed25519PrivateKey.generate()
+        public = base64.b64encode(b"p" * 32).decode("ascii")
+        signing_public = base64.b64encode(signing.public_key().public_bytes_raw()).decode("ascii")
+        with tempfile.TemporaryDirectory() as temporary:
+            server.STATE = Path(temporary)
+            server.USERS_FILE = server.STATE / "users.json"
+            server.GROUPS_FILE = server.STATE / "groups.json"
+            server.QUEUES_FILE = server.STATE / "offline-queue.json"
+            server.save_users({
+                "owner": {"name": "owner", "public": public, "sign_public": signing_public},
+                "privateuser": {"name": "privateuser", "public": public, "sign_public": signing_public, "allow_group_invites": False},
+            })
+            client, service = socket.socketpair()
+            worker = threading.Thread(target=server.handle, args=(service, ("127.0.0.1", 1)))
+            worker.start()
+            server.send(client, {"type": "hello", "name": "owner", "public": public, "sign_public": signing_public})
+            challenge = server.receive(client)
+            nonce = base64.b64decode(challenge["nonce"])
+            signature = signing.sign(server.login_proof_bytes("owner", nonce))
+            server.send(client, {"type": "prove", "signature": base64.b64encode(signature).decode("ascii")})
+            self.assertEqual(server.receive(client)["type"], "ready")
+            server.send(client, {"type": "group_create", "name": "consent", "members": ["privateuser"]})
+            self.assertEqual(server.receive(client)["type"], "group_list")
+            group = server.load_groups()["consent"]
+            self.assertEqual(group["members"], ["owner"])
+            self.assertEqual(group["invites"], [])
+            client.close(); worker.join(timeout=5)
+        server.STATE, server.USERS_FILE, server.GROUPS_FILE, server.QUEUES_FILE = original
 
     def test_server_packets_do_not_interleave(self):
         server = load_server_module()
