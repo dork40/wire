@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.14"
+SERVER_VERSION = "1.4.15"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -24,6 +24,12 @@ BACKUPS_FILE = STATE / "identity-backups.json"
 QUEUES_FILE = STATE / "offline-queue.json"
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str]] = {}
+# A client can be sent packets by its own handler and by any number of other
+# handlers (messages, file relay, group updates).  TCP is a byte stream, so
+# concurrent sendall() calls can splice two length-prefixed packets together.
+# Keep a small lock per socket so every packet remains one complete frame.
+SEND_LOCKS: dict[int, threading.Lock] = {}
+SEND_LOCKS_LOCK = threading.Lock()
 
 
 def receive_exact(sock: socket.socket, count: int) -> bytes:
@@ -45,7 +51,11 @@ def receive(sock: socket.socket) -> dict:
 
 def send(sock: socket.socket, packet: dict) -> None:
     raw = json.dumps(packet, separators=(",", ":")).encode("utf-8")
-    sock.sendall(struct.pack("!I", len(raw)) + raw)
+    framed = struct.pack("!I", len(raw)) + raw
+    with SEND_LOCKS_LOCK:
+        write_lock = SEND_LOCKS.setdefault(id(sock), threading.Lock())
+    with write_lock:
+        sock.sendall(framed)
 
 
 def load_users() -> dict:
@@ -510,6 +520,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             sock.close()
         except OSError:
             pass
+        with SEND_LOCKS_LOCK:
+            SEND_LOCKS.pop(id(sock), None)
 
 
 def main() -> None:
