@@ -85,6 +85,7 @@ HISTORY_DIR = DATA / "history"
 CONTACTS_DIR = DATA / "contacts"
 SETTINGS_FILE = DATA / "settings.json"
 DOWNLOADS_DIR = Path.home() / "Downloads" / "Wire"
+DIAGNOSTIC_LOG = DATA / "wire-diagnostics.log"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_CHUNK_BYTES = 40 * 1024
@@ -165,6 +166,17 @@ def load_settings() -> dict:
 def save_settings(settings: dict) -> None:
     DATA.mkdir(exist_ok=True)
     SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
+
+
+def report_background_failure(area: str, exc: BaseException) -> None:
+    """Keep unexpected worker failures inspectable without exposing message data."""
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with DIAGNOSTIC_LOG.open("a", encoding="utf-8") as log:
+            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {area}: {type(exc).__name__}: {exc}\n")
+    except OSError:
+        pass
+    say(f"{area} stopped unexpectedly; details saved to {DIAGNOSTIC_LOG}")
 
 
 def stream_capabilities() -> dict:
@@ -313,25 +325,6 @@ def refresh_prompt_display() -> None:
     except RuntimeError:
         # Wire can be shutting down while a typing-expiry timer fires.
         pass
-
-
-def draw_mouse_cursor(image: Image.Image, monitor: dict) -> None:
-    """Draw a clear cursor into a captured desktop frame on Windows."""
-    if os.name != "nt":
-        return
-    class Point(ctypes.Structure):
-        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-    point = Point()
-    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
-        return
-    x, y = point.x - monitor["left"], point.y - monitor["top"]
-    if not (0 <= x < image.width and 0 <= y < image.height):
-        return
-    draw = ImageDraw.Draw(image)
-    arrow = [(x, y), (x, y + 20), (x + 5, y + 15), (x + 10, y + 25),
-             (x + 14, y + 23), (x + 9, y + 13), (x + 18, y + 13)]
-    draw.line(arrow + [arrow[0]], fill="black", width=4, joint="curve")
-    draw.polygon(arrow, fill="white")
 
 
 def screen_viewer_process(frames: object, title: str, stop: object) -> None:
@@ -648,7 +641,6 @@ class Wire:
         self.outgoing_files: dict[str, dict] = {}
         self.incoming_files: dict[str, dict] = {}
         self.pending_shares: dict[str, dict] = {}
-        self.outgoing_shares: dict[str, dict] = {}
         self.webrtc_shares: dict[str, WebRTCShare] = {}
         self.share_peers: dict[str, str] = {}
         self.share_viewers: dict[str, mp.Process] = {}
@@ -1609,77 +1601,6 @@ class Wire:
             raise
         say(f"WebRTC screen-share offer sent to {peer.name}; waiting for them to accept")
 
-    def share_sender(self, share_id: str) -> None:
-        state = self.outgoing_shares.get(share_id)
-        if not state:
-            return
-        listener, peer, offer, stop_event = state["listener"], state["peer"], state["offer"], state["stop"]
-        connection: Optional[socket.socket] = None
-        try:
-            connection, _ = listener.accept()
-            connection.settimeout(30)
-            hello = self.read_direct_packet(connection, peer.key)
-            if hello.get("kind") != "share_hello" or hello.get("id") != share_id or not hmac.compare_digest(str(hello.get("token", "")), offer["token"]):
-                raise ValueError("screen-share viewer could not be verified")
-            self.send_direct_packet(connection, peer.key, {"kind": "share_start", "id": share_id})
-            width, height = offer["resolution"]
-            frame_time = 1 / offer["fps"]
-            # A per-frame budget keeps bandwidth stable. When the selected
-            # resolution cannot fit, Wire lowers JPEG detail/size first so
-            # motion remains smooth instead of building a huge send backlog.
-            target_bytes = max(20_000, int(STREAM_BITRATES[self.settings["stream_bitrate"]] * 125_000 / offer["fps"]))
-            with mss.mss() as capture:
-                monitor = capture.monitors[1]
-                say(f"screen sharing with {peer.name}; type /share stop to end")
-                while not stop_event.is_set():
-                    started = time.monotonic()
-                    grabbed = capture.grab(monitor)
-                    image = Image.frombytes("RGB", grabbed.size, grabbed.rgb)
-                    draw_mouse_cursor(image, monitor)
-                    image.thumbnail((width, height), Image.Resampling.LANCZOS)
-                    # Avoid JPEG optimize=True here: it gives only a small
-                    # size gain but is much too expensive for live video.
-                    # Scale and quality adapt to the selected bitrate.
-                    frame = b""
-                    for scale in (1.0, 0.85, 0.70, 0.55, 0.42):
-                        candidate = image if scale == 1.0 else image.resize(
-                            (max(320, int(image.width * scale)), max(180, int(image.height * scale))),
-                            Image.Resampling.BILINEAR,
-                        )
-                        for quality in (75, 65, 55, 45, 35, 25):
-                            raw = io.BytesIO()
-                            candidate.save(raw, format="JPEG", quality=quality)
-                            frame = raw.getvalue()
-                            if len(frame) <= target_bytes:
-                                break
-                        if len(frame) <= target_bytes:
-                            break
-                    if len(frame) > min(target_bytes, 2_400_000):
-                        # A very busy desktop can still be too large. Skip it
-                        # rather than delaying every following frame.
-                        continue
-                    self.send_direct_packet(connection, peer.key, {"kind": "share_frame", "id": share_id, "jpeg": b64(frame)})
-                    time.sleep(max(0, frame_time - (time.monotonic() - started)))
-        except socket.timeout:
-            if not stop_event.is_set():
-                say("screen-share offer expired")
-        except Exception as exc:
-            # Closing the listener is how /share stop cancels a waiting
-            # offer. Windows reports that as an OSError; it is not a failure.
-            if not stop_event.is_set():
-                say(f"screen share stopped: {exc}")
-        finally:
-            self.outgoing_shares.pop(share_id, None)
-            try:
-                listener.close()
-            except OSError:
-                pass
-            if connection:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
-
     def stop_screen_share(self) -> None:
         """Cancel an unanswered offer or end an active share immediately."""
         had_webrtc = bool(self.webrtc_shares)
@@ -1698,17 +1619,9 @@ class Wire:
             if viewer.is_alive(): viewer.terminate()
         self.share_viewers.clear()
         self.share_viewer_stops.clear()
-        states = list(self.outgoing_shares.values())
-        if not states and not had_webrtc:
+        if not had_webrtc:
             say("no screen share is active")
             return
-        self.outgoing_shares.clear()
-        for state in states:
-            state["stop"].set()
-            try:
-                state["listener"].close()
-            except OSError:
-                pass
         say("screen share stopped")
 
     def answer_share_offer(self, code: str, accept: bool) -> None:
@@ -1757,6 +1670,7 @@ class Wire:
             if viewer.is_alive(): viewer.terminate()
         except Exception as exc:
             say(f"screen share failed: {exc}")
+            report_background_failure("screen share", exc)
         finally:
             self.share_viewers.pop(share_id, None)
             self.share_viewer_stops.pop(share_id, None)
@@ -1778,67 +1692,6 @@ class Wire:
             media.close()
         if remote:
             say("screen share ended by the other person")
-
-    def share_viewer(self, peer: Peer, state: dict) -> None:
-        offer, share_id = state["offer"], state["offer"]["id"]
-        connection: Optional[socket.socket] = None
-        frames: queue.Queue[bytes] = queue.Queue(maxsize=2)
-        closed = threading.Event()
-        try:
-            connection = socket.create_connection((state["host"], state["port"]), timeout=15)
-            connection.settimeout(30)
-            self.send_direct_packet(connection, peer.key, {"kind": "share_hello", "id": share_id, "token": offer["token"]})
-            if self.read_direct_packet(connection, peer.key).get("kind") != "share_start":
-                raise ValueError("screen-share sender did not verify")
-            def receive_frames() -> None:
-                try:
-                    while not closed.is_set():
-                        frame = self.read_direct_packet(connection, peer.key)
-                        if frame.get("kind") != "share_frame" or frame.get("id") != share_id:
-                            return
-                        jpeg = unb64(frame.get("jpeg", ""))
-                        if len(jpeg) > 2_700_000:
-                            return
-                        while frames.full():
-                            frames.get_nowait()
-                        frames.put_nowait(jpeg)
-                except Exception:
-                    pass
-                finally:
-                    closed.set()
-            threading.Thread(target=receive_frames, daemon=True).start()
-            root = tk.Tk()
-            root.title(f"Wire screen share — {peer.name}")
-            label = tk.Label(root, text="Waiting for encrypted screen frames…", bg="black", fg="white")
-            label.pack()
-            def close_viewer() -> None:
-                closed.set()
-                root.destroy()
-            root.protocol("WM_DELETE_WINDOW", close_viewer)
-            def draw() -> None:
-                if closed.is_set():
-                    close_viewer()
-                    return
-                latest = None
-                while not frames.empty():
-                    latest = frames.get_nowait()
-                if latest:
-                    image = Image.open(io.BytesIO(latest))
-                    shown = ImageTk.PhotoImage(image)
-                    label.configure(image=shown, text="")
-                    label.image = shown
-                root.after(15, draw)
-            root.after(15, draw)
-            root.mainloop()
-        except Exception as exc:
-            say(f"screen share failed: {exc}")
-        finally:
-            if connection:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
-            say("screen-share viewer closed")
 
     def preview_image(self, path: Path) -> None:
         try:
@@ -2197,8 +2050,9 @@ class Wire:
             while True:
                 packet = recv_frame(peer.sock)
                 self.handle_message(peer, packet)
-        except Exception:
-            pass
+        except Exception as exc:
+            if not isinstance(exc, (ConnectionError, OSError)):
+                report_background_failure(f"room connection with {peer.name}", exc)
         finally:
             self.peers.pop(peer.name.lower(), None)
             if self.room == peer.name.lower():
@@ -2482,9 +2336,11 @@ class Wire:
                         self.handle_message(peer, packet["packet"])
                 elif kind == "error":
                     say(f"directory: {packet.get('message', 'error')}")
-        except Exception:
+        except Exception as exc:
             if self.server is sock:
                 self.server = None
+                if not isinstance(exc, (ConnectionError, OSError)):
+                    report_background_failure("username directory connection", exc)
                 say("\ndirectory disconnected")
 
     def listen(self, port: int) -> None:
