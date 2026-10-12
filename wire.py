@@ -68,6 +68,7 @@ APP = "wire"
 PORT = 46565
 DEFAULT_DIRECTORY_HOST = "wirecmd.ddns.net"
 DEFAULT_DIRECTORY_PORT = 47666
+INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/dork40/wire/main/install-wire.ps1"
 # Account data must never live beside a versioned package/executable.  Updates,
 # pipx environments and portable builds can be replaced without losing users.
 if os.name == "nt":
@@ -335,6 +336,21 @@ def toast(text: str) -> None:
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception:
         pass
+
+
+def start_update_after_exit() -> None:
+    """Start an updater in another console after this Wire process releases its files."""
+    if os.name != "nt":
+        raise ValueError("automatic updating is currently available on Windows only")
+    script = (
+        f"$wirePid = {os.getpid()}; "
+        "Wait-Process -Id $wirePid -ErrorAction SilentlyContinue; "
+        f"irm {INSTALL_SCRIPT_URL} | iex; "
+        "Write-Host ''; Read-Host 'Update complete. Press Enter to close this window'"
+    )
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+                     creationflags=flags)
 
 
 def enable_terminal_color() -> None:
@@ -2316,6 +2332,26 @@ class Wire:
             if peer.sock:
                 peer.sock.close()
 
+    def close_active_chat(self) -> None:
+        """Close the current room while leaving Wire and the directory online."""
+        if self.group_room:
+            self.group_room = None
+            say("group chat closed")
+            return
+        room_name = self.room
+        if not room_name:
+            say("no chat is open")
+            return
+        self.room = None
+        peer = self.peers.pop(room_name, None)
+        if peer and peer.sock:
+            try:
+                peer.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            peer.sock.close()
+        say("chat closed")
+
 
 HELP = """WIRE HELP
 
@@ -2433,8 +2469,11 @@ SETTINGS AND UTILITIES
                                       Includes Do Not Disturb and Allow group invites.
   /settings delete                   Delete this PC's local account data.
   /identity / /fingerprint <name>    Show safety fingerprints.
-  /ping / /testnotify / /update      Connection, notification, and update checks.
-  /help / /exit                      Show this help or close Wire.
+  /ping / /testnotify                Connection and notification checks.
+  /update                            Close Wire and install the newest version.
+  /checkupdate                       Check whether a newer version exists.
+  /exit                              Close the active chat but keep Wire open.
+  /quit                              Close Wire.
 
 Typing indicators clear automatically five seconds after typing stops."""
 
@@ -2651,6 +2690,10 @@ def main() -> None:
                     app.pending_pings[ping_id] = time.monotonic()
                     app.server_send({"type": "ping", "id": ping_id})
                 elif command == "update":
+                    print("Wire will close, then install the newest version in a separate window.")
+                    start_update_after_exit()
+                    break
+                elif command == "checkupdate":
                     check_for_update()
                 elif command == "testnotify":
                     toast("Wire notifications are working.")
@@ -2739,7 +2782,9 @@ def main() -> None:
                     if not peer:
                         raise ValueError("not connected to that user")
                     print(fingerprint(peer.public_key))
-                elif command in ("exit", "quit"):
+                elif command == "exit":
+                    app.close_active_chat()
+                elif command == "quit":
                     break
                 else:
                     if len(app.peers) == 1:
