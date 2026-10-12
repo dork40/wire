@@ -2507,6 +2507,12 @@ def main() -> None:
             except (OSError, ConnectionError):
                 pass
         session.default_buffer.on_text_changed += announce_typing
+    # Keep prompt_toolkit's stdout proxy active for the whole app, not only
+    # while prompt() is running. Directory replies can arrive in the tiny gap
+    # between commands; without this, they print but leave no visible prompt.
+    stdout_proxy = patch_stdout() if session and patch_stdout else None
+    if stdout_proxy:
+        stdout_proxy.__enter__()
     try:
         while True:
             try:
@@ -2514,11 +2520,10 @@ def main() -> None:
                 prompt = app.name or "wire"
                 global ACTIVE_PROMPT
                 ACTIVE_PROMPT = prompt
-                if session and patch_stdout:
+                if session:
                     # Incoming messages print above the prompt, then this redraws
                     # whatever the person was already typing without losing it.
-                    with patch_stdout():
-                        line = session.prompt(f"{prompt} > ").strip()
+                    line = session.prompt(f"{prompt} > ").strip()
                 else:
                     line = input(f"{prompt} > ").strip()
             except (EOFError, KeyboardInterrupt):
@@ -2795,6 +2800,8 @@ def main() -> None:
                 print(f"error: {exc}")
     finally:
         app.close()
+        if stdout_proxy:
+            stdout_proxy.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
