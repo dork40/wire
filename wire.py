@@ -291,14 +291,11 @@ def say(text: str) -> None:
                 # context variable.  Set it explicitly so run_in_terminal()
                 # erases and redraws the active prompt instead of printing over it.
                 with set_app(application):
-                    # prompt_toolkit 3 returns an awaitable here.  Calling it
-                    # without scheduling it means background messages only
-                    # appear after the next Enter key, and raw-input fallback
-                    # then exposes arrow-key escape sequences.  Run it on the
-                    # application's own loop so the current input redraws.
-                    application.create_background_task(
-                        run_in_terminal(lambda: application.print_text(text))
-                    )
+                    # `run_in_terminal` already creates and schedules its own
+                    # task. Passing that Task into create_background_task()
+                    # raises a TypeError, then output falls back to the queue
+                    # and appears only after Enter. Schedule it directly.
+                    run_in_terminal(lambda: application.print_text(text))
             except Exception:
                 with PRINT_LOCK:
                     print(text, flush=True)
