@@ -9,6 +9,7 @@ from pathlib import Path
 
 import wire
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from PIL import Image
 
 
 def load_server_module():
@@ -21,6 +22,15 @@ def load_server_module():
 
 
 class TransportTests(unittest.TestCase):
+    def test_share_menu_does_not_advertise_unverified_high_fps(self):
+        self.assertEqual(max(wire.STREAM_FPS), 60)
+
+    def test_gif_frame_has_compact_terminal_rendering(self):
+        image = Image.new("RGB", (8, 8), (10, 20, 30))
+        text, lines = wire.Wire.gif_frame_text(image, "motion.gif")
+        self.assertIn("GIF: motion.gif", text)
+        self.assertGreater(lines, 1)
+
     def test_identity_recovery_requires_password_proof(self):
         server = load_server_module()
         original_state, original_backups = server.STATE, server.BACKUPS_FILE

@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageSequence
 try:
     import tkinter as tk
     from PIL import ImageTk
@@ -107,7 +107,9 @@ RELAY_UPLOAD_EXPANSION = 1.42
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
 TRANSFER_TEMP_DIR = DATA / "transfer-temp"
 STREAM_RESOLUTIONS = [(640, 360), (854, 480), (1280, 720), (1600, 900), (1920, 1080), (2560, 1440), (3840, 2160)]
-STREAM_FPS = [15, 24, 30, 60, 90, 120]
+# The Python/aiortc path cannot honestly sustain 90/120 FPS across supported
+# hardware. Keep the menu to targets it can reasonably measure and report.
+STREAM_FPS = [15, 24, 30, 60]
 # This is a target, not a promise: actual FPS also depends on the PC and LAN.
 STREAM_BITRATES = [1, 2, 4, 8, 12, 20, 35, 50]
 STREAM_PROFILES = ("auto", "low-resource", "balanced", "smooth", "gaming", "ultra")
@@ -205,8 +207,8 @@ def stream_capabilities() -> dict:
 
 def apply_stream_profile(settings: dict) -> None:
     profiles = {
-        "low-resource": (1, 2, 1), "balanced": (2, 2, 2), "smooth": (4, 3, 3),
-        "gaming": (4, 3, 4), "ultra": (5, 3, 5),
+        "low-resource": (1, 2, 1), "balanced": (2, 2, 2), "smooth": (4, 3, 4),
+        "gaming": (4, 3, 5), "ultra": (5, 3, 5),
     }
     if settings.get("stream_profile") in profiles:
         settings["stream_resolution"], settings["stream_fps"], settings["stream_bitrate"] = profiles[settings["stream_profile"]]
@@ -342,6 +344,34 @@ def refresh_prompt_display() -> None:
     except RuntimeError:
         # Wire can be shutting down while a typing-expiry timer fires.
         pass
+
+
+def read_menu_key() -> str:
+    """Read one settings-menu key on Windows or a POSIX terminal."""
+    if msvcrt is not None:
+        key = msvcrt.getwch()
+        if key in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down", "K": "left", "M": "right"}.get(msvcrt.getwch(), "")
+        return {"\r": "enter", "\x1b": "escape"}.get(key, key)
+    if not sys.stdin.isatty():
+        return "escape"
+    # Linux/macOS send ANSI sequences such as ESC [ A for the arrow keys.
+    # Switch only this small menu to raw mode, restoring the terminal before
+    # each redraw so an exception cannot leave the shell unusable.
+    import select
+    import termios
+    import tty
+    descriptor = sys.stdin.fileno()
+    original = termios.tcgetattr(descriptor)
+    try:
+        tty.setraw(descriptor)
+        key = sys.stdin.read(1)
+        if key == "\x1b" and select.select([sys.stdin], [], [], 0.05)[0]:
+            if sys.stdin.read(1) == "[":
+                return {"A": "up", "B": "down", "C": "right", "D": "left"}.get(sys.stdin.read(1), "")
+        return {"\r": "enter", "\n": "enter", "\x1b": "escape"}.get(key, key)
+    finally:
+        termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
 
 
 def screen_viewer_process(frames: object, title: str, stop: object) -> None:
@@ -927,10 +957,7 @@ class Wire:
             return 1
 
     def settings_menu(self) -> None:
-        """Small keyboard-only menu for Command Prompt and Windows Terminal."""
-        if msvcrt is None:
-            self.show_settings()
-            return
+        """Small keyboard-only menu for Windows, Linux, and macOS terminals."""
         selected = 0
         while True:
             inputs, outputs = self.voice_devices("input"), self.voice_devices("output")
@@ -949,7 +976,7 @@ class Wire:
                 ("Speakers (next call)", output_name),
                 ("Share monitor", str(min(self.settings["stream_monitor"], self.monitor_count()))),
                 ("Share resolution", f"{STREAM_RESOLUTIONS[self.settings['stream_resolution']][0]}x{STREAM_RESOLUTIONS[self.settings['stream_resolution']][1]}"),
-                ("Share FPS", str(STREAM_FPS[self.settings["stream_fps"]])),
+                ("Share FPS target", str(STREAM_FPS[self.settings["stream_fps"]]) + " (max 60)"),
                 ("Share bitrate", f"{STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps" + (" (20 max)" if STREAM_BITRATES[self.settings['stream_bitrate']] > 20 else "")),
                 ("Share profile", self.settings["stream_profile"]),
                 ("Share codec", self.settings["stream_codec"]),
@@ -969,7 +996,7 @@ class Wire:
                 "Selects the speakers for your next call.",
                 "Selects which display /share captures.",
                 "Higher resolutions need more encoder and network capacity.",
-                "Higher FPS needs more encoder and network capacity.",
+                "60 is the highest supported target; use /share stats to see actual capture and send FPS.",
                 "A target rate; WebRTC can adapt. This encoder currently caps at 20 Mbps.",
                 "Profiles choose sensible resolution, FPS, and bitrate starting points.",
                 "Auto selects a compatible WebRTC codec when possible.",
@@ -984,15 +1011,13 @@ class Wire:
                 marker = ">" if index == selected else " "
                 print(f"{marker} {label}: {value}" if value else f"{marker} {label}")
             print(f"\n{hints[selected]}")
-            key = msvcrt.getwch()
-            if key in ("\x00", "\xe0"):
-                key = msvcrt.getwch()
-                if key == "H":
-                    selected = (selected - 1) % len(rows)
-                elif key == "P":
-                    selected = (selected + 1) % len(rows)
-                elif key in ("K", "M"):
-                    direction = -1 if key == "K" else 1
+            key = read_menu_key()
+            if key == "up":
+                selected = (selected - 1) % len(rows)
+            elif key == "down":
+                selected = (selected + 1) % len(rows)
+            elif key in ("left", "right"):
+                    direction = -1 if key == "left" else 1
                     if selected == 0:
                         self.settings["notifications"] = not self.settings["notifications"]
                     elif selected == 1:
@@ -1036,10 +1061,10 @@ class Wire:
                     save_settings(self.settings)
                     self.apply_voice_settings()
                     self.sync_preferences()
-            elif key in ("\r", "\x1b") and selected == 17:
+            elif key in ("enter", "escape") and selected == 17:
                 print()
                 return
-            elif key == "\x1b":
+            elif key == "escape":
                 print()
                 return
 
@@ -1748,6 +1773,13 @@ class Wire:
 
     def preview_image(self, path: Path) -> None:
         try:
+            if path.suffix.lower() == ".gif":
+                say(f"GIF received: {path.name}")
+                # GIFs arrive through the normal /send image flow. Play one
+                # compact loop without asking the recipient for another
+                # command or opening an external image window.
+                threading.Thread(target=self.preview_gif, args=(str(path),), daemon=True).start()
+                return
             # CMD's ANSI/color support is inconsistent and the old text card
             # could become mojibake or a wall of # characters. On Windows use
             # the user's normal image viewer, which keeps the chat readable.
@@ -1777,6 +1809,47 @@ class Wire:
                 say("  └" + "─" * card_width + "┘")
         except Exception:
             say("[image preview unavailable]")
+
+    @staticmethod
+    def gif_frame_text(image: Image.Image, name: str) -> tuple[str, int]:
+        """Compact true-colour terminal frame; standard consoles lack GIF image APIs."""
+        image = image.convert("RGB")
+        image.thumbnail((36, 18), Image.Resampling.LANCZOS)
+        pixels = image.load()
+        lines = [f"GIF: {name}  (one loop; Ctrl+C stops)"]
+        for y in range(0, image.height, 2):
+            row = []
+            for x in range(image.width):
+                top = pixels[x, y]
+                bottom = pixels[x, min(y + 1, image.height - 1)]
+                row.append(f"\x1b[38;2;{top[0]};{top[1]};{top[2]}m\x1b[48;2;{bottom[0]};{bottom[1]};{bottom[2]}m▀")
+            lines.append("".join(row) + "\x1b[0m")
+        return "\n".join(lines), len(lines)
+
+    def preview_gif(self, value: str) -> None:
+        path = Path(value.strip().strip('"')).expanduser()
+        if not path.is_file() or path.suffix.lower() != ".gif":
+            raise ValueError("choose a GIF file")
+        try:
+            with Image.open(path) as source:
+                if not getattr(source, "is_animated", False):
+                    raise ValueError("that GIF has only one frame")
+                previous_lines = 0
+                print("\x1b[?25l", end="", flush=True)
+                try:
+                    for index, frame in enumerate(ImageSequence.Iterator(source)):
+                        if index >= 60:
+                            break
+                        text, line_count = self.gif_frame_text(frame.copy(), path.name)
+                        if previous_lines:
+                            print(f"\x1b[{previous_lines}F", end="")
+                        print(text, flush=True)
+                        previous_lines = line_count
+                        time.sleep(min(0.15, max(0.04, frame.info.get("duration", 100) / 1000)))
+                finally:
+                    print("\x1b[0m\x1b[?25h", flush=True)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"could not play GIF: {exc}") from exc
 
     @staticmethod
     def sixel_rle(values: str) -> str:
@@ -1861,7 +1934,9 @@ class Wire:
                     index += 1
             peer.send_image_frame({"kind": "end", "id": image_id})
             say(f"sent image: {path.name}")
-            self.preview_image(path)
+            # The recipient previews the received image. Do not open another
+            # copy on the sender, especially when both Wire accounts happen
+            # to be running on the same computer.
         except Exception as exc:
             try:
                 self.pace_relay_upload(256)
@@ -2244,6 +2319,20 @@ class Wire:
             online = sum(1 for member in group.get("members", []) if member.get("online"))
             mine = next((member.get("role", "member") for member in group.get("members", []) if member.get("name", "").lower() == self.name.lower()), "member")
             say(f"{group['name']}  [{online}/{len(group.get('members', []))} online]  {mine}")
+
+    def show_group_members(self, group: dict) -> None:
+        """Show the people in a group when it is opened, without a new UI."""
+        members = []
+        for member in group.get("members", []):
+            name = str(member.get("name", "?"))
+            status = "online" if member.get("online") else "offline"
+            role = " admin" if member.get("role") == "admin" else ""
+            you = " (you)" if self.name and name.lower() == self.name.lower() else ""
+            members.append(f"{name}{you} [{status}{role}]")
+        width = shutil.get_terminal_size(fallback=(100, 24)).columns
+        heading = f"GROUP {group['name']}"
+        say("\n" + heading + " " * max(1, width - len(heading) - len("MEMBERS")) + "MEMBERS")
+        say(" | ".join(members) or "no members")
 
     def send_group_message(self, group_name: str, text: str) -> None:
         group = self.groups.get(group_name.lower())
@@ -2638,7 +2727,7 @@ FILES AND MEDIA
   /share stop|close / /share stats   Stop sharing or show live share statistics.
 
 GROUPS
-  /group list / create <name> <people...> / open <name>
+  /group list / create <name> <people...> / open|members <name>
   /group invite|accept|kick <group> <person>
   /group admin|member <group> <person>
   /group pin|unpin <group> <message-code> / pins <group>
@@ -2802,7 +2891,13 @@ def main() -> None:
                         app.group_room = group["name"].lower()
                         app.room = None
                         print(f"group open: {group['name']} (type normally; /group leave {group['name']} to leave)")
+                        app.show_group_members(group)
                         app.show_history(f"group-{group['name']}")
+                    elif pieces[0] == "members" and len(pieces) == 2:
+                        group = app.groups.get(pieces[1].lower())
+                        if not group:
+                            raise ValueError("unknown group; use /group list first")
+                        app.show_group_members(group)
                     elif pieces[0] in ("add", "invite") and len(pieces) == 3:
                         app.server_send({"type": "group_invite", "group": pieces[1], "member": pieces[2]})
                     elif pieces[0] == "accept" and len(pieces) == 2:
@@ -2820,7 +2915,7 @@ def main() -> None:
                     elif pieces[0] == "leave" and len(pieces) == 2:
                         app.server_send({"type": "group_leave", "group": pieces[1]})
                     else:
-                        raise ValueError("use: /group create <name> <people...> | list | open <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | jump <name> <message-code> | leave <name>")
+                        raise ValueError("use: /group create <name> <people...> | list | open|members <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | jump <name> <message-code> | leave <name>")
                 elif command == "send":
                     room_peer = app.peers.get(app.room or "")
                     if not room_peer:
