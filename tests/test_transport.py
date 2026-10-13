@@ -115,7 +115,9 @@ class TransportTests(unittest.TestCase):
             nonce = base64.b64decode(challenge["nonce"])
             signature = signing.sign(server.login_proof_bytes("owner", nonce))
             server.send(client, {"type": "prove", "signature": base64.b64encode(signature).decode("ascii")})
-            self.assertEqual(server.receive(client)["type"], "ready")
+            ready = server.receive(client)
+            self.assertEqual(ready["type"], "ready")
+            self.assertEqual(ready["relay_rate"], server.RELAY_RATE_BYTES_PER_SECOND)
             server.send(client, {"type": "group_create", "name": "consent", "members": ["privateuser"]})
             self.assertEqual(server.receive(client)["type"], "group_list")
             group = server.load_groups()["consent"]

@@ -18,7 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.20"
+SERVER_VERSION = "1.4.21"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -38,8 +38,8 @@ MAX_CLIENT_FRAME_BYTES = 256 * 1024
 MAX_OFFLINE_QUEUE_PACKETS = 250
 MAX_OFFLINE_QUEUE_BYTES = 5 * 1024 * 1024
 MAX_GROUP_MEMBERS = 100
-RELAY_RATE_BYTES_PER_SECOND = 6 * 1024 * 1024
-RELAY_RATE_BURST_BYTES = 12 * 1024 * 1024
+RELAY_RATE_BYTES_PER_SECOND = 40 * 1024 * 1024
+RELAY_RATE_BURST_BYTES = 64 * 1024 * 1024
 RELAY_BUDGETS: dict[str, tuple[float, float]] = {}
 MAX_CONNECTIONS = 256
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
@@ -280,7 +280,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             queues = load_queues()
             queued_packets = queues.pop(key, [])
             if queued_packets: save_queues(queues)
-        send(sock, {"type": "ready", "name": name, "version": SERVER_VERSION})
+        send(sock, {"type": "ready", "name": name, "version": SERVER_VERSION,
+                    "relay_rate": RELAY_RATE_BYTES_PER_SECOND})
         sock.settimeout(None)
         for queued in queued_packets:
             if isinstance(queued, dict): send(sock, queued)

@@ -100,11 +100,8 @@ FILE_CHUNK_BYTES = 64 * 1024
 # The directory accepts up to 1 MB frames, but small chunks avoid making text,
 # voice, and control packets wait behind a huge encoded video/file packet.
 RELAY_FILE_CHUNK_BYTES = 24 * 1024
-# The directory deliberately protects itself from a single client flooding the
-# relay.  A file frame grows when it is JSON/base64/AES wrapped, so keep the
-# *raw* attachment stream below the server's 6 MiB/s allowance.  This makes
-# large transfers steady instead of accepting an initial burst and then
-# silently losing chunks to the protection limit.
+# Conservative fallback for older directories that do not advertise their
+# relay capacity. Newer directories negotiate a much higher safe pace.
 RELAY_UPLOAD_BYTES_PER_SECOND = 4 * 1024 * 1024
 RELAY_UPLOAD_EXPANSION = 1.42
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v"}
@@ -656,6 +653,7 @@ class Wire:
         # each assume they own the full bandwidth allowance.
         self.relay_upload_lock = threading.Lock()
         self.relay_next_send_at = 0.0
+        self.relay_upload_bytes_per_second = RELAY_UPLOAD_BYTES_PER_SECOND
         self.requests: dict[str, str] = {}
         self.incoming_images: dict[str, dict] = {}
         self.pending_images: dict[str, dict] = {}
@@ -2172,6 +2170,16 @@ class Wire:
                 raise ConnectionError(reply.get("message", "directory rejected login"))
             sock.settimeout(None)
             self.server = sock
+            # New directories advertise their wire-byte relay allowance. Keep
+            # headroom for encryption/base64 expansion and normal chat/voice
+            # packets. This is fast on a LAN without exceeding the server's
+            # anti-flood budget; old servers retain the safe fallback.
+            advertised_rate = reply.get("relay_rate")
+            if isinstance(advertised_rate, int) and 1 * 1024 * 1024 <= advertised_rate <= 64 * 1024 * 1024:
+                self.relay_upload_bytes_per_second = max(
+                    RELAY_UPLOAD_BYTES_PER_SECOND,
+                    int(advertised_rate / RELAY_UPLOAD_EXPANSION * 0.85),
+                )
             DATA.mkdir(exist_ok=True)
             SERVER_CONFIG.write_text(json.dumps({"host": host, "port": port}), encoding="utf-8")
             threading.Thread(target=self.server_loop, args=(sock,), daemon=True).start()
@@ -2192,7 +2200,7 @@ class Wire:
     def pace_relay_upload(self, raw_bytes: int) -> None:
         """Reserve relay bandwidth before sending an encrypted attachment frame."""
         expanded = max(1, int(raw_bytes * RELAY_UPLOAD_EXPANSION) + 256)
-        duration = expanded / RELAY_UPLOAD_BYTES_PER_SECOND
+        duration = expanded / self.relay_upload_bytes_per_second
         with self.relay_upload_lock:
             now = time.monotonic()
             scheduled = max(now, self.relay_next_send_at)
