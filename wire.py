@@ -49,16 +49,12 @@ from wire_webrtc import WebRTCShare
 
 try:
     from prompt_toolkit import PromptSession
-    from prompt_toolkit.application import run_in_terminal
-    from prompt_toolkit.application.current import set_app
     from prompt_toolkit.filters import Condition
     from prompt_toolkit.layout.containers import ConditionalContainer, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.patch_stdout import patch_stdout
 except ImportError:
     PromptSession = None
-    run_in_terminal = None
-    set_app = None
     Condition = ConditionalContainer = Window = FormattedTextControl = None
     patch_stdout = None
 
@@ -283,32 +279,12 @@ def recv_frame(sock: socket.socket) -> dict:
 
 def say(text: str) -> None:
     """Print background output without damaging the active prompt buffer."""
-    application = PROMPT_APPLICATION
-    if application and PROMPT_WAITING and application.is_running and getattr(application, "loop", None) and run_in_terminal and set_app:
-        def render_above_prompt() -> None:
-            try:
-                # This callback runs on the application's loop, but not in its
-                # context variable.  Set it explicitly so run_in_terminal()
-                # erases and redraws the active prompt instead of printing over it.
-                with set_app(application):
-                    # `run_in_terminal` already creates and schedules its own
-                    # task. Passing that Task into create_background_task()
-                    # raises a TypeError, then output falls back to the queue
-                    # and appears only after Enter. Schedule it directly.
-                    run_in_terminal(lambda: application.print_text(text))
-            except Exception:
-                with PRINT_LOCK:
-                    print(text, flush=True)
-        try:
-            application.loop.call_soon_threadsafe(render_above_prompt)
-            return
-        except RuntimeError:
-            pass
+    # `patch_stdout` wraps stdout while PromptSession is reading. It is the
+    # supported prompt_toolkit mechanism for worker-thread output: it erases
+    # and redraws the current input automatically, without waiting for Enter.
     if SAFE_PROMPT_ACTIVE:
-        # Between commands prompt_toolkit is not drawing. Queue output until
-        # main can print it immediately before the next clean prompt.
         with PRINT_LOCK:
-            PENDING_OUTPUT.append(text)
+            print(text, flush=True)
         return
     with PRINT_LOCK:
         print(text, flush=True)
@@ -2790,7 +2766,11 @@ def main() -> None:
                     # whatever the person was already typing without losing it.
                     PROMPT_WAITING = True
                     try:
-                        line = session.prompt(f"{prompt} > ").strip()
+                        if patch_stdout:
+                            with patch_stdout(raw=True):
+                                line = session.prompt(f"{prompt} > ").strip()
+                        else:
+                            line = session.prompt(f"{prompt} > ").strip()
                     finally:
                         PROMPT_WAITING = False
                 else:
