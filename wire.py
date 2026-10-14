@@ -2753,6 +2753,9 @@ def main() -> None:
             except (OSError, ConnectionError):
                 pass
         session.default_buffer.on_text_changed += announce_typing
+    stdout_context = patch_stdout(raw=True) if session and patch_stdout else None
+    if stdout_context:
+        stdout_context.__enter__()
     try:
         while True:
             try:
@@ -2766,11 +2769,7 @@ def main() -> None:
                     # whatever the person was already typing without losing it.
                     PROMPT_WAITING = True
                     try:
-                        if patch_stdout:
-                            with patch_stdout(raw=True):
-                                line = session.prompt(f"{prompt} > ").strip()
-                        else:
-                            line = session.prompt(f"{prompt} > ").strip()
+                        line = session.prompt(f"{prompt} > ").strip()
                     finally:
                         PROMPT_WAITING = False
                 else:
@@ -3064,6 +3063,8 @@ def main() -> None:
             except (ValueError, OSError, ConnectionError) as exc:
                 print(f"error: {exc}")
     finally:
+        if stdout_context:
+            stdout_context.__exit__(*sys.exc_info())
         app.close()
         PROMPT_APPLICATION = None
         PROMPT_WAITING = False
