@@ -359,6 +359,32 @@ def schedule_prompt_refresh(delay: float = 0.3) -> None:
         PROMPT_REFRESH_TIMER.start()
 
 
+def restart_blank_prompt_after_connect() -> None:
+    """Finish an empty hidden prompt after a background room connection.
+
+    This is the safe equivalent of pressing Enter once: it never submits or
+    clears text the user has started typing. Ending the empty prompt makes the
+    main loop create a new prompt below the completed history block.
+    """
+    application = PROMPT_APPLICATION
+    loop = getattr(application, "loop", None) if application else None
+    if not application or not application.is_running or not loop:
+        return
+
+    def restart_or_repaint() -> None:
+        buffer = application.current_buffer
+        if not buffer.text:
+            buffer.validate_and_handle()
+        else:
+            application.renderer.reset(_scroll=True, leave_alternate_screen=False)
+            application.invalidate()
+
+    try:
+        loop.call_soon_threadsafe(restart_or_repaint)
+    except RuntimeError:
+        pass
+
+
 def read_menu_key() -> str:
     """Read one settings-menu key on Windows or a POSIX terminal."""
     if msvcrt is not None:
@@ -2096,6 +2122,7 @@ class Wire:
         say(f"connected: {peer.name}  fingerprint: {fingerprint(peer.public_key)}")
         say(f"room open: {peer.name} (type normally; /help for commands)")
         self.show_history(peer.name)
+        restart_blank_prompt_after_connect()
         if peer.sock:
             threading.Thread(target=self.receive_loop, args=(peer,), daemon=True).start()
 
