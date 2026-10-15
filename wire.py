@@ -115,6 +115,8 @@ SAFE_PROMPT_ACTIVE = False
 PROMPT_APPLICATION = None
 PROMPT_WAITING = False
 PENDING_OUTPUT: list[str] = []
+PROMPT_REFRESH_LOCK = threading.Lock()
+PROMPT_REFRESH_TIMER: Optional[threading.Timer] = None
 
 
 def migrate_portable_data() -> None:
@@ -285,6 +287,7 @@ def say(text: str) -> None:
     if SAFE_PROMPT_ACTIVE:
         with PRINT_LOCK:
             print(text, flush=True)
+        schedule_prompt_refresh()
         return
     with PRINT_LOCK:
         print(text, flush=True)
@@ -317,6 +320,34 @@ def refresh_prompt_display() -> None:
     except RuntimeError:
         # Wire can be shutting down while a typing-expiry timer fires.
         pass
+
+
+def schedule_prompt_refresh(delay: float = 0.3) -> None:
+    """Repaint once background output has finished flushing.
+
+    prompt_toolkit moves worker-thread output above the current input line, but
+    its Windows stdout proxy flushes on a separate thread. A burst such as
+    room-open plus chat history can finish after the proxy's first repaint and
+    leave the live prompt visually blank until Enter is pressed. Debounce one
+    final invalidate after the proxy's 0.2 second flush window so the prompt
+    and any unfinished input are always visible.
+    """
+    if not SAFE_PROMPT_ACTIVE:
+        return
+    global PROMPT_REFRESH_TIMER
+
+    def refresh() -> None:
+        global PROMPT_REFRESH_TIMER
+        with PROMPT_REFRESH_LOCK:
+            PROMPT_REFRESH_TIMER = None
+        refresh_prompt_display()
+
+    with PROMPT_REFRESH_LOCK:
+        if PROMPT_REFRESH_TIMER is not None:
+            PROMPT_REFRESH_TIMER.cancel()
+        PROMPT_REFRESH_TIMER = threading.Timer(delay, refresh)
+        PROMPT_REFRESH_TIMER.daemon = True
+        PROMPT_REFRESH_TIMER.start()
 
 
 def read_menu_key() -> str:
@@ -2740,7 +2771,7 @@ def main() -> None:
         session = PromptSession(top_toolbar=typing_toolbar) if PromptSession else None
     except Exception:
         session = None
-    global SAFE_PROMPT_ACTIVE, PROMPT_APPLICATION, PROMPT_WAITING
+    global SAFE_PROMPT_ACTIVE, PROMPT_APPLICATION, PROMPT_WAITING, PROMPT_REFRESH_TIMER
     SAFE_PROMPT_ACTIVE = session is not None
     if session:
         PROMPT_APPLICATION = session.app
@@ -3063,6 +3094,10 @@ def main() -> None:
             except (ValueError, OSError, ConnectionError) as exc:
                 print(f"error: {exc}")
     finally:
+        with PROMPT_REFRESH_LOCK:
+            if PROMPT_REFRESH_TIMER is not None:
+                PROMPT_REFRESH_TIMER.cancel()
+                PROMPT_REFRESH_TIMER = None
         if stdout_context:
             stdout_context.__exit__(*sys.exc_info())
         app.close()
