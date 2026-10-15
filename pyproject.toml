@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wire-messenger"
-version = "1.4.51"
+version = "1.4.52"
 description = "Encrypted terminal messenger with WebRTC screen sharing"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "cryptography==50.0.2",
-  "Pillow==12.1.1",
+  "Pillow==12.3.0",
   "sounddevice==0.5.5",
   "pynput==1.8.1",
   "pywebrtc-audio==0.2.0",

@@ -46,6 +46,10 @@ directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
+Wire v1.4.52 requires directory server v1.4.22 or newer. The directory now uses
+TLS and a persistent signing identity; upgrade the server before upgrading
+clients. Keep the server state volume because it contains the pinned server key.
+
 ## Commands
 
 ```text
@@ -69,6 +73,13 @@ The directory address is saved after `server <host> [port]` is used once. In a n
 
 ## Security and current scope
 
-Passwords are never stored in plaintext. They derive a local key that encrypts the X25519 private identity on disk. Messages use an X25519 shared secret, HKDF-SHA256, and AES-256-GCM.
+Passwords are never stored in plaintext. They derive a local key that encrypts
+the X25519 and Ed25519 private identities on disk. Wire does not store a copy of
+that derived key. New accounts use scrypt with OWASP-equivalent parameters.
+Messages use an X25519 shared secret, HKDF-SHA256, and AES-256-GCM.
 
-The directory stores public identity keys and forwards encrypted packets only. Before trusting a new peer, compare their `identity` fingerprint with the fingerprint shown for them in your room.
+The directory stores public identity keys and forwards encrypted packets only.
+Directory traffic uses TLS with trust-on-first-use key pinning. Peer identity
+records and direct handshakes are signed, and peer identities are pinned after
+first contact. If Wire reports that a directory or peer identity changed, stop
+and verify the fingerprints rather than bypassing the warning.

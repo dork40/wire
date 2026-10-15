@@ -1,14 +1,21 @@
 import importlib.util
 import base64
+import hashlib
+import hmac
 import os
 import socket
+import subprocess
+import sys
 import threading
 import tempfile
+import time
 import unittest
+import json
 from pathlib import Path
 
 import wire
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.fernet import Fernet
 from PIL import Image
 
 
@@ -22,6 +29,50 @@ def load_server_module():
 
 
 class TransportTests(unittest.TestCase):
+    def test_terminal_control_sequences_are_removed(self):
+        hostile = "hello\x1b[2J\x1b]0;fake title\x07world"
+        rendered = wire.Wire().render_record({"from": "peer", "text": hostile})
+        self.assertNotIn("\x1b", rendered)
+        self.assertNotIn("\x07", rendered)
+        self.assertIn("hello", rendered)
+        self.assertIn("world", rendered)
+
+    def test_replayed_encrypted_nonce_is_rejected(self):
+        peer = wire.Peer("peer", None, os.urandom(32), os.urandom(32))
+        packet = {"nonce": wire.b64(os.urandom(12))}
+        self.assertTrue(peer.accept_nonce(packet))
+        self.assertFalse(peer.accept_nonce(packet))
+
+    def test_shutdown_drains_network_workers_before_stdout_finalizes(self):
+        app = wire.Wire()
+        server_side, server_peer = socket.socketpair()
+        room_side, room_peer = socket.socketpair()
+        app.server = server_side
+        peer = wire.Peer("peer", room_side, os.urandom(32), os.urandom(32))
+        app.peers["peer"] = peer
+        app.start_worker(app.server_loop, server_side)
+        app.start_worker(app.receive_loop, peer)
+        app.close()
+        server_peer.close(); room_peer.close()
+        with app.background_threads_lock:
+            self.assertEqual(app.background_threads, set())
+
+    def test_legacy_users_file_drops_password_derived_key_copy(self):
+        original_data, original_users = wire.DATA, wire.USERS
+        with tempfile.TemporaryDirectory() as temporary:
+            wire.DATA, wire.USERS = Path(temporary), Path(temporary) / "users.json"
+            salt = os.urandom(16)
+            secret = wire.derive("password", salt)
+            private = Fernet(base64.urlsafe_b64encode(secret)).encrypt(b"p" * 32).decode("ascii")
+            wire.USERS.write_text(json.dumps({"alice": {"name": "alice", "salt": wire.b64(salt), "check": wire.b64(secret), "private": private}}), encoding="utf-8")
+            loaded = wire.load_users()
+            self.assertNotIn("check", loaded["alice"])
+            self.assertNotIn("check", wire.USERS.read_text(encoding="utf-8"))
+        wire.DATA, wire.USERS = original_data, original_users
+
+    def test_new_password_kdf_meets_configured_work_factor(self):
+        self.assertEqual(wire.CURRENT_KDF, {"name": "scrypt", "n": 2**14, "r": 8, "p": 5})
+
     def test_share_menu_does_not_advertise_unverified_high_fps(self):
         self.assertEqual(max(wire.STREAM_FPS), 60)
 
@@ -53,6 +104,29 @@ class TransportTests(unittest.TestCase):
                 self.assertEqual(reply["type"], expected)
                 if expected == "error": self.assertNotIn("backup", reply)
                 client.close(); worker.join(timeout=5)
+        server.STATE, server.BACKUPS_FILE = original_state, original_backups
+
+    def test_identity_recovery_v2_uses_one_time_challenge(self):
+        server = load_server_module()
+        original_state, original_backups = server.STATE, server.BACKUPS_FILE
+        secret = b"s" * 32
+        verifier = hmac.new(secret, b"wire-v2-identity-recovery", hashlib.sha256).hexdigest()
+        backup = {"salt": "c2FsdA==", "kdf": wire.CURRENT_KDF, "ciphertext": "encrypted-account", "recovery_verifier": verifier}
+        with tempfile.TemporaryDirectory() as temporary:
+            server.STATE = Path(temporary)
+            server.BACKUPS_FILE = server.STATE / "identity-backups.json"
+            server.RECOVERY_ATTEMPTS.clear()
+            server.save_backups({"alice": backup})
+            client, service = socket.socketpair()
+            worker = threading.Thread(target=server.handle, args=(service, ("127.0.0.2", 1)))
+            worker.start()
+            server.send(client, {"type": "identity_fetch", "name": "alice"})
+            challenge = server.receive(client)
+            nonce = base64.b64decode(challenge["challenge"])
+            proof = hmac.new(bytes.fromhex(verifier), nonce, hashlib.sha256).hexdigest()
+            server.send(client, {"type": "identity_fetch_prove", "proof": proof})
+            self.assertEqual(server.receive(client)["type"], "identity_backup")
+            client.close(); worker.join(timeout=5)
         server.STATE, server.BACKUPS_FILE = original_state, original_backups
 
     def test_relay_limits_reject_queue_floods_and_rate_bursts(self):
@@ -123,6 +197,11 @@ class TransportTests(unittest.TestCase):
             server.send(client, {"type": "hello", "name": "owner", "public": public, "sign_public": signing_public})
             challenge = server.receive(client)
             nonce = base64.b64decode(challenge["nonce"])
+            directory_public = base64.b64decode(challenge["server_sign_public"])
+            ed25519.Ed25519PublicKey.from_public_bytes(directory_public).verify(
+                base64.b64decode(challenge["server_signature"]),
+                server.directory_proof_bytes("owner", public, signing_public, nonce),
+            )
             signature = signing.sign(server.login_proof_bytes("owner", nonce))
             server.send(client, {"type": "prove", "signature": base64.b64encode(signature).decode("ascii")})
             ready = server.receive(client)
@@ -160,6 +239,35 @@ class TransportTests(unittest.TestCase):
             self.assertFalse(server.CONNECTION_SLOTS.acquire(blocking=False))
         finally:
             for _ in acquired: server.CONNECTION_SLOTS.release()
+
+    def test_directory_main_uses_tls_and_pins_its_key(self):
+        probe = socket.socket(); probe.bind(("127.0.0.1", 0)); port = probe.getsockname()[1]; probe.close()
+        original_data, original_keys = wire.DATA, wire.DIRECTORY_KEYS_FILE
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = os.environ.copy()
+            environment.update({"WIRE_HOST": "127.0.0.1", "WIRE_PORT": str(port), "WIRE_STATE": str(Path(temporary) / "server")})
+            process = subprocess.Popen([sys.executable, str(Path(__file__).parents[1] / "wire-server.py")], env=environment,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                wire.DATA = Path(temporary) / "client"
+                wire.DIRECTORY_KEYS_FILE = wire.DATA / "directory-keys.json"
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        connection, key = wire.open_directory_socket("127.0.0.1", port, 1)
+                        break
+                    except OSError:
+                        if time.monotonic() >= deadline:
+                            self.fail(f"TLS directory did not start: {process.stderr.read().decode(errors='replace')}")
+                        time.sleep(0.05)
+                self.assertIn(connection.version(), {"TLSv1.2", "TLSv1.3"})
+                self.assertEqual(len(key), 32)
+                connection.close()
+                self.assertTrue(wire.DIRECTORY_KEYS_FILE.exists())
+            finally:
+                process.terminate(); process.wait(timeout=5)
+                if process.stderr: process.stderr.close()
+                wire.DATA, wire.DIRECTORY_KEYS_FILE = original_data, original_keys
 
     def test_server_packets_do_not_interleave(self):
         server = load_server_module()

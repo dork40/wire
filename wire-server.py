@@ -7,18 +7,23 @@ import hmac
 import hashlib
 import json
 import socket
+import ssl
 import struct
 import threading
 import time
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.x509.oid import NameOID
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.21"
+SERVER_VERSION = "1.4.22"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -26,7 +31,7 @@ GROUPS_FILE = STATE / "groups.json"
 BACKUPS_FILE = STATE / "identity-backups.json"
 QUEUES_FILE = STATE / "offline-queue.json"
 LOCK = threading.Lock()
-ONLINE: dict[str, tuple[str, socket.socket, str, str]] = {}
+ONLINE: dict[str, tuple[str, socket.socket, str, str, str]] = {}
 # A client can be sent packets by its own handler and by any number of other
 # handlers (messages, file relay, group updates).  TCP is a byte stream, so
 # concurrent sendall() calls can splice two length-prefixed packets together.
@@ -37,12 +42,83 @@ MAX_RELAY_PACKET_BYTES = 100 * 1024
 MAX_CLIENT_FRAME_BYTES = 256 * 1024
 MAX_OFFLINE_QUEUE_PACKETS = 250
 MAX_OFFLINE_QUEUE_BYTES = 5 * 1024 * 1024
+MAX_TOTAL_OFFLINE_QUEUE_BYTES = 512 * 1024 * 1024
 MAX_GROUP_MEMBERS = 100
 RELAY_RATE_BYTES_PER_SECOND = 40 * 1024 * 1024
 RELAY_RATE_BURST_BYTES = 64 * 1024 * 1024
 RELAY_BUDGETS: dict[str, tuple[float, float]] = {}
 MAX_CONNECTIONS = 256
 CONNECTION_SLOTS = threading.BoundedSemaphore(MAX_CONNECTIONS)
+MAX_CONNECTIONS_PER_IP = 32
+IP_CONNECTIONS: dict[str, int] = {}
+IP_CONNECTIONS_LOCK = threading.Lock()
+RECOVERY_ATTEMPTS: dict[str, list[float]] = {}
+RECOVERY_WINDOW_SECONDS = 15 * 60
+MAX_RECOVERY_ATTEMPTS = 5
+SERVER_KEY_LOCK = threading.Lock()
+SERVER_SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
+
+
+def protect_state_path(path: Path, directory: bool = False) -> None:
+    if os.name == "nt":
+        return
+    try:
+        path.chmod(0o700 if directory else 0o600)
+    except OSError:
+        pass
+
+
+def prepare_state() -> None:
+    STATE.mkdir(parents=True, exist_ok=True)
+    protect_state_path(STATE, directory=True)
+
+
+def replace_private_json(target: Path, payload: str) -> None:
+    prepare_state()
+    temp = target.with_suffix(".tmp")
+    temp.write_text(payload, encoding="utf-8")
+    protect_state_path(temp)
+    temp.replace(target)
+    protect_state_path(target)
+
+
+def server_signing_key() -> ed25519.Ed25519PrivateKey:
+    global SERVER_SIGNING_KEY
+    with SERVER_KEY_LOCK:
+        if SERVER_SIGNING_KEY is not None:
+            return SERVER_SIGNING_KEY
+        prepare_state()
+        key_file = STATE / "server-signing-key"
+        try:
+            raw = base64.b64decode(key_file.read_text(encoding="ascii"), validate=True)
+            SERVER_SIGNING_KEY = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+        except (OSError, ValueError):
+            SERVER_SIGNING_KEY = ed25519.Ed25519PrivateKey.generate()
+            key_file.write_text(base64.b64encode(SERVER_SIGNING_KEY.private_bytes_raw()).decode("ascii"), encoding="ascii")
+            protect_state_path(key_file)
+        return SERVER_SIGNING_KEY
+
+
+def tls_context() -> ssl.SSLContext:
+    """Create a persistent self-signed TLS identity backed by the server key."""
+    prepare_state()
+    key = server_signing_key()
+    certificate_file, tls_key_file = STATE / "server-certificate.pem", STATE / "server-tls-key.pem"
+    if not certificate_file.exists() or not tls_key_file.exists():
+        subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Wire Directory")])
+        now = datetime.now(timezone.utc)
+        certificate = (x509.CertificateBuilder().subject_name(subject).issuer_name(issuer)
+                       .public_key(key.public_key()).serial_number(x509.random_serial_number())
+                       .not_valid_before(now - timedelta(minutes=5)).not_valid_after(now + timedelta(days=3650))
+                       .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+                       .sign(key, algorithm=None))
+        tls_key_file.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+        certificate_file.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+        protect_state_path(tls_key_file); protect_state_path(certificate_file)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.load_cert_chain(certificate_file, tls_key_file)
+    return context
 
 
 def receive_exact(sock: socket.socket, count: int) -> bytes:
@@ -78,10 +154,7 @@ def load_users() -> dict:
 
 
 def save_users(users: dict) -> None:
-    STATE.mkdir(exist_ok=True)
-    tmp = USERS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(users, indent=2), encoding="utf-8")
-    tmp.replace(USERS_FILE)
+    replace_private_json(USERS_FILE, json.dumps(users, indent=2))
 
 
 def load_groups() -> dict:
@@ -95,10 +168,7 @@ def load_groups() -> dict:
 
 
 def save_groups(groups: dict) -> None:
-    STATE.mkdir(exist_ok=True)
-    tmp = GROUPS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(groups, indent=2), encoding="utf-8")
-    tmp.replace(GROUPS_FILE)
+    replace_private_json(GROUPS_FILE, json.dumps(groups, indent=2))
 
 
 def load_backups() -> dict:
@@ -109,10 +179,7 @@ def load_backups() -> dict:
 
 
 def save_backups(backups: dict) -> None:
-    STATE.mkdir(exist_ok=True)
-    temp = BACKUPS_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(backups), encoding="utf-8")
-    temp.replace(BACKUPS_FILE)
+    replace_private_json(BACKUPS_FILE, json.dumps(backups))
 
 
 def load_queues() -> dict:
@@ -123,10 +190,7 @@ def load_queues() -> dict:
 
 
 def save_queues(queues: dict) -> None:
-    STATE.mkdir(exist_ok=True)
-    temp = QUEUES_FILE.with_suffix(".tmp")
-    temp.write_text(json.dumps(queues, separators=(",", ":")), encoding="utf-8")
-    temp.replace(QUEUES_FILE)
+    replace_private_json(QUEUES_FILE, json.dumps(queues, separators=(",", ":")))
 
 
 def valid_group_name(value: object) -> bool:
@@ -139,7 +203,7 @@ def group_details(group: dict, users: dict, online: set[str]) -> dict:
     return {
         "name": group["name"], "owner": group["owner"],
         "pins": [item for item in group.get("pins", []) if isinstance(item, str)][:50],
-        "members": [{"name": users[item]["name"], "public": users[item]["public"], "online": item in online,
+        "members": [{**signed_identity(users[item]["name"], users[item]["public"], users[item].get("sign_public")), "online": item in online,
                      "role": "owner" if item == group["owner"] else ("admin" if item in admins else "member")} for item in member_keys],
     }
 
@@ -160,9 +224,60 @@ def login_proof_bytes(name: str, nonce: bytes) -> bytes:
     return b"wire-login-v1\0" + name.lower().encode("utf-8") + b"\0" + nonce
 
 
+def directory_proof_bytes(name: str, public: str, sign_public: str, nonce: bytes) -> bytes:
+    return (b"wire-directory-v1\0" + name.lower().encode("utf-8") + b"\0"
+            + base64.b64decode(public.encode("ascii"), validate=True)
+            + base64.b64decode(sign_public.encode("ascii"), validate=True) + nonce)
+
+
+def directory_identity_bytes(name: str, public: str, sign_public: str) -> bytes:
+    return (b"wire-directory-identity-v1\0" + name.lower().encode("utf-8") + b"\0"
+            + base64.b64decode(public.encode("ascii"), validate=True)
+            + base64.b64decode(sign_public.encode("ascii"), validate=True))
+
+
+def signed_identity(name: str, public: str, sign_public: str) -> dict:
+    if not isinstance(name, str) or not isinstance(public, str) or not isinstance(sign_public, str):
+        return {"name": name, "public": public, "sign_public": sign_public, "identity_signature": ""}
+    signature = server_signing_key().sign(directory_identity_bytes(name, public, sign_public))
+    return {"name": name, "public": public, "sign_public": sign_public,
+            "identity_signature": base64.b64encode(signature).decode("ascii")}
+
+
 def recovery_proof(secret: bytes) -> str:
     """A password-derived proof used only to release the encrypted backup."""
     return hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
+
+
+def allow_recovery(address: str) -> bool:
+    """Bound expensive password-recovery guesses by source address."""
+    now = time.monotonic()
+    with LOCK:
+        recent = [stamp for stamp in RECOVERY_ATTEMPTS.get(address, []) if now - stamp < RECOVERY_WINDOW_SECONDS]
+        if len(recent) >= MAX_RECOVERY_ATTEMPTS:
+            RECOVERY_ATTEMPTS[address] = recent
+            return False
+        recent.append(now)
+        RECOVERY_ATTEMPTS[address] = recent
+        return True
+
+
+def acquire_ip_connection(address: str) -> bool:
+    with IP_CONNECTIONS_LOCK:
+        current = IP_CONNECTIONS.get(address, 0)
+        if current >= MAX_CONNECTIONS_PER_IP:
+            return False
+        IP_CONNECTIONS[address] = current + 1
+        return True
+
+
+def release_ip_connection(address: str) -> None:
+    with IP_CONNECTIONS_LOCK:
+        remaining = IP_CONNECTIONS.get(address, 1) - 1
+        if remaining > 0:
+            IP_CONNECTIONS[address] = remaining
+        else:
+            IP_CONNECTIONS.pop(address, None)
 
 
 def packet_size(packet: dict) -> int:
@@ -206,6 +321,9 @@ def deliver_or_queue(username: str, packet: dict) -> bool:
         if key not in load_users():
             return False
         queues = load_queues(); pending = queues.setdefault(key, [])
+        total_queued = sum(packet_size(item) for items in queues.values() if isinstance(items, list) for item in items if isinstance(item, dict))
+        if total_queued + size > MAX_TOTAL_OFFLINE_QUEUE_BYTES:
+            return False
         if len(pending) >= MAX_OFFLINE_QUEUE_PACKETS or sum(packet_size(item) for item in pending if isinstance(item, dict)) + size > MAX_OFFLINE_QUEUE_BYTES:
             return False
         pending.append(packet); save_queues(queues)
@@ -224,15 +342,30 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
         if hello.get("type") == "identity_fetch":
             name = hello.get("name", "")
             key = name.lower() if isinstance(name, str) else ""
+            if not allow_recovery(address[0]):
+                send(sock, {"type": "error", "message": "identity recovery is temporarily unavailable"})
+                return
             with LOCK:
                 backup = load_backups().get(key)
-            if not isinstance(backup, dict) or not isinstance(backup.get("salt"), str) or not isinstance(backup.get("recovery_proof"), str):
+            if (not isinstance(backup, dict) or not isinstance(backup.get("salt"), str)
+                    or not isinstance(backup.get("recovery_proof"), str) and not isinstance(backup.get("recovery_verifier"), str)):
                 send(sock, {"type": "error", "message": "identity recovery is unavailable"})
                 return
-            send(sock, {"type": "identity_recovery_challenge", "salt": backup["salt"]})
+            challenge = os.urandom(32)
+            response = {"type": "identity_recovery_challenge", "salt": backup["salt"]}
+            if isinstance(backup.get("recovery_verifier"), str):
+                response.update({"challenge": base64.b64encode(challenge).decode("ascii"), "kdf": backup.get("kdf")})
+            send(sock, response)
             proof = receive(sock)
             supplied = proof.get("proof") if proof.get("type") == "identity_fetch_prove" else None
-            if not isinstance(supplied, str) or not hmac.compare_digest(supplied, backup["recovery_proof"]):
+            expected = backup.get("recovery_proof")
+            if isinstance(backup.get("recovery_verifier"), str):
+                try:
+                    verifier = bytes.fromhex(backup["recovery_verifier"])
+                    expected = hmac.new(verifier, challenge, hashlib.sha256).hexdigest()
+                except ValueError:
+                    expected = None
+            if not isinstance(supplied, str) or not isinstance(expected, str) or not hmac.compare_digest(supplied, expected):
                 send(sock, {"type": "error", "message": "identity recovery is unavailable"})
                 return
             send(sock, {"type": "identity_backup", "backup": backup})
@@ -255,7 +388,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 send(sock, {"type": "error", "message": "username is already online"})
                 return
         nonce = os.urandom(32)
-        send(sock, {"type": "challenge", "nonce": base64.b64encode(nonce).decode("ascii")})
+        directory_key = server_signing_key()
+        directory_public = directory_key.public_key().public_bytes_raw()
+        directory_signature = directory_key.sign(directory_proof_bytes(name, public, sign_public, nonce))
+        send(sock, {"type": "challenge", "nonce": base64.b64encode(nonce).decode("ascii"),
+                    "server_sign_public": base64.b64encode(directory_public).decode("ascii"),
+                    "server_signature": base64.b64encode(directory_signature).decode("ascii")})
         proof = receive(sock)
         if proof.get("type") != "prove" or not isinstance(proof.get("signature"), str):
             send(sock, {"type": "error", "message": "login proof missing"})
@@ -276,7 +414,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                           "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
                           "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
             save_users(users)
-            ONLINE[key] = (name, sock, public, address[0])
+            ONLINE[key] = (name, sock, public, address[0], sign_public)
             queues = load_queues()
             queued_packets = queues.pop(key, [])
             if queued_packets: save_queues(queues)
@@ -287,9 +425,16 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             if isinstance(queued, dict): send(sock, queued)
         print(f"online  {name}  {address[0]}")
 
+        command_times: list[float] = []
         while True:
             packet = receive(sock)
             kind = packet.get("type")
+            if kind != "relay":
+                now = time.monotonic()
+                command_times = [stamp for stamp in command_times if now - stamp < 10]
+                if len(command_times) >= 500:
+                    raise ConnectionError("command rate limit exceeded")
+                command_times.append(now)
             if kind == "open":
                 target = packet.get("to", "").lower()
                 with LOCK:
@@ -298,7 +443,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "error", "message": "user is offline or does not exist"})
                 elif target == key:
                     send(sock, {"type": "error", "message": "cannot open a room with yourself"})
-                elif deliver(target, {"type": "request", "from": name, "public": public}):
+                elif deliver(target, {"type": "request", "from": name, **signed_identity(name, public, sign_public)}):
                     send(sock, {"type": "waiting", "to": target_info[0]})
             elif kind == "discover":
                 query = packet.get("query", "").lower()
@@ -530,7 +675,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 for member_key in group["members"]:
                     encrypted = packets.get(member_key)
                     if member_key != key and isinstance(encrypted, dict):
-                        deliver_or_queue(member_key, {"type": "group_message", "group": group["name"], "from": name, "public": public, "packet": encrypted})
+                        deliver_or_queue(member_key, {"type": "group_message", "group": group["name"], "from": name, **signed_identity(name, public, sign_public), "packet": encrypted})
             elif kind == "direct_offer":
                 target = packet.get("to", "").lower()
                 port = packet.get("port")
@@ -552,8 +697,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     deliver(target, {"type": "share_offer", "from": name, "offer": offer})
             elif kind == "share_answer":
                 target = packet.get("to", "").lower()
-                answer = packet.get("answer")
-                if not isinstance(answer, dict) or not deliver(target, {"type": "share_answer", "from": name, "answer": answer}):
+                answer, share_id = packet.get("answer"), packet.get("id")
+                if not isinstance(answer, dict) or not isinstance(share_id, str) or not deliver(target, {"type": "share_answer", "from": name, "id": share_id, "answer": answer}):
                     send(sock, {"type": "error", "message": "screen-share peer is offline"})
             elif kind == "share_stop":
                 target, share_id = packet.get("to", "").lower(), packet.get("id")
@@ -566,8 +711,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 if not source_info:
                     send(sock, {"type": "error", "message": "requester is no longer online"})
                 else:
-                    deliver(source, {"type": "accepted", "name": name, "public": public})
-                    send(sock, {"type": "accepted", "name": source_info[0], "public": source_info[2]})
+                    deliver(source, {"type": "accepted", **signed_identity(name, public, sign_public)})
+                    send(sock, {"type": "accepted", **signed_identity(source_info[0], source_info[2], source_info[4])})
             elif kind == "relay":
                 target = packet.get("to", "").lower()
                 payload = packet.get("packet")
@@ -601,6 +746,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
 
 
 def main() -> None:
+    secure_context = tls_context()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((HOST, PORT))
@@ -612,10 +758,22 @@ def main() -> None:
             if not CONNECTION_SLOTS.acquire(blocking=False):
                 sock.close()
                 continue
+            if not acquire_ip_connection(address[0]):
+                sock.close()
+                CONNECTION_SLOTS.release()
+                continue
             def serve(connection: socket.socket, peer_address: tuple[str, int]) -> None:
                 try:
-                    handle(connection, peer_address)
+                    connection.settimeout(15)
+                    secure = secure_context.wrap_socket(connection, server_side=True)
+                    handle(secure, peer_address)
+                except (ssl.SSLError, OSError):
+                    try:
+                        connection.close()
+                    except OSError:
+                        pass
                 finally:
+                    release_ip_connection(peer_address[0])
                     CONNECTION_SLOTS.release()
             threading.Thread(target=serve, args=(sock, address), daemon=True).start()
     except KeyboardInterrupt:

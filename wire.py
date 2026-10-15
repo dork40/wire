@@ -13,7 +13,9 @@ import hmac
 import json
 import os
 import platform
+import re
 import socket
+import ssl
 import struct
 import subprocess
 import shutil
@@ -28,6 +30,7 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Callable, Optional
 
+from cryptography import x509
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
@@ -42,6 +45,7 @@ except ImportError:
     # installs even when an optional graphical screen-share viewer is absent.
     tk = None
     ImageTk = None
+Image.MAX_IMAGE_PIXELS = 50_000_000
 import numpy as np
 from pywebrtc_audio import AudioProcessor
 import mss
@@ -88,12 +92,14 @@ SERVER_CONFIG = DATA / "server.json"
 HISTORY_DIR = DATA / "history"
 CONTACTS_DIR = DATA / "contacts"
 SETTINGS_FILE = DATA / "settings.json"
+DIRECTORY_KEYS_FILE = DATA / "directory-keys.json"
 DOWNLOADS_DIR = Path.home() / "Downloads" / "Wire"
 DIAGNOSTIC_LOG = DATA / "wire-diagnostics.log"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_CHUNK_BYTES = 40 * 1024
 MAX_FILE_BYTES = 500 * 1024 * 1024
+MAX_MESSAGE_CHARS = 32_000
 FILE_CHUNK_BYTES = 64 * 1024
 # The directory accepts up to 1 MB frames, but small chunks avoid making text,
 # voice, and control packets wait behind a huge encoded video/file packet.
@@ -111,6 +117,9 @@ STREAM_FPS = [15, 24, 30, 60]
 # This is a target, not a promise: actual FPS also depends on the PC and LAN.
 STREAM_BITRATES = [1, 2, 4, 8, 12, 20, 35, 50]
 STREAM_PROFILES = ("auto", "low-resource", "balanced", "smooth", "gaming", "ultra")
+TRANSFER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# OWASP-equivalent scrypt work factor with modest RAM use for older laptops.
+CURRENT_KDF = {"name": "scrypt", "n": 2**14, "r": 8, "p": 5}
 PRINT_LOCK = threading.Lock()
 ACTIVE_PROMPT = "wire"
 SAFE_PROMPT_ACTIVE = False
@@ -149,21 +158,113 @@ def unb64(value: str) -> bytes:
     return base64.b64decode(value.encode("ascii"), validate=True)
 
 
-def derive(password: str, salt: bytes) -> bytes:
-    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2**14, r=8, p=1, dklen=32)
+def derive(password: str, salt: bytes, parameters: Optional[dict] = None) -> bytes:
+    """Derive an account key; untagged accounts retain their legacy settings."""
+    params = parameters if isinstance(parameters, dict) else {"n": 2**14, "r": 8, "p": 1}
+    n, r, p = int(params.get("n", 2**14)), int(params.get("r", 8)), int(params.get("p", 1))
+    if n not in (2**14, 2**15, 2**16, 2**17) or r != 8 or not 1 <= p <= 5:
+        raise ValueError("unsupported password protection parameters")
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
+
+
+def safe_terminal_text(value: object) -> str:
+    """Remove terminal commands while preserving ordinary Unicode and newlines."""
+    text = str(value)
+    return "".join(char for char in text if char in "\n\t" or (ord(char) >= 32 and not 127 <= ord(char) <= 159))
+
+
+def valid_transfer_id(value: object) -> bool:
+    return isinstance(value, str) and TRANSFER_ID_RE.fullmatch(value) is not None
+
+
+def protect_private_path(path: Path, directory: bool = False) -> None:
+    """Use owner-only permissions where POSIX permissions are meaningful."""
+    if os.name == "nt":
+        return
+    try:
+        path.chmod(0o700 if directory else 0o600)
+    except OSError:
+        pass
+
+
+def pin_directory_public(host: str, port: int, server_public: bytes) -> None:
+    if len(server_public) != 32:
+        raise ConnectionError("directory TLS identity is invalid")
+    configured = os.environ.get("WIRE_DIRECTORY_KEY")
+    if configured:
+        try:
+            expected = unb64(configured)
+        except Exception as exc:
+            raise ConnectionError("WIRE_DIRECTORY_KEY is not valid base64") from exc
+        if not hmac.compare_digest(server_public, expected):
+            raise ConnectionError("directory signing key does not match WIRE_DIRECTORY_KEY")
+    endpoint = f"{host.lower()}:{port}"
+    try:
+        pins = json.loads(DIRECTORY_KEYS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(pins, dict):
+            pins = {}
+    except (OSError, json.JSONDecodeError):
+        pins = {}
+    encoded = b64(server_public)
+    if endpoint in pins and not hmac.compare_digest(str(pins[endpoint]), encoded):
+        raise ConnectionError("SAFETY WARNING: directory identity changed; connection refused")
+    if endpoint not in pins:
+        DATA.mkdir(parents=True, exist_ok=True)
+        protect_private_path(DATA, directory=True)
+        pins[endpoint] = encoded
+        temporary = DIRECTORY_KEYS_FILE.with_suffix(".tmp")
+        temporary.write_text(json.dumps(pins, indent=2), encoding="utf-8")
+        protect_private_path(temporary)
+        temporary.replace(DIRECTORY_KEYS_FILE)
+        protect_private_path(DIRECTORY_KEYS_FILE)
+        say(f"saved directory safety identity: {fingerprint(server_public)}")
+
+
+def open_directory_socket(host: str, port: int, timeout: float) -> tuple[ssl.SSLSocket, bytes]:
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        secure = context.wrap_socket(raw, server_hostname=host)
+        certificate = x509.load_der_x509_certificate(secure.getpeercert(binary_form=True))
+        public = certificate.public_key()
+        if not isinstance(public, ed25519.Ed25519PublicKey):
+            raise ConnectionError("directory TLS certificate uses an unsupported key")
+        server_public = public.public_bytes_raw()
+        pin_directory_public(host, port, server_public)
+        return secure, server_public
+    except Exception:
+        raw.close()
+        raise
 
 
 def load_users() -> dict:
     if not USERS.exists():
         return {}
-    return json.loads(USERS.read_text(encoding="utf-8"))
+    users = json.loads(USERS.read_text(encoding="utf-8"))
+    # Older releases stored the complete password-derived encryption key as a
+    # password "check". Fernet authentication already verifies the password,
+    # so delete that dangerous duplicate immediately, before login.
+    changed = False
+    for account in users.values() if isinstance(users, dict) else ():
+        if isinstance(account, dict) and "check" in account:
+            account.pop("check", None)
+            changed = True
+    if changed:
+        save_users(users)
+    return users
 
 
 def save_users(users: dict) -> None:
-    DATA.mkdir(exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
+    protect_private_path(DATA, directory=True)
     temp = USERS.with_suffix(".tmp")
     temp.write_text(json.dumps(users, indent=2), encoding="utf-8")
+    protect_private_path(temp)
     temp.replace(USERS)
+    protect_private_path(USERS)
 
 
 def load_settings() -> dict:
@@ -176,8 +277,10 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict) -> None:
-    DATA.mkdir(exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
+    protect_private_path(DATA, directory=True)
     SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
+    protect_private_path(SETTINGS_FILE)
 
 
 def report_background_failure(area: str, exc: BaseException) -> None:
@@ -186,6 +289,7 @@ def report_background_failure(area: str, exc: BaseException) -> None:
         DATA.mkdir(parents=True, exist_ok=True)
         with DIAGNOSTIC_LOG.open("a", encoding="utf-8") as log:
             log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {area}: {type(exc).__name__}: {exc}\n")
+        protect_private_path(DIAGNOSTIC_LOG)
     except OSError:
         pass
     say(f"{area} stopped unexpectedly; details saved to {DIAGNOSTIC_LOG}")
@@ -567,6 +671,19 @@ def login_proof_bytes(name: str, nonce: bytes) -> bytes:
     return b"wire-login-v1\0" + name.lower().encode("utf-8") + b"\0" + nonce
 
 
+def directory_proof_bytes(name: str, public: bytes, sign_public: bytes, nonce: bytes) -> bytes:
+    return b"wire-directory-v1\0" + name.lower().encode("utf-8") + b"\0" + public + sign_public + nonce
+
+
+def directory_identity_bytes(name: str, public: bytes, sign_public: bytes) -> bytes:
+    return b"wire-directory-identity-v1\0" + name.lower().encode("utf-8") + b"\0" + public + sign_public
+
+
+def peer_hello_bytes(name: str, public: bytes, sign_public: bytes, nonce: bytes, timestamp: int) -> bytes:
+    return (b"wire-peer-hello-v2\0" + name.lower().encode("utf-8") + b"\0" + public
+            + sign_public + nonce + struct.pack("!q", timestamp))
+
+
 @dataclass
 class Peer:
     name: str
@@ -578,6 +695,25 @@ class Peer:
     # all send at once.  A direct socket is a byte stream, so protect its
     # length-prefixed packets from being interleaved by those threads.
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    seen_nonces: set[str] = field(default_factory=set, repr=False)
+    nonce_order: list[str] = field(default_factory=list, repr=False)
+
+    def accept_nonce(self, packet: dict) -> bool:
+        encoded = packet.get("nonce")
+        if not isinstance(encoded, str):
+            return False
+        try:
+            if len(unb64(encoded)) != 12:
+                return False
+        except Exception:
+            return False
+        if encoded in self.seen_nonces:
+            return False
+        self.seen_nonces.add(encoded)
+        self.nonce_order.append(encoded)
+        if len(self.nonce_order) > 4096:
+            self.seen_nonces.discard(self.nonce_order.pop(0))
+        return True
 
     def _send_packet(self, packet: dict) -> None:
         if self.relay:
@@ -589,6 +725,8 @@ class Peer:
             raise ConnectionError("room is no longer connected")
 
     def send(self, text: str, message_id: str, reply_to: str | None = None) -> None:
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(f"message is too long ({MAX_MESSAGE_CHARS} character maximum)")
         nonce = os.urandom(12)
         data = AESGCM(self.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
         packet = {"type": "msg", "id": message_id, "reply_to": reply_to, "nonce": b64(nonce), "data": b64(data)}
@@ -723,6 +861,7 @@ class Wire:
         self.sign_public: Optional[bytes] = None
         self.history_key: Optional[bytes] = None
         self.account_secret: Optional[bytes] = None
+        self.directory_public: Optional[bytes] = None
         self.history_lock = threading.Lock()
         self.peers: dict[str, Peer] = {}
         self.room: Optional[str] = None
@@ -758,6 +897,26 @@ class Wire:
         self.typing_notifier: Optional[Callable[[], None]] = None
         self.group_room: Optional[str] = None
         self.settings = load_settings()
+        self.closing = threading.Event()
+        self.background_threads: set[threading.Thread] = set()
+        self.background_threads_lock = threading.Lock()
+        self.direct_handshake_slots = threading.BoundedSemaphore(16)
+        self.pending_sockets: set[socket.socket] = set()
+        self.pending_sockets_lock = threading.Lock()
+
+    def start_worker(self, target: Callable, *args: object) -> threading.Thread:
+        """Track workers so shutdown can drain them before Python finalizes stdout."""
+        def run() -> None:
+            try:
+                target(*args)
+            finally:
+                with self.background_threads_lock:
+                    self.background_threads.discard(threading.current_thread())
+        worker = threading.Thread(target=run, daemon=True)
+        with self.background_threads_lock:
+            self.background_threads.add(worker)
+        worker.start()
+        return worker
 
     def signup(self, name: str) -> None:
         if not name.isalnum() or not 3 <= len(name) <= 24:
@@ -770,14 +929,14 @@ class Wire:
         if first != second:
             raise ValueError("passwords do not match")
         salt = os.urandom(16)
-        secret = derive(first, salt)
+        secret = derive(first, salt, CURRENT_KDF)
         private = x25519.X25519PrivateKey.generate()
         sign_private = ed25519.Ed25519PrivateKey.generate()
         raw_private = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
         public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         raw_sign_private = sign_private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
         sign_public = sign_private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
-        users[name.lower()] = {"name": name, "salt": b64(salt), "check": b64(secret),
+        users[name.lower()] = {"name": name, "salt": b64(salt), "kdf": dict(CURRENT_KDF),
                                "private": Fernet(base64.urlsafe_b64encode(secret)).encrypt(raw_private).decode("ascii"),
                                "public": b64(public),
                                "sign_private": Fernet(base64.urlsafe_b64encode(secret)).encrypt(raw_sign_private).decode("ascii"),
@@ -792,13 +951,11 @@ class Wire:
         if not account:
             account = self.restore_identity(name, password)
             users = load_users()
-        secret = derive(password, unb64(account["salt"]))
-        if not hmac.compare_digest(secret, unb64(account["check"])):
-            raise ValueError("wrong password")
+        secret = derive(password, unb64(account["salt"]), account.get("kdf"))
         try:
             raw = Fernet(base64.urlsafe_b64encode(secret)).decrypt(account["private"].encode("ascii"))
         except Exception as exc:
-            raise ValueError("could not unlock identity") from exc
+            raise ValueError("wrong password or damaged identity") from exc
         self.name = account["name"]
         self.private = x25519.X25519PrivateKey.from_private_bytes(raw)
         self.public = unb64(account["public"])
@@ -829,14 +986,21 @@ class Wire:
                     host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
             except (OSError, ValueError, KeyError, json.JSONDecodeError):
                 host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
-            sock = socket.create_connection((host, port), timeout=10)
+            sock, _ = open_directory_socket(str(host), int(port), timeout=10)
             send_frame(sock, {"type": "identity_fetch", "name": name})
             reply = recv_frame(sock)
             if reply.get("type") != "identity_recovery_challenge" or not isinstance(reply.get("salt"), str):
                 raise ValueError("identity recovery is unavailable")
             challenge_salt = reply["salt"]
-            secret = derive(password, unb64(challenge_salt))
-            proof = hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
+            secret = derive(password, unb64(challenge_salt), reply.get("kdf"))
+            verifier = hmac.new(secret, b"wire-v2-identity-recovery", hashlib.sha256).digest()
+            challenge = reply.get("challenge")
+            if isinstance(challenge, str):
+                proof = hmac.new(verifier, unb64(challenge), hashlib.sha256).hexdigest()
+            else:
+                # One-time compatibility with an older server. A new backup
+                # replaces this reusable proof as soon as login completes.
+                proof = hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
             send_frame(sock, {"type": "identity_fetch_prove", "proof": proof})
             reply = recv_frame(sock); sock.close()
             backup = reply.get("backup") if reply.get("type") == "identity_backup" else None
@@ -856,8 +1020,8 @@ class Wire:
         account = load_users().get(self.name.lower())
         if not account: return
         encrypted = Fernet(base64.urlsafe_b64encode(self.account_secret)).encrypt(json.dumps(account, separators=(",", ":")).encode("utf-8")).decode("ascii")
-        recovery = hmac.new(self.account_secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
-        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "ciphertext": encrypted, "recovery_proof": recovery}})
+        recovery = hmac.new(self.account_secret, b"wire-v2-identity-recovery", hashlib.sha256).hexdigest()
+        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "kdf": account.get("kdf"), "ciphertext": encrypted, "recovery_verifier": recovery}})
 
     def show_share_stats(self) -> None:
         if not self.webrtc_shares:
@@ -882,6 +1046,33 @@ class Wire:
         if not self.private or not self.public or not self.sign_private or not self.sign_public or not self.name:
             raise ValueError("sign in first")
 
+    def verify_directory_identity(self, host: str, port: int, reply: dict, nonce: bytes) -> None:
+        """Authenticate and TOFU-pin the directory's persistent signing key."""
+        server_public = unb64(str(reply.get("server_sign_public", "")))
+        signature = unb64(str(reply.get("server_signature", "")))
+        if len(server_public) != 32 or len(signature) != 64:
+            raise ConnectionError("directory does not support authenticated connections; update the server")
+        ed25519.Ed25519PublicKey.from_public_bytes(server_public).verify(
+            signature, directory_proof_bytes(self.name, self.public, self.sign_public, nonce)
+        )
+        if self.directory_public and not hmac.compare_digest(self.directory_public, server_public):
+            raise ConnectionError("directory TLS and signing identities do not match")
+        self.directory_public = server_public
+        pin_directory_public(host, port, server_public)
+
+    def verify_directory_peer(self, name: str, public: str, sign_public_value: str, identity_signature: str) -> tuple[bytes, bytes]:
+        if not self.directory_public:
+            raise ConnectionError("directory identity is not authenticated")
+        peer_public, peer_sign_public = unb64(public), unb64(sign_public_value)
+        signature = unb64(identity_signature)
+        if len(peer_public) != 32 or len(peer_sign_public) != 32 or len(signature) != 64:
+            raise ValueError("directory sent an invalid peer identity")
+        ed25519.Ed25519PublicKey.from_public_bytes(self.directory_public).verify(
+            signature, directory_identity_bytes(name, peer_public, peer_sign_public)
+        )
+        self.verify_peer_identity(name, peer_public, peer_sign_public)
+        return peer_public, peer_sign_public
+
     def make_peer(self, sock: socket.socket, hello: dict, expected: Optional[str] = None) -> Peer:
         self.require_login()
         if hello.get("type") != "hello" or not isinstance(hello.get("name"), str) or not isinstance(hello.get("public"), str):
@@ -892,13 +1083,26 @@ class Wire:
         peer_public = unb64(hello["public"])
         if len(peer_public) != 32:
             raise ValueError("bad peer key")
+        sign_public = unb64(str(hello.get("sign_public", "")))
+        nonce = unb64(str(hello.get("nonce", "")))
+        signature = unb64(str(hello.get("signature", "")))
+        timestamp = hello.get("timestamp")
+        if len(sign_public) != 32 or len(nonce) != 16 or not isinstance(timestamp, int) or abs(time.time() - timestamp) > 120:
+            raise ValueError("bad signed peer handshake")
+        ed25519.Ed25519PublicKey.from_public_bytes(sign_public).verify(
+            signature, peer_hello_bytes(peer_name, peer_public, sign_public, nonce, timestamp)
+        )
+        self.verify_peer_identity(peer_name, peer_public, sign_public)
         shared = self.private.exchange(x25519.X25519PublicKey.from_public_bytes(peer_public))
         key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"wire-v1").derive(shared)
         return Peer(peer_name, sock, key, peer_public)
 
     def hello(self) -> dict:
         self.require_login()
-        return {"type": "hello", "name": self.name, "public": b64(self.public)}
+        nonce, timestamp = os.urandom(16), int(time.time())
+        signature = self.sign_private.sign(peer_hello_bytes(self.name, self.public, self.sign_public, nonce, timestamp))
+        return {"type": "hello", "name": self.name, "public": b64(self.public), "sign_public": b64(self.sign_public),
+                "nonce": b64(nonce), "timestamp": timestamp, "signature": b64(signature)}
 
     def history_path(self, peer_name: str) -> Path:
         self.require_login()
@@ -908,9 +1112,9 @@ class Wire:
         self.require_login()
         return CONTACTS_DIR / f"{self.name.lower()}.wire"
 
-    def contacts(self) -> dict[str, list[str]]:
+    def contacts(self) -> dict:
         """Return the signed-in user's encrypted local friend and block lists."""
-        empty = {"friends": [], "blocked": []}
+        empty = {"friends": [], "blocked": [], "identities": {}}
         if not self.history_key:
             return empty
         path = self.contacts_path()
@@ -924,16 +1128,34 @@ class Wire:
             return {
                 "friends": [name for name in contacts.get("friends", []) if isinstance(name, str)],
                 "blocked": [name for name in contacts.get("blocked", []) if isinstance(name, str)],
+                "identities": contacts.get("identities", {}) if isinstance(contacts.get("identities"), dict) else {},
             }
         except Exception:
             return empty
 
-    def save_contacts(self, contacts: dict[str, list[str]]) -> None:
+    def save_contacts(self, contacts: dict) -> None:
         self.require_login()
         assert self.history_key
         CONTACTS_DIR.mkdir(exist_ok=True)
+        protect_private_path(CONTACTS_DIR, directory=True)
         payload = json.dumps(contacts, separators=(",", ":")).encode("utf-8")
         self.contacts_path().write_bytes(Fernet(self.history_key).encrypt(payload))
+        protect_private_path(self.contacts_path())
+
+    def verify_peer_identity(self, name: str, public: bytes, sign_public: bytes) -> None:
+        """Trust a peer on first use and reject silent identity-key changes."""
+        contacts = self.contacts()
+        identities = contacts.setdefault("identities", {})
+        key = name.lower()
+        current = identities.get(key)
+        proposed = {"public": b64(public), "sign_public": b64(sign_public)}
+        if isinstance(current, dict):
+            if current.get("public") != proposed["public"] or current.get("sign_public") != proposed["sign_public"]:
+                raise ValueError(f"SAFETY WARNING: {name}'s identity key changed; connection refused")
+            return
+        identities[key] = proposed
+        self.save_contacts(contacts)
+        say(f"saved safety identity for {name}")
 
     def edit_contact(self, list_name: str, username: str, add: bool) -> None:
         self.require_login()
@@ -1213,14 +1435,20 @@ class Wire:
             records.append({"id": message_id, "at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text, "reply_to": reply_to, "reactions": []})
             HISTORY_DIR.mkdir(exist_ok=True)
             encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
-            self.history_path(peer_name).write_bytes(encrypted)
+            path = self.history_path(peer_name)
+            path.write_bytes(encrypted)
+            protect_private_path(HISTORY_DIR, directory=True)
+            protect_private_path(path)
         return message_id
 
     def save_history(self, peer_name: str, records: list[dict]) -> None:
         self.require_login()
         assert self.history_key
         HISTORY_DIR.mkdir(exist_ok=True)
-        self.history_path(peer_name).write_bytes(Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8")))
+        path = self.history_path(peer_name)
+        path.write_bytes(Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8")))
+        protect_private_path(HISTORY_DIR, directory=True)
+        protect_private_path(path)
 
     def matching_message(self, peer_name: str, prefix: str, own_only: bool = False) -> tuple[list[dict], dict]:
         records = self.read_history(peer_name)
@@ -1232,7 +1460,7 @@ class Wire:
         return records, candidates[0]
 
     def render_record(self, record: dict, show_id: bool = False) -> str:
-        text = "[deleted]" if record.get("deleted") else str(record.get("text", ""))
+        text = "[deleted]" if record.get("deleted") else safe_terminal_text(record.get("text", ""))
         suffix = f"  ({record.get('id', '')[:6]})" if show_id and record.get("id") else ""
         if record.get("reply_to"):
             suffix += f"  reply:{str(record['reply_to'])[:6]}"
@@ -1244,8 +1472,8 @@ class Wire:
             suffix += "  delivered"
         reactions = record.get("reactions", [])
         if reactions:
-            suffix += "  " + " ".join(str(item) for item in reactions[:12])
-        return f"{record.get('from', '?')} > {text}{suffix}"
+            suffix += "  " + " ".join(safe_terminal_text(item) for item in reactions[:12])
+        return f"{safe_terminal_text(record.get('from', '?'))} > {text}{suffix}"
 
     def show_history(self, peer_name: str, show_ids: bool = False) -> None:
         records = self.read_history(peer_name)
@@ -1528,6 +1756,8 @@ class Wire:
         if len(matches) != 1:
             raise ValueError("no pending file with that code")
         file_id = matches[0]
+        if not valid_transfer_id(file_id):
+            raise ValueError("invalid file transfer code")
         state = self.pending_files.pop(file_id)
         sender, offer = state.get("from"), state.get("offer")
         peer = self.peers.get(str(sender).lower())
@@ -1538,7 +1768,7 @@ class Wire:
             say("file declined; nothing was downloaded")
             return
         name, size, expected_hash = Path(str(offer.get("name", ""))).name, offer.get("size"), offer.get("sha256")
-        if not name or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not isinstance(expected_hash, str):
+        if not name or not valid_transfer_id(file_id) or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid file offer")
         files_dir = DOWNLOADS_DIR / "Files"
         files_dir.mkdir(parents=True, exist_ok=True)
@@ -1606,13 +1836,13 @@ class Wire:
         if len(matches) != 1:
             raise ValueError("no paused transfer with that code")
         state = self.paused_files[matches[0]]
-        threading.Thread(target=self.direct_receive_worker, args=(state["peer"], state["host"], state["port"], state["offer"], state["target"]), daemon=True).start()
+        self.start_worker(self.direct_receive_worker, state["peer"], state["host"], state["port"], state["offer"], state["target"])
         say("resuming encrypted file transfer...")
 
     def direct_receive_worker(self, peer: Peer, host: str, port: int, offer: dict, target_override: Optional[Path] = None) -> None:
         name = Path(str(offer.get("name", "file"))).name
         size, file_id, token, expected_hash = offer.get("size"), offer.get("id"), offer.get("token"), offer.get("sha256")
-        if not name or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not isinstance(file_id, str) or not isinstance(token, str) or not isinstance(expected_hash, str):
+        if not name or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not valid_transfer_id(file_id) or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token) or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             say("file transfer rejected: invalid offer")
             return
         FILES_DIR = DOWNLOADS_DIR / "Files"
@@ -1765,7 +1995,7 @@ class Wire:
         peer = self.peers.get(str(state["from"]).lower())
         if not peer:
             raise ValueError("open a room with that person before accepting their screen share")
-        threading.Thread(target=self.webrtc_viewer, args=(peer, state), daemon=True).start()
+        self.start_worker(self.webrtc_viewer, peer, state)
         say("opening encrypted screen-share viewer...")
 
     def webrtc_viewer(self, peer: Peer, state: dict) -> None:
@@ -1824,12 +2054,16 @@ class Wire:
 
     def preview_image(self, path: Path) -> None:
         try:
+            with Image.open(path) as probe:
+                if probe.format not in {"PNG", "JPEG", "GIF", "BMP", "WEBP"}:
+                    raise ValueError("unsupported image contents")
+                probe.verify()
             if path.suffix.lower() == ".gif":
                 say(f"GIF received: {path.name}")
                 # GIFs arrive through the normal /send image flow. Play one
                 # compact loop without asking the recipient for another
                 # command or opening an external image window.
-                threading.Thread(target=self.preview_gif, args=(str(path),), daemon=True).start()
+                self.start_worker(self.preview_gif, str(path))
                 return
             # CMD's ANSI/color support is inconsistent and the old text card
             # could become mojibake or a wall of # characters. On Windows use
@@ -2024,7 +2258,7 @@ class Wire:
             self.pending_images[image_id] = {"name": name, "size": size, "sha256": frame.get("sha256")}
             say(f"\n{peer.name} wants to send {name} ({size // 1024} KB). Type /image accept {image_id[:6]} or /image decline {image_id[:6]}")
         elif kind == "accept":
-            threading.Thread(target=self.transfer_image, args=(peer, image_id), daemon=True).start()
+            self.start_worker(self.transfer_image, peer, image_id)
         elif kind == "decline":
             self.outgoing_images.pop(image_id, None)
             say("image offer declined")
@@ -2137,9 +2371,11 @@ class Wire:
         restart_blank_prompt_after_connect()
         redraw_prompt()
         if peer.sock:
-            threading.Thread(target=self.receive_loop, args=(peer,), daemon=True).start()
+            self.start_worker(self.receive_loop, peer)
 
     def handle_message(self, peer: Peer, packet: dict) -> None:
+        if packet.get("type") in {"control", "image", "voice", "audio", "file_relay", "msg"} and not peer.accept_nonce(packet):
+            return
         if packet.get("type") == "control":
             try:
                 control = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-control").decode("utf-8"))
@@ -2152,7 +2388,7 @@ class Wire:
                     file_id = control.get("id")
                     state = self.outgoing_files.get(file_id) if isinstance(file_id, str) else None
                     if state and state["peer"] is peer:
-                        threading.Thread(target=self.relay_send_file_worker, args=(file_id,), daemon=True).start()
+                        self.start_worker(self.relay_send_file_worker, file_id)
                 elif control.get("kind") == "file_relay_decline":
                     file_id = control.get("id")
                     state = self.outgoing_files.pop(file_id, None) if isinstance(file_id, str) else None
@@ -2207,6 +2443,8 @@ class Wire:
             return
         nonce, data = unb64(packet["nonce"]), unb64(packet["data"])
         text = AESGCM(peer.key).decrypt(nonce, data, b"wire-v1-message").decode("utf-8")
+        if len(text) > MAX_MESSAGE_CHARS:
+            return
         message_id = packet.get("id") if isinstance(packet.get("id"), str) and len(packet["id"]) <= 64 else uuid.uuid4().hex
         reply_to = packet.get("reply_to") if isinstance(packet.get("reply_to"), str) else None
         self.record_history(peer.name, peer.name, text, message_id, reply_to)
@@ -2240,7 +2478,7 @@ class Wire:
             token = f"{peer.name}:{reaction}"
             target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{peer.name}:")] + [token]
             say(f"\n{peer.name} reacted {reaction} to {message_id[:6]}")
-        elif kind == "message_edit" and target.get("from") == peer.name and isinstance(control.get("text"), str):
+        elif kind == "message_edit" and target.get("from") == peer.name and isinstance(control.get("text"), str) and len(control["text"]) <= MAX_MESSAGE_CHARS:
             target["text"], target["edited"] = control["text"], True
             say(f"\n{peer.name} edited message {message_id[:6]}")
         elif kind == "message_delete" and target.get("from") == peer.name:
@@ -2253,7 +2491,7 @@ class Wire:
 
     def receive_loop(self, peer: Peer) -> None:
         try:
-            while True:
+            while not self.closing.is_set():
                 packet = recv_frame(peer.sock)
                 self.handle_message(peer, packet)
         except Exception as exc:
@@ -2267,7 +2505,8 @@ class Wire:
                 peer.sock.close()
             except OSError:
                 pass
-            say(f"\n{peer.name} disconnected")
+            if not self.closing.is_set():
+                say(f"\n{peer.name} disconnected")
 
     def connect_server(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
         self.require_login()
@@ -2283,7 +2522,8 @@ class Wire:
         if self.server:
             self.server.close()
             self.server = None
-        sock = socket.create_connection((host, port), timeout=8)
+        sock, tls_public = open_directory_socket(str(host), int(port), timeout=8)
+        self.directory_public = tls_public
         try:
             send_frame(sock, {"type": "hello", "name": self.name, "public": b64(self.public),
                               "sign_public": b64(self.sign_public)})
@@ -2291,6 +2531,7 @@ class Wire:
             if reply.get("type") != "challenge":
                 raise ConnectionError(reply.get("message", "directory rejected login"))
             nonce = unb64(reply["nonce"])
+            self.verify_directory_identity(str(host), int(port), reply, nonce)
             signature = self.sign_private.sign(login_proof_bytes(self.name, nonce))
             send_frame(sock, {"type": "prove", "signature": b64(signature)})
             reply = recv_frame(sock)
@@ -2310,7 +2551,8 @@ class Wire:
                 )
             DATA.mkdir(exist_ok=True)
             SERVER_CONFIG.write_text(json.dumps({"host": host, "port": port}), encoding="utf-8")
-            threading.Thread(target=self.server_loop, args=(sock,), daemon=True).start()
+            protect_private_path(SERVER_CONFIG)
+            self.start_worker(self.server_loop, sock)
             self.sync_preferences()
             self.backup_identity()
             version = reply.get("version")
@@ -2340,21 +2582,19 @@ class Wire:
     def relay_send(self, username: str, packet: dict) -> None:
         self.server_send({"type": "relay", "to": username, "packet": packet})
 
-    def relay_peer(self, name: str, public: str) -> Peer:
+    def relay_peer(self, name: str, public: str, sign_public_value: str, identity_signature: str) -> Peer:
         self.require_login()
-        peer_public = unb64(public)
-        if len(peer_public) != 32:
-            raise ValueError("bad peer key")
+        peer_public, _ = self.verify_directory_peer(name, public, sign_public_value, identity_signature)
         shared = self.private.exchange(x25519.X25519PublicKey.from_public_bytes(peer_public))
         key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"wire-v1").derive(shared)
         return Peer(name, None, key, peer_public, lambda packet: self.relay_send(name, packet))
 
-    def attach_relay_peer(self, name: str, public: str) -> None:
+    def attach_relay_peer(self, name: str, public: str, sign_public_value: str, identity_signature: str) -> None:
         self.require_login()
         if self.is_blocked(name):
             say(f"ignored room from blocked user {name}")
             return
-        self.attach(self.relay_peer(name, public))
+        self.attach(self.relay_peer(name, public, sign_public_value, identity_signature))
 
     def update_groups(self, entries: object) -> None:
         if not isinstance(entries, list):
@@ -2388,16 +2628,18 @@ class Wire:
         say(" | ".join(members) or "no members")
 
     def send_group_message(self, group_name: str, text: str) -> None:
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(f"message is too long ({MAX_MESSAGE_CHARS} character maximum)")
         group = self.groups.get(group_name.lower())
         if not group:
             raise ValueError("unknown group; use group list first")
         packets: dict[str, dict] = {}
         message_id = uuid.uuid4().hex
         for member in group.get("members", []):
-            name, public = member.get("name"), member.get("public")
-            if not isinstance(name, str) or not isinstance(public, str) or name.lower() == self.name.lower():
+            name, public, sign_public_value, identity_signature = member.get("name"), member.get("public"), member.get("sign_public"), member.get("identity_signature")
+            if not isinstance(name, str) or not isinstance(public, str) or not isinstance(sign_public_value, str) or not isinstance(identity_signature, str) or name.lower() == self.name.lower():
                 continue
-            peer = self.relay_peer(name, public)
+            peer = self.relay_peer(name, public, sign_public_value, identity_signature)
             nonce = os.urandom(12)
             data = AESGCM(peer.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
             packets[name.lower()] = {"type": "msg", "id": message_id, "nonce": b64(nonce), "data": b64(data)}
@@ -2405,19 +2647,21 @@ class Wire:
         self.record_history(f"group-{group['name']}", self.name or "me", text, message_id)
 
     def handle_group_message(self, packet: dict) -> None:
-        group, sender, public, encrypted = packet.get("group"), packet.get("from"), packet.get("public"), packet.get("packet")
-        if not isinstance(group, str) or not isinstance(sender, str) or not isinstance(public, str) or not isinstance(encrypted, dict) or self.is_blocked(sender):
+        group, sender, public, sign_public_value, identity_signature, encrypted = packet.get("group"), packet.get("from"), packet.get("public"), packet.get("sign_public"), packet.get("identity_signature"), packet.get("packet")
+        if not isinstance(group, str) or not isinstance(sender, str) or not isinstance(public, str) or not isinstance(sign_public_value, str) or not isinstance(identity_signature, str) or not isinstance(encrypted, dict) or self.is_blocked(sender):
             return
         try:
-            peer = self.relay_peer(sender, public)
+            peer = self.relay_peer(sender, public, sign_public_value, identity_signature)
             if encrypted.get("type") != "msg":
                 return
             text = AESGCM(peer.key).decrypt(unb64(encrypted["nonce"]), unb64(encrypted["data"]), b"wire-v1-message").decode("utf-8")
+            if len(text) > MAX_MESSAGE_CHARS:
+                return
         except Exception:
             return
         message_id = encrypted.get("id") if isinstance(encrypted.get("id"), str) else uuid.uuid4().hex
         self.record_history(f"group-{group}", sender, text, message_id)
-        say(f"\n[{group}] {sender} > {text}")
+        say(f"\n[{safe_terminal_text(group)}] {safe_terminal_text(sender)} > {safe_terminal_text(text)}")
         redraw_prompt()
         if self.notifications_allowed():
             toast(f"new group message in {group} from {sender}")
@@ -2453,15 +2697,18 @@ class Wire:
 
     def server_loop(self, sock: socket.socket) -> None:
         try:
-            while True:
+            while not self.closing.is_set():
                 packet = recv_frame(sock)
                 kind = packet.get("type")
                 if kind == "request":
-                    name, public = packet["from"], packet["public"]
+                    name, public, sign_public_value, identity_signature = packet["from"], packet["public"], packet.get("sign_public"), packet.get("identity_signature")
+                    if not isinstance(sign_public_value, str) or not isinstance(identity_signature, str):
+                        raise ValueError("directory sent an unsigned identity")
+                    self.verify_directory_peer(name, public, sign_public_value, identity_signature)
                     if self.is_blocked(name):
                         say(f"\nignored room request from blocked user {name}")
                         continue
-                    self.requests[name.lower()] = public
+                    self.requests[name.lower()] = json.dumps({"public": public, "sign_public": sign_public_value})
                     say(f"\n{name} wants to open a room. Type: accept {name}")
                     redraw_prompt()
                 elif kind == "waiting":
@@ -2535,10 +2782,10 @@ class Wire:
                 elif kind == "direct_offer":
                     offer = packet.get("offer", {})
                     code = offer.get("id", "")
-                    if isinstance(code, str) and isinstance(offer.get("name"), str) and isinstance(offer.get("size"), int):
+                    if valid_transfer_id(code) and isinstance(offer.get("name"), str) and isinstance(offer.get("size"), int):
                         self.pending_files[code] = {"from": packet.get("from"), "host": packet.get("host"), "port": packet.get("port"), "offer": offer}
-                        say(f"\n{packet.get('from')} wants to send {offer['name']} ({offer['size'] // 1024 // 1024} MB)")
-                        for item in offer.get("contents", [])[:20]: say(f"  {item}")
+                        say(f"\n{safe_terminal_text(packet.get('from'))} wants to send {safe_terminal_text(offer['name'])} ({offer['size'] // 1024 // 1024} MB)")
+                        for item in offer.get("contents", [])[:20]: say(f"  {safe_terminal_text(item)}")
                         say(f"Type /file accept {code[:6]} or /file decline {code[:6]}")
                         redraw_prompt()
                 elif kind == "share_offer":
@@ -2567,7 +2814,7 @@ class Wire:
                     # line here; it can arrive exactly as the first prompt opens.
                     pass
                 elif kind == "accepted":
-                    self.attach_relay_peer(packet["name"], packet["public"])
+                    self.attach_relay_peer(packet["name"], packet["public"], packet["sign_public"], packet["identity_signature"])
                 elif kind == "relay":
                     sender = packet.get("from", "")
                     if self.is_blocked(sender):
@@ -2583,13 +2830,14 @@ class Wire:
                         # into noisy terminal output.
                         pass
                     else:
-                        say(f"directory: {message}")
+                        say(f"directory: {safe_terminal_text(message)}")
         except Exception as exc:
             if self.server is sock:
                 self.server = None
                 if not isinstance(exc, (ConnectionError, OSError)):
                     report_background_failure("username directory connection", exc)
-                say("\ndirectory disconnected")
+                if not self.closing.is_set():
+                    say("\ndirectory disconnected")
 
     def listen(self, port: int) -> None:
         self.require_login()
@@ -2600,23 +2848,43 @@ class Wire:
         listener.bind(("0.0.0.0", port))
         listener.listen()
         self.listener = listener
-        threading.Thread(target=self.accept_loop, daemon=True).start()
+        self.start_worker(self.accept_loop)
         say(f"listening on TCP {port}")
 
     def accept_loop(self) -> None:
         assert self.listener
-        while True:
+        while not self.closing.is_set():
             try:
                 sock, address = self.listener.accept()
-                hello = recv_frame(sock)
-                send_frame(sock, self.hello())
-                peer = self.make_peer(sock, hello)
-                say(f"incoming connection from {address[0]}")
-                self.attach(peer)
+                if not self.direct_handshake_slots.acquire(blocking=False):
+                    sock.close()
+                    continue
+                with self.pending_sockets_lock:
+                    self.pending_sockets.add(sock)
+                self.start_worker(self.accept_incoming_peer, sock, address)
             except OSError:
                 return
-            except Exception as exc:
-                say(f"connection refused: {exc}")
+
+    def accept_incoming_peer(self, sock: socket.socket, address: tuple[str, int]) -> None:
+        try:
+            sock.settimeout(15)
+            hello = recv_frame(sock)
+            send_frame(sock, self.hello())
+            peer = self.make_peer(sock, hello)
+            sock.settimeout(None)
+            say(f"incoming connection from {address[0]}")
+            self.attach(peer)
+        except Exception as exc:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            if not self.closing.is_set():
+                say(f"connection refused: {safe_terminal_text(exc)}")
+        finally:
+            with self.pending_sockets_lock:
+                self.pending_sockets.discard(sock)
+            self.direct_handshake_slots.release()
 
     def connect(self, expected: str, host: str, port: int) -> None:
         self.require_login()
@@ -2632,6 +2900,7 @@ class Wire:
             raise
 
     def close(self) -> None:
+        self.closing.set()
         # Do this before sockets and the interpreter disappear; aiortc owns
         # background ICE / DTLS / RTP tasks that must be drained first.
         for media in list(self.webrtc_shares.values()):
@@ -2645,13 +2914,34 @@ class Wire:
             if viewer.is_alive(): viewer.terminate()
         self.share_viewers.clear()
         self.share_viewer_stops.clear()
-        if self.listener:
-            self.listener.close()
-        if self.server:
-            self.server.close()
+        with self.pending_sockets_lock:
+            pending_sockets = list(self.pending_sockets)
+        sockets = [self.listener, self.server] + [peer.sock for peer in self.peers.values()] + pending_sockets
+        for connection in sockets:
+            if not connection:
+                continue
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+        self.listener = None
+        self.server = None
         for peer in list(self.peers.values()):
-            if peer.sock:
-                peer.sock.close()
+            call = self.calls.pop(peer.name.lower(), None)
+            if call:
+                call.close()
+        deadline = time.monotonic() + 4
+        while time.monotonic() < deadline:
+            with self.background_threads_lock:
+                workers = [item for item in self.background_threads if item is not threading.current_thread()]
+            if not workers:
+                break
+            for worker in workers:
+                worker.join(timeout=min(0.25, max(0, deadline - time.monotonic())))
 
     def close_active_chat(self) -> None:
         """Close the current room while leaving Wire and the directory online."""
@@ -2872,7 +3162,7 @@ def main() -> None:
             if room_peer and not line.startswith("/"):
                 try:
                     app.send_message(room_peer, line)
-                except (OSError, ConnectionError) as exc:
+                except (OSError, ConnectionError, ValueError) as exc:
                     print(f"error: {exc}")
                 continue
             if line.startswith("/"):
@@ -3148,11 +3438,11 @@ def main() -> None:
             if PROMPT_REFRESH_TIMER is not None:
                 PROMPT_REFRESH_TIMER.cancel()
                 PROMPT_REFRESH_TIMER = None
-        if stdout_context:
-            stdout_context.__exit__(*sys.exc_info())
         app.close()
         PROMPT_APPLICATION = None
         PROMPT_WAITING = False
+        if stdout_context:
+            stdout_context.__exit__(*sys.exc_info())
 
 
 if __name__ == "__main__":
