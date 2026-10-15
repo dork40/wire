@@ -310,13 +310,22 @@ def redraw_prompt() -> None:
 
 
 def refresh_prompt_display() -> None:
-    """Request a prompt_toolkit redraw from its owning event-loop thread."""
+    """Force a complete prompt redraw from its owning event-loop thread."""
     application = PROMPT_APPLICATION
     loop = getattr(application, "loop", None) if application else None
     if not application or not application.is_running or not loop:
         return
+
+    def repaint() -> None:
+        # invalidate() alone can emit nothing when prompt_toolkit believes its
+        # cached screen is unchanged, even though background output moved the
+        # real Windows console cursor. Reset the renderer cache first so the
+        # prompt and current input buffer are physically written again.
+        application.renderer.reset(_scroll=True, leave_alternate_screen=False)
+        application.invalidate()
+
     try:
-        loop.call_soon_threadsafe(application.invalidate)
+        loop.call_soon_threadsafe(repaint)
     except RuntimeError:
         # Wire can be shutting down while a typing-expiry timer fires.
         pass
