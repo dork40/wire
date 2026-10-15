@@ -359,30 +359,37 @@ def schedule_prompt_refresh(delay: float = 0.3) -> None:
         PROMPT_REFRESH_TIMER.start()
 
 
-def restart_blank_prompt_after_connect() -> None:
+def restart_blank_prompt_after_connect(delay: float = 0.5) -> None:
     """Finish an empty hidden prompt after a background room connection.
 
     This is the safe equivalent of pressing Enter once: it never submits or
     clears text the user has started typing. Ending the empty prompt makes the
     main loop create a new prompt below the completed history block.
     """
-    application = PROMPT_APPLICATION
-    loop = getattr(application, "loop", None) if application else None
-    if not application or not application.is_running or not loop:
-        return
+    def request_restart() -> None:
+        application = PROMPT_APPLICATION
+        loop = getattr(application, "loop", None) if application else None
+        if not application or not application.is_running or not loop:
+            return
 
-    def restart_or_repaint() -> None:
-        buffer = application.current_buffer
-        if not buffer.text:
-            buffer.validate_and_handle()
-        else:
-            application.renderer.reset(_scroll=True, leave_alternate_screen=False)
-            application.invalidate()
+        def restart_or_repaint() -> None:
+            buffer = application.current_buffer
+            if not buffer.text:
+                buffer.validate_and_handle()
+            else:
+                application.renderer.reset(_scroll=True, leave_alternate_screen=False)
+                application.invalidate()
 
-    try:
-        loop.call_soon_threadsafe(restart_or_repaint)
-    except RuntimeError:
-        pass
+        try:
+            loop.call_soon_threadsafe(restart_or_repaint)
+        except RuntimeError:
+            pass
+
+    # The stdout bridge writes history asynchronously. Restarting immediately
+    # would let that pending history erase the freshly created prompt again.
+    timer = threading.Timer(delay, request_restart)
+    timer.daemon = True
+    timer.start()
 
 
 def read_menu_key() -> str:
