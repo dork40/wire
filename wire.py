@@ -53,10 +53,12 @@ try:
     from prompt_toolkit.layout.containers import ConditionalContainer, Window
     from prompt_toolkit.layout.controls import FormattedTextControl
     from prompt_toolkit.patch_stdout import patch_stdout
+    from prompt_toolkit.utils import is_dumb_terminal
 except ImportError:
     PromptSession = None
     Condition = ConditionalContainer = Window = FormattedTextControl = None
     patch_stdout = None
+    is_dumb_terminal = None
 
 try:
     import msvcrt
@@ -322,7 +324,7 @@ def refresh_prompt_display() -> None:
         # real Windows console cursor. Reset the renderer cache first so the
         # prompt and current input buffer are physically written again.
         application.renderer.reset(_scroll=True, leave_alternate_screen=False)
-        application.invalidate()
+        application._redraw()
 
     try:
         loop.call_soon_threadsafe(repaint)
@@ -375,10 +377,13 @@ def restart_blank_prompt_after_connect(delay: float = 0.5) -> None:
         def restart_or_repaint() -> None:
             buffer = application.current_buffer
             if not buffer.text:
-                buffer.validate_and_handle()
+                # Force the blank prompt onto the physical console now. A
+                # normal invalidate can be coalesced away as "unchanged".
+                application.renderer.reset(_scroll=True, leave_alternate_screen=False)
+                application._redraw()
             else:
                 application.renderer.reset(_scroll=True, leave_alternate_screen=False)
-                application.invalidate()
+                application._redraw()
 
         try:
             loop.call_soon_threadsafe(restart_or_repaint)
@@ -2130,6 +2135,7 @@ class Wire:
         say(f"room open: {peer.name} (type normally; /help for commands)")
         self.show_history(peer.name)
         restart_blank_prompt_after_connect()
+        redraw_prompt()
         if peer.sock:
             threading.Thread(target=self.receive_loop, args=(peer,), daemon=True).start()
 
@@ -2815,8 +2821,9 @@ def main() -> None:
     except Exception:
         session = None
     global SAFE_PROMPT_ACTIVE, PROMPT_APPLICATION, PROMPT_WAITING, PROMPT_REFRESH_TIMER
-    SAFE_PROMPT_ACTIVE = session is not None
-    if session:
+    dumb_prompt = bool(session and is_dumb_terminal and is_dumb_terminal())
+    SAFE_PROMPT_ACTIVE = session is not None and not dumb_prompt
+    if SAFE_PROMPT_ACTIVE:
         PROMPT_APPLICATION = session.app
         # Typing packets and their expiry timers run on worker threads. Never
         # mutate prompt_toolkit's renderer from those threads directly.
@@ -2827,7 +2834,7 @@ def main() -> None:
             except (OSError, ConnectionError):
                 pass
         session.default_buffer.on_text_changed += announce_typing
-    stdout_context = patch_stdout(raw=True) if session and patch_stdout else None
+    stdout_context = patch_stdout(raw=True) if SAFE_PROMPT_ACTIVE and patch_stdout else None
     if stdout_context:
         stdout_context.__enter__()
     try:
