@@ -3,7 +3,7 @@ import unittest
 
 from av import VideoFrame
 
-from wire_webrtc import ScreenTrack, ShareStats
+from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats
 
 
 class _Capture:
@@ -26,6 +26,13 @@ class ScreenTrackTests(unittest.TestCase):
         self.assertEqual((frame.width, frame.height), (640, 360))
         self.assertEqual(frame.pts, 3000)
         self.assertEqual(track.capture.stats.snapshot()["send_fps"] > 0, True)
+
+    def test_capture_pause_can_be_resumed_without_restarting_backend(self):
+        capture = LatestFrameCapture(640, 360, 30, ShareStats())
+        capture.set_paused(True)
+        self.assertTrue(capture.paused.is_set())
+        capture.set_paused(False)
+        self.assertFalse(capture.paused.is_set())
 
 
 if __name__ == "__main__":

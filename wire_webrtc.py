@@ -149,6 +149,7 @@ class LatestFrameCapture:
         self.stats = stats
         self.monitor_index = monitor_index
         self.frame = None; self.sequence = 0; self.lock = threading.Lock(); self.stop = threading.Event()
+        self.paused = threading.Event()
         self.reformatter = VideoReformatter()
         self.backend = "mss"
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -184,6 +185,9 @@ class LatestFrameCapture:
             timestamp = None
             last_frame_available = time.monotonic()
             while not self.stop.is_set():
+                if self.paused.is_set():
+                    time.sleep(0.02)
+                    continue
                 # Conversion completes synchronously before DXcam can reuse
                 # its ring slot, so a borrowed view avoids a 14 MB copy for a
                 # 2560x1440 BGRA desktop on every frame.
@@ -215,6 +219,9 @@ class LatestFrameCapture:
             # mss index 0 is the virtual desktop; real displays start at 1.
             mon = cap.monitors[min(max(1, self.monitor_index), len(cap.monitors) - 1)]
             while not self.stop.is_set():
+                if self.paused.is_set():
+                    time.sleep(0.02)
+                    continue
                 began = time.monotonic()
                 shot = cap.grab(mon)
                 # BGRA buffer is passed straight to PyAV; no Pillow/JPEG/base64 step.
@@ -235,6 +242,8 @@ class LatestFrameCapture:
         self._run_mss()
     def latest(self):
         with self.lock: return self.frame
+    def set_paused(self, paused):
+        self.paused.set() if paused else self.paused.clear()
     def close(self):
         self.stop.set()
         if self.thread.is_alive() and threading.current_thread() is not self.thread:
@@ -435,6 +444,12 @@ class WebRTCShare:
             return self.call(self._stats()).result(timeout=1)
         except Exception:
             return self.stats.snapshot()
+
+    def set_paused(self, paused):
+        if not self.capture:
+            return False
+        self.capture.set_paused(paused)
+        return True
 
     async def _shutdown(self):
         if self.capture:

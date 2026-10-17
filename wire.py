@@ -1087,6 +1087,31 @@ class Wire:
                 line += f"; RTT {stats['rtt_ms']} ms"
             say(line)
 
+    def pause_screen_share(self, paused: bool) -> None:
+        senders = [media for media in self.webrtc_shares.values() if media.capture]
+        if not senders:
+            raise ValueError("you are not sharing a screen")
+        for media in senders:
+            media.set_paused(paused)
+        say("screen share paused" if paused else "screen share resumed")
+
+    def diagnose(self) -> None:
+        """Report local capability checks without exposing account secrets."""
+        caps = stream_capabilities()
+        try:
+            audio = f"{len(self.voice_devices('input'))} microphone(s), {len(self.voice_devices('output'))} speaker device(s)"
+        except Exception as exc:
+            audio = f"unavailable ({type(exc).__name__})"
+        say("WIRE DIAGNOSTICS")
+        say(f"client: {wire_version()}; {platform.system()} build {platform.version()}; Python {platform.python_version()}")
+        say(f"directory: {'connected and authenticated' if self.server and self.directory_public else 'not connected'}")
+        say(f"media: WebRTC {'ready' if caps['webrtc'] else 'unavailable'}; codecs {', '.join(caps['codecs']) or 'none'}")
+        say(f"encoder: {caps['hardware']}; displays: {self.monitor_count()}; viewer: {'ready' if tk and ImageTk else 'unavailable'}")
+        say(f"audio: {audio}; TURN relay: {'configured' if os.environ.get('WIRE_TURN_URL', '').strip() else 'not configured (direct/STUN only)'}")
+        say(f"data: {DATA}; diagnostics: {DIAGNOSTIC_LOG}")
+        if self.webrtc_shares:
+            self.show_share_stats()
+
     def require_login(self) -> None:
         if not self.private or not self.public or not self.sign_private or not self.sign_public or not self.name:
             raise ValueError("sign in first")
@@ -3097,6 +3122,7 @@ FILES AND MEDIA
   /call / /call stats / /acceptcall <name> / /declinecall <name> / /hangup
   /share                             Start sharing your selected monitor.
   /share accept|decline <code>       Answer a screen-share request.
+  /share pause|resume               Temporarily pause or resume outgoing capture.
   /share stop|close / /share stats   Stop sharing or show live share statistics.
 
 GROUPS
@@ -3111,7 +3137,7 @@ SETTINGS AND UTILITIES
                                       Includes Do Not Disturb and Allow group invites.
   /settings delete                   Delete this PC's local account data.
   /identity / /fingerprint <name>    Show safety fingerprints.
-  /ping / /testnotify                Connection and notification checks.
+  /ping / /testnotify / /diagnose   Connection, notification, and capability checks.
   /update                            Close Wire and install the newest version.
   /checkupdate                       Check whether a newer version exists.
   /exit                              Close the active chat but keep Wire open.
@@ -3349,12 +3375,18 @@ def main() -> None:
                         app.stop_screen_share()
                     elif pieces == ["stats"]:
                         app.show_share_stats()
+                    elif pieces == ["pause"]:
+                        app.pause_screen_share(True)
+                    elif pieces == ["resume"]:
+                        app.pause_screen_share(False)
                     else:
-                        raise ValueError("use: /share | /share accept|decline <code> | /share stop | /share stats")
+                        raise ValueError("use: /share | /share accept|decline <code> | /share pause|resume|stop|stats")
                 elif command == "ping":
                     ping_id = uuid.uuid4().hex
                     app.pending_pings[ping_id] = time.monotonic()
                     app.server_send({"type": "ping", "id": ping_id})
+                elif command == "diagnose":
+                    app.diagnose()
                 elif command == "update":
                     print("Wire will close, then install the newest version in a separate window.")
                     start_update_after_exit()
