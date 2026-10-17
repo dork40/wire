@@ -15,6 +15,7 @@ from pathlib import Path
 
 import wire
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.fernet import Fernet
 from PIL import Image
 
@@ -341,6 +342,33 @@ class TransportTests(unittest.TestCase):
             wire.recv_frame, wire.say = old_receive, old_say
         self.assertEqual(first.received, [])
         self.assertEqual(target.received, [("remote", {"sdp": "answer"}), ("call", {"sdp": "answer"})])
+
+    def test_screen_share_offer_is_received_inside_encrypted_control(self):
+        app = wire.Wire()
+        key, share_id = os.urandom(32), "a" * 32
+        peer = wire.Peer("alice", None, key, os.urandom(32))
+        offer = {"id": share_id, "sdp": "private-sdp", "resolution": [1280, 720], "fps": 60}
+        control = json.dumps({"kind": "webrtc_offer", "id": share_id, "offer": offer}, separators=(",", ":")).encode()
+        nonce = os.urandom(12)
+        packet = {"type": "control", "nonce": wire.b64(nonce),
+                  "data": wire.b64(AESGCM(key).encrypt(nonce, control, b"wire-v1-control"))}
+        original_say, original_redraw = wire.say, wire.redraw_prompt
+        wire.say, wire.redraw_prompt = lambda _: None, lambda: None
+        try:
+            app.handle_message(peer, packet)
+        finally:
+            wire.say, wire.redraw_prompt = original_say, original_redraw
+        self.assertEqual(app.pending_shares[share_id]["offer"]["sdp"], "private-sdp")
+
+    def test_malformed_screen_share_offer_is_rejected(self):
+        share_id = "b" * 32
+        self.assertFalse(wire.valid_share_offer({"id": share_id, "sdp": "x", "resolution": [], "fps": 60}, share_id))
+        self.assertFalse(wire.valid_share_offer({"id": share_id, "sdp": "x", "resolution": [1920, 1080], "fps": 1000}, share_id))
+
+    def test_updater_no_longer_executes_remote_powershell(self):
+        source = Path(wire.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("irm {INSTALL_SCRIPT_URL} | iex", source)
+        self.assertIn("wire/archive/{commit}.zip", source)
 
 
 if __name__ == "__main__":

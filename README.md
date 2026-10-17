@@ -46,7 +46,7 @@ directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
-Wire v1.4.52 requires directory server v1.4.22 or newer. The directory now uses
+Wire v1.4.53 requires directory server v1.4.22 or newer. The directory now uses
 TLS and a persistent signing identity; upgrade the server before upgrading
 clients. Keep the server state volume because it contains the pinned server key.
 
@@ -68,6 +68,9 @@ close the viewer as well. Wire uses STUN to discover public candidates for direc
 internet sharing while keeping media encrypted with DTLS-SRTP. Hosts can configure
 their own TURN relay with `WIRE_TURN_URL`, `WIRE_TURN_USERNAME`, and
 `WIRE_TURN_CREDENTIAL` when direct UDP cannot connect.
+
+Screen-share SDP and ICE signaling travels inside the room's end-to-end
+encrypted control channel. The directory only relays ciphertext.
 
 The directory address is saved after `server <host> [port]` is used once. In a normal release, the official directory address would be built in, so chat users never need to enter an IP address.
 

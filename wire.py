@@ -80,7 +80,7 @@ APP = "wire"
 PORT = 46565
 DEFAULT_DIRECTORY_HOST = "wirecmd.ddns.net"
 DEFAULT_DIRECTORY_PORT = 47666
-INSTALL_SCRIPT_URL = "https://raw.githubusercontent.com/dork40/wire/main/install-wire.ps1"
+GITHUB_API_MAIN = "https://api.github.com/repos/dork40/wire/commits/main"
 # Account data must never live beside a versioned package/executable.  Updates,
 # pipx environments and portable builds can be replaced without losing users.
 if os.name == "nt":
@@ -175,6 +175,26 @@ def safe_terminal_text(value: object) -> str:
 
 def valid_transfer_id(value: object) -> bool:
     return isinstance(value, str) and TRANSFER_ID_RE.fullmatch(value) is not None
+
+
+def valid_share_offer(offer: object, expected_id: object = None) -> bool:
+    """Reject malformed WebRTC metadata before it reaches native media code."""
+    if not isinstance(offer, dict) or not valid_transfer_id(offer.get("id")):
+        return False
+    if expected_id is not None and offer["id"] != expected_id:
+        return False
+    resolution = offer.get("resolution")
+    if (not isinstance(resolution, (list, tuple)) or len(resolution) != 2
+            or any(isinstance(value, bool) or not isinstance(value, int) or not 240 <= value <= 8192
+                   for value in resolution)):
+        return False
+    fps = offer.get("fps")
+    if isinstance(fps, bool) or not isinstance(fps, int) or not 1 <= fps <= 240:
+        return False
+    codec = offer.get("codec", "auto")
+    return (isinstance(offer.get("sdp"), str) and 0 < len(offer["sdp"]) <= 2_000_000
+            and isinstance(offer.get("type", "offer"), str)
+            and isinstance(codec, str) and len(codec) <= 16)
 
 
 def protect_private_path(path: Path, directory: bool = False) -> None:
@@ -594,19 +614,25 @@ def toast(text: str) -> None:
 
 
 def start_update_after_exit() -> None:
-    """Start an updater in another console after this Wire process releases its files."""
+    """Install one immutable Git commit without executing a downloaded script."""
     if os.name != "nt":
         raise ValueError("automatic updating is currently available on Windows only")
+    request = urllib.request.Request(GITHUB_API_MAIN, headers={"User-Agent": "Wire-Updater"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        commit = json.loads(response.read().decode("utf-8")).get("sha", "")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("GitHub returned an invalid release commit")
+    source = f"https://github.com/dork40/wire/archive/{commit}.zip"
     script = (
         f"$wirePid = {os.getpid()}; "
         "Wait-Process -Id $wirePid -ErrorAction SilentlyContinue; "
         "$servers = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '*pipx\\pipx\\venvs\\wire-messenger*' -and $_.CommandLine -match 'wire-server\\.py|wire-server\\.exe' }); "
         "if ($servers) { $servers | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } }; "
-        f"irm {INSTALL_SCRIPT_URL} | iex; "
+        f"py -m pipx install --force '{source}'; "
         "Write-Host ''; Read-Host 'Update complete. Press Enter to close this window'"
     )
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
-    subprocess.Popen(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", script],
                      creationflags=flags)
 
 
@@ -1953,8 +1979,9 @@ class Wire:
         self.share_peers[share_id] = peer.name
         try:
             offer = media.call(media.offer()).result(timeout=35); offer["id"] = share_id
-            # `port` keeps old Wire directories compatible; WebRTC ignores it.
-            self.server_send({"type": "share_offer", "to": peer.name, "port": 1, "offer": offer})
+            # SDP and ICE candidates stay inside the existing end-to-end
+            # encrypted room instead of being readable by the directory.
+            peer.send_control({"kind": "webrtc_offer", "id": share_id, "offer": offer})
         except Exception:
             self.webrtc_shares.pop(share_id, None); self.share_peers.pop(share_id, None); media.close()
             raise
@@ -1965,8 +1992,9 @@ class Wire:
         had_webrtc = bool(self.webrtc_shares)
         for share_id, media in list(self.webrtc_shares.items()):
             peer_name = self.share_peers.get(share_id)
-            if peer_name and self.server:
-                try: self.server_send({"type": "share_stop", "to": peer_name, "id": share_id})
+            peer = self.peers.get(str(peer_name).lower()) if peer_name else None
+            if peer:
+                try: peer.send_control({"kind": "webrtc_stop", "id": share_id})
                 except (OSError, ConnectionError): pass
             media.close()
         self.webrtc_shares.clear()
@@ -1990,6 +2018,10 @@ class Wire:
         share_id = matches[0]
         state = self.pending_shares.pop(share_id)
         if not accept:
+            peer = self.peers.get(str(state["from"]).lower())
+            if peer:
+                try: peer.send_control({"kind": "webrtc_decline", "id": share_id})
+                except (OSError, ConnectionError): pass
             say("screen share declined")
             return
         peer = self.peers.get(str(state["from"]).lower())
@@ -2382,6 +2414,24 @@ class Wire:
                 if control.get("kind") == "webrtc_answer" and isinstance(control.get("answer"), dict):
                     media = self.webrtc_shares.get(str(control.get("id", "")))
                     if media: media.call(media.remote(control["answer"]))
+                elif control.get("kind") == "webrtc_offer" and isinstance(control.get("offer"), dict):
+                    offer = control["offer"]
+                    share_id = control.get("id")
+                    if valid_transfer_id(share_id) and valid_share_offer(offer, share_id):
+                        resolution = offer["resolution"]
+                        self.pending_shares[share_id] = {"from": peer.name, "offer": offer}
+                        say(f"\n{peer.name} wants to share their screen ({resolution[0]}x{resolution[1]}).")
+                        say(f"Type /share accept {share_id[:6]} or /share decline {share_id[:6]}")
+                        redraw_prompt()
+                elif control.get("kind") == "webrtc_stop" and valid_transfer_id(control.get("id")):
+                    self.pending_shares.pop(control["id"], None)
+                    self.stop_share_id(control["id"], remote=True)
+                elif control.get("kind") == "webrtc_decline" and valid_transfer_id(control.get("id")):
+                    share_id = control["id"]
+                    media = self.webrtc_shares.pop(share_id, None)
+                    self.share_peers.pop(share_id, None)
+                    if media: media.close()
+                    say("screen share declined by the other person")
                 elif control.get("kind") in ("message_react", "message_edit", "message_delete", "message_delivered", "message_read"):
                     self.apply_message_control(peer, control)
                 elif control.get("kind") == "file_relay_accept":
@@ -2791,10 +2841,10 @@ class Wire:
                 elif kind == "share_offer":
                     offer = packet.get("offer", {})
                     code = offer.get("id", "") if isinstance(offer, dict) else ""
-                    if isinstance(offer, dict) and isinstance(code, str) and isinstance(offer.get("sdp"), str):
+                    if valid_share_offer(offer, code):
                         self.pending_shares[code] = {"from": packet.get("from"), "offer": offer}
-                        resolution = offer.get("resolution", ["?", "?"])
-                        say(f"\n{packet.get('from')} wants to share their screen ({resolution[0]}x{resolution[1]}).")
+                        resolution = offer["resolution"]
+                        say(f"\n{safe_terminal_text(packet.get('from'))} wants to share their screen ({resolution[0]}x{resolution[1]}).")
                         say(f"Type /share accept {code[:6]} or /share decline {code[:6]}")
                         redraw_prompt()
                 elif kind == "share_answer":
