@@ -13,6 +13,7 @@ from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSession
 import aiortc.codecs.h264 as aiortc_h264
 from aiortc.rtcrtpsender import RTCRtpSender
 from av import VideoFrame
+from av.video.reformatter import Interpolation, VideoReformatter
 
 try:
     import dxcam
@@ -148,15 +149,26 @@ class LatestFrameCapture:
         self.stats = stats
         self.monitor_index = monitor_index
         self.frame = None; self.sequence = 0; self.lock = threading.Lock(); self.stop = threading.Event()
+        self.reformatter = VideoReformatter()
         self.backend = "mss"
         self.thread = threading.Thread(target=self._run, daemon=True)
     def start(self): self.thread.start()
     def _publish(self, raw, monitor):
         began = time.monotonic()
         draw_windows_cursor(raw, monitor)
+        # Resize and convert on the capture worker.  Doing this in
+        # ScreenTrack.recv serialized CPU preprocessing with WebRTC/NVENC and
+        # capped a 1080p60 share well below its requested frame rate.  The
+        # converted AV frame owns its buffers, so DXcam's ring-buffer image no
+        # longer needs another full-resolution numpy copy either.
+        frame = VideoFrame.from_ndarray(raw, format="bgra")
+        frame = self.reformatter.reformat(
+            frame, width=self.width, height=self.height, format="yuv420p",
+            interpolation=Interpolation.FAST_BILINEAR,
+        )
         with self.lock:
             self.sequence += 1
-            self.frame = (raw, (raw.shape[1], raw.shape[0]), self.sequence)
+            self.frame = (frame, self.sequence)
         self.stats.record_capture(time.monotonic() - began)
 
     def _run_dxcam(self):
@@ -172,7 +184,10 @@ class LatestFrameCapture:
             timestamp = None
             last_frame_available = time.monotonic()
             while not self.stop.is_set():
-                item = camera.get_latest_frame(with_timestamp=True)
+                # Conversion completes synchronously before DXcam can reuse
+                # its ring slot, so a borrowed view avoids a 14 MB copy for a
+                # 2560x1440 BGRA desktop on every frame.
+                item = camera.get_latest_frame(copy=False, with_timestamp=True)
                 if item is None:
                     # DXGI access loss can leave DXcam retrying forever without
                     # raising. Fall back before it floods stderr or hangs /share.
@@ -186,9 +201,7 @@ class LatestFrameCapture:
                     time.sleep(0.001)
                     continue
                 timestamp = next_timestamp
-                # DXcam owns a small ring buffer. Copy once before handing the
-                # frame to the asynchronous encoder so it cannot be overwritten.
-                self._publish(raw.copy(), mon)
+                self._publish(raw, mon)
         finally:
             try:
                 camera.stop()
@@ -205,7 +218,7 @@ class LatestFrameCapture:
                 began = time.monotonic()
                 shot = cap.grab(mon)
                 # BGRA buffer is passed straight to PyAV; no Pillow/JPEG/base64 step.
-                raw = np.asarray(shot).copy()
+                raw = np.asarray(shot)
                 self._publish(raw, mon)
                 time.sleep(max(0, interval - (time.monotonic() - began)))
 
@@ -285,14 +298,12 @@ class ScreenTrack(VideoStreamTrack):
                 await asyncio.sleep(self.next_frame_at - now)
             began = time.monotonic()
             item = self.capture.latest()
-            if item is None or item[2] == self.last_sequence:
+            if item is None or item[1] == self.last_sequence:
                 await asyncio.sleep(min(0.005, interval))
                 continue
-            raw, _size, sequence = item
+            frame, sequence = item
             self.last_sequence = sequence
             self.next_frame_at = max(self.next_frame_at + interval, time.monotonic())
-            frame = VideoFrame.from_ndarray(raw, format="bgra")
-            frame = frame.reformat(width=self.capture.width, height=self.capture.height, format="yuv420p")
             # RTP timestamps must be a small, monotonic media timeline. Using
             # Unix wall-clock values made FFmpeg/WebRTC pace some shares at a
             # few FPS despite capture and encode being fast enough.
