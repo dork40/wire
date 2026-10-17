@@ -49,7 +49,7 @@ Image.MAX_IMAGE_PIXELS = 50_000_000
 import numpy as np
 from pywebrtc_audio import AudioProcessor
 import mss
-from wire_webrtc import WebRTCShare, probe_h264_hardware
+from wire_webrtc import WebRTCShare, configure_turn, probe_h264_hardware
 
 try:
     from prompt_toolkit import PromptSession
@@ -900,6 +900,7 @@ class Wire:
         self.history_key: Optional[bytes] = None
         self.account_secret: Optional[bytes] = None
         self.directory_public: Optional[bytes] = None
+        self.turn_configured = False
         self.history_lock = threading.Lock()
         self.peers: dict[str, Peer] = {}
         self.room: Optional[str] = None
@@ -1107,7 +1108,8 @@ class Wire:
         say(f"directory: {'connected and authenticated' if self.server and self.directory_public else 'not connected'}")
         say(f"media: WebRTC {'ready' if caps['webrtc'] else 'unavailable'}; codecs {', '.join(caps['codecs']) or 'none'}")
         say(f"encoder: {caps['hardware']}; displays: {self.monitor_count()}; viewer: {'ready' if tk and ImageTk else 'unavailable'}")
-        say(f"audio: {audio}; TURN relay: {'configured' if os.environ.get('WIRE_TURN_URL', '').strip() else 'not configured (direct/STUN only)'}")
+        turn_ready = self.turn_configured or bool(os.environ.get("WIRE_TURN_URL", "").strip())
+        say(f"audio: {audio}; TURN relay: {'configured' if turn_ready else 'not configured (direct/STUN only)'}")
         say(f"data: {DATA}; diagnostics: {DIAGNOSTIC_LOG}")
         if self.webrtc_shares:
             self.show_share_stats()
@@ -2650,6 +2652,7 @@ class Wire:
             reply = recv_frame(sock)
             if reply.get("type") != "ready":
                 raise ConnectionError(reply.get("message", "directory rejected login"))
+            self.turn_configured = configure_turn(reply.get("turn"))
             sock.settimeout(None)
             self.server = sock
             # New directories advertise their wire-byte relay allowance. Keep

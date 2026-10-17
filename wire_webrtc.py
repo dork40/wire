@@ -30,6 +30,27 @@ _H264_PROBE_LOCK = threading.Lock()
 _H264_PROBE_COMPLETE = False
 _H264_HARDWARE_ENCODER = None
 _PREFER_H264_HARDWARE = True
+_DIRECTORY_TURN = None
+
+
+def configure_turn(value):
+    """Accept short-lived TURN credentials only from the authenticated directory."""
+    global _DIRECTORY_TURN
+    if not isinstance(value, dict):
+        _DIRECTORY_TURN = None
+        return False
+    urls = value.get("urls")
+    if isinstance(urls, str):
+        urls = [urls]
+    username, credential = value.get("username"), value.get("credential")
+    if (not isinstance(urls, list) or not urls or len(urls) > 4
+            or not all(isinstance(url, str) and url.startswith(("turn:", "turns:")) and len(url) <= 300 for url in urls)
+            or not isinstance(username, str) or not 1 <= len(username) <= 200
+            or not isinstance(credential, str) or not 1 <= len(credential) <= 300):
+        _DIRECTORY_TURN = None
+        return False
+    _DIRECTORY_TURN = RTCIceServer(urls=urls, username=username, credential=credential)
+    return True
 
 
 def _configure_h264_context(name, width, height, bitrate):
@@ -122,6 +143,8 @@ def ice_configuration():
     turn_url = os.environ.get("WIRE_TURN_URL", "").strip()
     if turn_url:
         servers.append(RTCIceServer(urls=[turn_url], username=os.environ.get("WIRE_TURN_USERNAME"), credential=os.environ.get("WIRE_TURN_CREDENTIAL")))
+    elif _DIRECTORY_TURN:
+        servers.append(_DIRECTORY_TURN)
     return RTCConfiguration(iceServers=servers)
 
 

@@ -23,7 +23,9 @@ from cryptography.x509.oid import NameOID
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.23"
+SERVER_VERSION = "1.4.24"
+TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
+TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -57,6 +59,18 @@ RECOVERY_WINDOW_SECONDS = 15 * 60
 MAX_RECOVERY_ATTEMPTS = 5
 SERVER_KEY_LOCK = threading.Lock()
 SERVER_SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
+
+
+def turn_credentials(name: str) -> dict | None:
+    """Create Coturn REST credentials that expire instead of exposing its secret."""
+    if (not TURN_SECRET or not TURN_URLS or len(TURN_URLS) > 4
+            or any(not url.startswith(("turn:", "turns:")) or len(url) > 300 for url in TURN_URLS)):
+        return None
+    username = f"{int(time.time()) + 3600}:{name.lower()}"
+    credential = base64.b64encode(
+        hmac.new(TURN_SECRET.encode("utf-8"), username.encode("utf-8"), hashlib.sha1).digest()
+    ).decode("ascii")
+    return {"urls": TURN_URLS, "username": username, "credential": credential, "expires_in": 3600}
 
 
 def protect_state_path(path: Path, directory: bool = False) -> None:
@@ -433,8 +447,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             queues = load_queues()
             queued_packets = queues.pop(key, [])
             if queued_packets: save_queues(queues)
-        send(sock, {"type": "ready", "name": name, "version": SERVER_VERSION,
-                    "relay_rate": RELAY_RATE_BYTES_PER_SECOND})
+        ready = {"type": "ready", "name": name, "version": SERVER_VERSION,
+                 "relay_rate": RELAY_RATE_BYTES_PER_SECOND}
+        turn = turn_credentials(name)
+        if turn:
+            ready["turn"] = turn
+        send(sock, ready)
         sock.settimeout(None)
         for queued in queued_packets:
             if isinstance(queued, dict): send(sock, queued)

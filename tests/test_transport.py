@@ -30,6 +30,16 @@ def load_server_module():
 
 
 class TransportTests(unittest.TestCase):
+    def test_server_turn_credentials_are_short_lived_and_hmac_authenticated(self):
+        server = load_server_module()
+        server.TURN_URLS = ["turn:relay.example:3478?transport=udp"]
+        server.TURN_SECRET = "test-secret"
+        value = server.turn_credentials("Alice")
+        self.assertEqual(value["urls"], server.TURN_URLS)
+        self.assertTrue(value["username"].endswith(":alice"))
+        expected = base64.b64encode(hmac.new(b"test-secret", value["username"].encode(), hashlib.sha1).digest()).decode()
+        self.assertEqual(value["credential"], expected)
+
     def test_terminal_control_sequences_are_removed(self):
         hostile = "hello\x1b[2J\x1b]0;fake title\x07world"
         rendered = wire.Wire().render_record({"from": "peer", "text": hostile})

@@ -3,7 +3,7 @@ import unittest
 
 from av import VideoFrame
 
-from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats
+from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats, configure_turn, ice_configuration
 
 
 class _Capture:
@@ -33,6 +33,13 @@ class ScreenTrackTests(unittest.TestCase):
         self.assertTrue(capture.paused.is_set())
         capture.set_paused(False)
         self.assertFalse(capture.paused.is_set())
+
+    def test_authenticated_directory_turn_configuration_is_validated(self):
+        self.assertFalse(configure_turn({"urls": ["https://evil.invalid"], "username": "u", "credential": "p"}))
+        self.assertTrue(configure_turn({"urls": ["turn:relay.example:3478?transport=udp"], "username": "123:user", "credential": "token"}))
+        servers = ice_configuration().iceServers
+        self.assertTrue(any(server.username == "123:user" for server in servers))
+        configure_turn(None)
 
 
 if __name__ == "__main__":

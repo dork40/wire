@@ -5,7 +5,30 @@ services:
     restart: unless-stopped
     environment:
       WIRE_STATE: /data
+      WIRE_TURN_URLS: ${WIRE_TURN_URLS:-turn:wirecmd.ddns.net:3478?transport=udp,turn:wirecmd.ddns.net:3478?transport=tcp}
+      WIRE_TURN_SECRET: ${WIRE_TURN_SECRET:?set WIRE_TURN_SECRET}
     ports:
       - "47666:47666/tcp"
     volumes:
       - ./wire-server-data:/data
+  wire-turn:
+    image: coturn/coturn:4.18.0-r0
+    restart: unless-stopped
+    command:
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${WIRE_TURN_SECRET:?set WIRE_TURN_SECRET}
+      - --realm=wirecmd.ddns.net
+      - --external-ip=${WIRE_PUBLIC_IP:?set WIRE_PUBLIC_IP}/${WIRE_PRIVATE_IP:-192.168.1.199}
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --no-multicast-peers
+      - --stale-nonce=600
+      - --log-file=stdout
+    ports:
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      - "49160-49200:49160-49200/udp"

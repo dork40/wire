@@ -16,6 +16,15 @@ powershell -ExecutionPolicy Bypass -File .\make-truenas-yaml.ps1 | Set-Clipboard
 
 In TrueNAS, go to **Apps → Discover → more menu → Install via YAML**, name the app `wire`, paste the clipboard contents, and save. The deployment keeps its server data in `/mnt/nvme/wire`.
 
-The server uses TCP port 47666. Do not expose the TrueNAS web administration interface to the internet.
+The deployment runs both the Wire directory and an authenticated Coturn relay. The
+directory issues one-hour TURN credentials after a signed Wire login; the permanent
+TURN secret stays inside the two TrueNAS containers.
 
-Before public deployment, the Windows Wire client must be configured to use the TrueNAS hostname and the router must forward only TCP 47666 to the Wire container. The server stores public identity keys and encrypted packets; it does not store plaintext chat messages.
+Forward these router ports to `192.168.1.199`:
+
+- TCP 47666 for the Wire directory.
+- UDP and TCP 3478 for TURN negotiation.
+- UDP 49160-49200 for relayed media.
+
+Do not expose the TrueNAS web administration interface. TURN relays encrypted
+DTLS-SRTP packets and does not decrypt screen-share or call contents.
