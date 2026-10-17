@@ -9,7 +9,7 @@ services:
   wire-server:
     # Bump this whenever the embedded server protocol changes so TrueNAS
     # rebuilds the custom image instead of reusing the prior local tag.
-    image: wire-server:1.4.22
+    image: wire-server:1.4.23
     build:
       context: .
       dockerfile_inline: |

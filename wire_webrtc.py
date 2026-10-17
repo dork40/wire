@@ -1,22 +1,112 @@
 """Cross-platform WebRTC screen-share core.
 
-Windows currently uses MSS capture.  Capture/encode/transport are isolated here so a
+Windows prefers DXGI capture and falls back to MSS. Capture/encode/transport are isolated here so a
 Windows.Graphics.Capture/D3D11 backend or Linux PipeWire backend can replace only
 LatestFrameCapture later; the signaling/UI layers do not depend on Windows APIs.
 """
-import asyncio, ctypes, os, threading, time
+import asyncio, ctypes, logging, os, threading, time
 from fractions import Fraction
+import av
 import mss
 import numpy as np
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, MediaStreamError
+import aiortc.codecs.h264 as aiortc_h264
 from aiortc.rtcrtpsender import RTCRtpSender
-from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 
 try:
     import dxcam
 except ImportError:
     dxcam = None
+else:
+    # Access-loss warnings are handled by the bounded fallback below. DXcam
+    # can otherwise print the same warning hundreds of times into Wire.
+    logging.getLogger("dxcam.dxcam").setLevel(logging.ERROR)
+    logging.getLogger("dxcam.core.dxgi_duplicator").setLevel(logging.ERROR)
+
+
+_H264_PROBE_LOCK = threading.Lock()
+_H264_PROBE_COMPLETE = False
+_H264_HARDWARE_ENCODER = None
+_PREFER_H264_HARDWARE = True
+
+
+def _configure_h264_context(name, width, height, bitrate):
+    """Create one low-latency H.264 context without assuming a GPU vendor."""
+    codec = av.CodecContext.create(name, "w")
+    codec.width, codec.height = width, height
+    codec.bit_rate = bitrate
+    codec.pix_fmt = "yuv420p"
+    codec.framerate = Fraction(aiortc_h264.MAX_FRAME_RATE, 1)
+    codec.time_base = Fraction(1, aiortc_h264.MAX_FRAME_RATE)
+    if name == "h264_nvenc":
+        codec.options = {"preset": "p1", "tune": "ull", "rc": "cbr", "zerolatency": "1"}
+    elif name == "h264_amf":
+        codec.options = {"usage": "ultralowlatency", "quality": "speed", "rc": "cbr"}
+    elif name == "h264_qsv":
+        codec.options = {"preset": "veryfast", "look_ahead": "0", "async_depth": "1"}
+    else:
+        codec.options = {"level": "42", "tune": "zerolatency"}
+    codec.profile = "Baseline"
+    return codec
+
+
+def probe_h264_hardware():
+    """Return an encoder only after it successfully encodes a real test frame."""
+    global _H264_PROBE_COMPLETE, _H264_HARDWARE_ENCODER
+    with _H264_PROBE_LOCK:
+        if _H264_PROBE_COMPLETE:
+            return _H264_HARDWARE_ENCODER
+        _H264_PROBE_COMPLETE = True
+        for name in ("h264_nvenc", "h264_amf", "h264_qsv"):
+            try:
+                # Some hardware encoders reject tiny synthetic sizes or delay
+                # their first packet, so verify with three real 640x360 frames.
+                codec = _configure_h264_context(name, 640, 360, 1_000_000)
+                packets = []
+                for index in range(3):
+                    frame = VideoFrame(640, 360, "yuv420p")
+                    frame.pts, frame.time_base = index * 3_000, Fraction(1, 90_000)
+                    packets.extend(codec.encode(frame))
+                packets.extend(codec.encode(None))
+                if packets:
+                    _H264_HARDWARE_ENCODER = name
+                    break
+            except (av.FFmpegError, ValueError):
+                continue
+        return _H264_HARDWARE_ENCODER
+
+
+def _wire_h264_encode_frame(self, frame, force_keyframe):
+    """Use a verified hardware H.264 encoder, with transparent x264 fallback."""
+    if self.codec and (frame.width != self.codec.width or frame.height != self.codec.height
+                       or abs(self.target_bitrate - self.codec.bit_rate) / self.codec.bit_rate > 0.1):
+        self.buffer_data = b""
+        self.buffer_pts = None
+        self.codec = None
+    frame.pict_type = av.video.frame.PictureType.I if force_keyframe else av.video.frame.PictureType.NONE
+    hardware_name = probe_h264_hardware() if _PREFER_H264_HARDWARE else None
+    if self.codec is None and hardware_name:
+        try:
+            self.codec = _configure_h264_context(hardware_name, frame.width, frame.height, self.target_bitrate)
+        except (av.FFmpegError, ValueError):
+            self.codec = None
+    if self.codec is None:
+        self.codec = _configure_h264_context("libx264", frame.width, frame.height, self.target_bitrate)
+    try:
+        data = b"".join(bytes(packet) for packet in self.codec.encode(frame))
+    except av.FFmpegError:
+        # A driver can disappear or reject a resolution after the initial
+        # probe. Keep the share alive by switching to aiortc's x264 path.
+        self.codec = _configure_h264_context("libx264", frame.width, frame.height, self.target_bitrate)
+        data = b"".join(bytes(packet) for packet in self.codec.encode(frame))
+    if data:
+        yield from self._split_bitstream(data)
+
+
+# aiortc does not yet expose a public per-sender hardware encoder selector.
+# Patch only its H.264 frame hook, preserving the stock encoder as fallback.
+aiortc_h264.H264Encoder._encode_frame = _wire_h264_encode_frame
 
 
 def ice_configuration():
@@ -80,12 +170,18 @@ class LatestFrameCapture:
         try:
             camera.start(target_fps=min(self.fps, 120), video_mode=False)
             timestamp = None
+            last_frame_available = time.monotonic()
             while not self.stop.is_set():
                 item = camera.get_latest_frame(with_timestamp=True)
                 if item is None:
+                    # DXGI access loss can leave DXcam retrying forever without
+                    # raising. Fall back before it floods stderr or hangs /share.
+                    if time.monotonic() - last_frame_available > 0.75:
+                        raise RuntimeError("DXGI capture stopped producing frames")
                     time.sleep(0.001)
                     continue
                 raw, next_timestamp = item
+                last_frame_available = time.monotonic()
                 if next_timestamp == timestamp:
                     time.sleep(0.001)
                     continue
@@ -207,11 +303,12 @@ class ScreenTrack(VideoStreamTrack):
 
 
 class WebRTCShare:
-    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000):
+    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000, hardware=True):
         self.signal, self.on_frame, self.on_state = signal, on_frame, on_state
         self.width, self.height, self.fps = width, height, fps
         self.monitor_index = monitor_index
         self.codec_requested = str(codec).upper()
+        self.hardware_requested = bool(hardware)
         self.codec_used = "auto"
         # aiortc's bundled video encoders cap their validated operating range
         # at 0.5-20 Mbps. WebRTC congestion control can lower this as needed.
@@ -271,6 +368,8 @@ class WebRTCShare:
         except (MediaStreamError, asyncio.CancelledError):
             self.on_state("stream ended")
     async def offer(self):
+        global _PREFER_H264_HARDWARE
+        _PREFER_H264_HARDWARE = self.hardware_requested
         pc = await self._pc(); self.capture = LatestFrameCapture(self.width, self.height, self.fps, self.stats, self.monitor_index); self.capture.start()
         transceiver = pc.addTransceiver(ScreenTrack(self.capture), direction="sendonly")
         self.sender = transceiver.sender

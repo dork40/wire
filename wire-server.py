@@ -17,13 +17,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.x509.oid import NameOID
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.22"
+SERVER_VERSION = "1.4.23"
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
 STATE = Path(os.environ.get("WIRE_STATE", str(DEFAULT_STATE)))
 USERS_FILE = STATE / "users.json"
@@ -249,6 +249,21 @@ def recovery_proof(secret: bytes) -> str:
     return hmac.new(secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
 
 
+def valid_identity_backup(backup: object) -> bool:
+    """Accept current challenge verifiers and legacy proofs, both as SHA-256 hex."""
+    if not isinstance(backup, dict):
+        return False
+    recovery_value = backup.get("recovery_verifier")
+    legacy_value = backup.get("recovery_proof")
+    valid_recovery = ((isinstance(recovery_value, str) and len(recovery_value) == 64
+                       and all(char in "0123456789abcdef" for char in recovery_value))
+                      or (isinstance(legacy_value, str) and len(legacy_value) == 64
+                          and all(char in "0123456789abcdef" for char in legacy_value)))
+    return (isinstance(backup.get("salt"), str)
+            and isinstance(backup.get("ciphertext"), str)
+            and valid_recovery and len(json.dumps(backup)) <= 20_000)
+
+
 def allow_recovery(address: str) -> bool:
     """Bound expensive password-recovery guesses by source address."""
     now = time.monotonic()
@@ -341,12 +356,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
         # releases an encrypted identity blob to an unauthenticated requester.
         if hello.get("type") == "identity_fetch":
             name = hello.get("name", "")
-            key = name.lower() if isinstance(name, str) else ""
+            recovery_key = name.lower() if isinstance(name, str) else ""
             if not allow_recovery(address[0]):
                 send(sock, {"type": "error", "message": "identity recovery is temporarily unavailable"})
                 return
             with LOCK:
-                backup = load_backups().get(key)
+                backup = load_backups().get(recovery_key)
             if (not isinstance(backup, dict) or not isinstance(backup.get("salt"), str)
                     or not isinstance(backup.get("recovery_proof"), str) and not isinstance(backup.get("recovery_verifier"), str)):
                 send(sock, {"type": "error", "message": "identity recovery is unavailable"})
@@ -533,10 +548,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         save_users(users)
             elif kind == "identity_backup":
                 backup = packet.get("backup")
-                if (not isinstance(backup, dict) or not isinstance(backup.get("salt"), str)
-                        or not isinstance(backup.get("ciphertext"), str)
-                        or not isinstance(backup.get("recovery_proof"), str)
-                        or len(backup["recovery_proof"]) != 64 or len(json.dumps(backup)) > 20000):
+                if not valid_identity_backup(backup):
                     send(sock, {"type": "error", "message": "invalid encrypted backup"})
                     continue
                 with LOCK:

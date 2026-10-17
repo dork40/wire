@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import base64
 import ctypes
-import io
 import multiprocessing as mp
 import queue
 import getpass
@@ -31,12 +30,13 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from cryptography import x509
+from cryptography.exceptions import InvalidTag
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from PIL import Image, ImageDraw, ImageSequence
+from PIL import Image, ImageSequence
 try:
     import tkinter as tk
     from PIL import ImageTk
@@ -49,7 +49,7 @@ Image.MAX_IMAGE_PIXELS = 50_000_000
 import numpy as np
 from pywebrtc_audio import AudioProcessor
 import mss
-from wire_webrtc import WebRTCShare
+from wire_webrtc import WebRTCShare, probe_h264_hardware
 
 try:
     from prompt_toolkit import PromptSession
@@ -207,6 +207,20 @@ def protect_private_path(path: Path, directory: bool = False) -> None:
         pass
 
 
+def replace_private_bytes(target: Path, payload: bytes) -> None:
+    """Atomically replace private client state so interruption cannot truncate it."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    protect_private_path(target.parent, directory=True)
+    temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        temporary.write_bytes(payload)
+        protect_private_path(temporary)
+        temporary.replace(target)
+        protect_private_path(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def pin_directory_public(host: str, port: int, server_public: bytes) -> None:
     if len(server_public) != 32:
         raise ConnectionError("directory TLS identity is invalid")
@@ -297,10 +311,7 @@ def load_settings() -> dict:
 
 
 def save_settings(settings: dict) -> None:
-    DATA.mkdir(parents=True, exist_ok=True)
-    protect_private_path(DATA, directory=True)
-    SETTINGS_FILE.write_text(json.dumps(settings), encoding="utf-8")
-    protect_private_path(SETTINGS_FILE)
+    replace_private_bytes(SETTINGS_FILE, json.dumps(settings).encode("utf-8"))
 
 
 def report_background_failure(area: str, exc: BaseException) -> None:
@@ -316,12 +327,13 @@ def report_background_failure(area: str, exc: BaseException) -> None:
 
 
 def stream_capabilities() -> dict:
-    """Cheap, non-authoritative capability probe; never infer codec support from GPU names."""
-    result = {"platform": platform.system(), "codecs": [], "webrtc": False, "hardware": "not verified"}
+    """Probe actual codec availability; never infer support from GPU model names."""
+    result = {"platform": platform.system(), "codecs": [], "webrtc": False, "hardware": "software"}
     try:
         from aiortc.rtcrtpsender import RTCRtpSender
         result["webrtc"] = True
         result["codecs"] = sorted({codec.mimeType.split("/")[-1] for codec in RTCRtpSender.getCapabilities("video").codecs if codec.mimeType.startswith("video/") and codec.mimeType not in ("video/rtx", "video/red")})
+        result["hardware"] = probe_h264_hardware() or "software"
     except Exception:
         pass
     # A successful encoder probe belongs in the native media backend.  Do not advertise
@@ -919,6 +931,7 @@ class Wire:
         self.groups: dict[str, dict] = {}
         self.group_invites: dict[str, str] = {}
         self.typing_until: dict[str, float] = {}
+        self.typing_timers: dict[str, threading.Timer] = {}
         self.last_typing_sent = 0.0
         self.typing_notifier: Optional[Callable[[], None]] = None
         self.group_room: Optional[str] = None
@@ -1047,7 +1060,13 @@ class Wire:
         if not account: return
         encrypted = Fernet(base64.urlsafe_b64encode(self.account_secret)).encrypt(json.dumps(account, separators=(",", ":")).encode("utf-8")).decode("ascii")
         recovery = hmac.new(self.account_secret, b"wire-v2-identity-recovery", hashlib.sha256).hexdigest()
-        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "kdf": account.get("kdf"), "ciphertext": encrypted, "recovery_verifier": recovery}})
+        # v1.4.22's save validator still requires the legacy field, while its
+        # recovery path correctly prefers the one-time challenge verifier.
+        # Sending both avoids login warnings during a rolling server upgrade;
+        # the reusable value is never accepted when the verifier is present.
+        legacy = hmac.new(self.account_secret, b"wire-v1-identity-recovery", hashlib.sha256).hexdigest()
+        self.server_send({"type": "identity_backup", "backup": {"salt": account["salt"], "kdf": account.get("kdf"),
+                          "ciphertext": encrypted, "recovery_verifier": recovery, "recovery_proof": legacy}})
 
     def show_share_stats(self) -> None:
         if not self.webrtc_shares:
@@ -1161,12 +1180,10 @@ class Wire:
 
     def save_contacts(self, contacts: dict) -> None:
         self.require_login()
-        assert self.history_key
-        CONTACTS_DIR.mkdir(exist_ok=True)
-        protect_private_path(CONTACTS_DIR, directory=True)
+        if not self.history_key:
+            raise ValueError("sign in first")
         payload = json.dumps(contacts, separators=(",", ":")).encode("utf-8")
-        self.contacts_path().write_bytes(Fernet(self.history_key).encrypt(payload))
-        protect_private_path(self.contacts_path())
+        replace_private_bytes(self.contacts_path(), Fernet(self.history_key).encrypt(payload))
 
     def verify_peer_identity(self, name: str, public: bytes, sign_public: bytes) -> None:
         """Trust a peer on first use and reject silent identity-key changes."""
@@ -1425,7 +1442,8 @@ class Wire:
     def delete_account(self) -> None:
         """Remove only this PC's encrypted account material after explicit confirmation."""
         self.require_login()
-        assert self.name
+        if not self.name:
+            raise ValueError("sign in first")
         confirmation = input(f"Type DELETE {self.name} to permanently remove this local Wire account: ").strip()
         if confirmation != f"DELETE {self.name}":
             say("account deletion cancelled")
@@ -1459,22 +1477,16 @@ class Wire:
         with self.history_lock:
             records = self.read_history(peer_name)
             records.append({"id": message_id, "at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text, "reply_to": reply_to, "reactions": []})
-            HISTORY_DIR.mkdir(exist_ok=True)
             encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
-            path = self.history_path(peer_name)
-            path.write_bytes(encrypted)
-            protect_private_path(HISTORY_DIR, directory=True)
-            protect_private_path(path)
+            replace_private_bytes(self.history_path(peer_name), encrypted)
         return message_id
 
     def save_history(self, peer_name: str, records: list[dict]) -> None:
         self.require_login()
-        assert self.history_key
-        HISTORY_DIR.mkdir(exist_ok=True)
-        path = self.history_path(peer_name)
-        path.write_bytes(Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8")))
-        protect_private_path(HISTORY_DIR, directory=True)
-        protect_private_path(path)
+        if not self.history_key:
+            raise ValueError("sign in first")
+        encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
+        replace_private_bytes(self.history_path(peer_name), encrypted)
 
     def matching_message(self, peer_name: str, prefix: str, own_only: bool = False) -> tuple[list[dict], dict]:
         records = self.read_history(peer_name)
@@ -1531,6 +1543,10 @@ class Wire:
             say("no saved messages match")
 
     def send_message(self, peer: Peer, text: str, reply_to: str | None = None) -> None:
+        if not text:
+            raise ValueError("message cannot be empty")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(f"message is too long ({MAX_MESSAGE_CHARS} character maximum)")
         message_id = uuid.uuid4().hex
         peer.send(text, message_id, reply_to)
         self.record_history(peer.name, self.name or "me", text, message_id, reply_to)
@@ -1560,6 +1576,10 @@ class Wire:
         self.send_message(peer, text, str(target["id"]))
 
     def edit_message(self, peer: Peer, prefix: str, text: str) -> None:
+        if not text:
+            raise ValueError("message cannot be empty")
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(f"message is too long ({MAX_MESSAGE_CHARS} character maximum)")
         records, target = self.matching_message(peer.name, prefix, own_only=True)
         if target.get("deleted"):
             raise ValueError("cannot edit a deleted message")
@@ -1672,7 +1692,7 @@ class Wire:
                 path.unlink(missing_ok=True)
             raise ValueError("files must be 500 MB or smaller")
         file_id = uuid.uuid4().hex
-        token = b64(os.urandom(24))
+        token = os.urandom(32).hex()
         offer = {
             "id": file_id, "token": token, "name": path.name, "size": size,
             "sha256": self.file_digest(path), "contents": self.zip_contents(path),
@@ -1974,7 +1994,7 @@ class Wire:
         share_id = uuid.uuid4().hex
         resolution = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         fps = STREAM_FPS[self.settings["stream_fps"]]
-        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000)
+        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000, self.settings["stream_hardware"])
         self.webrtc_shares[share_id] = media
         self.share_peers[share_id] = peer.name
         try:
@@ -2279,15 +2299,18 @@ class Wire:
         raw = AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-image")
         frame = json.loads(raw.decode("utf-8"))
         image_id = frame.get("id", "")
-        if not isinstance(image_id, str) or not image_id:
+        if not valid_transfer_id(image_id):
             return
         kind = frame.get("kind")
         if kind == "offer":
             name = Path(str(frame.get("name", "image"))).name
             size = frame.get("size")
-            if Path(name).suffix.lower() not in IMAGE_EXTENSIONS or not isinstance(size, int) or not 0 <= size <= MAX_IMAGE_BYTES:
+            digest = frame.get("sha256")
+            if (Path(name).suffix.lower() not in IMAGE_EXTENSIONS or not isinstance(size, int)
+                    or not 0 <= size <= MAX_IMAGE_BYTES or not isinstance(digest, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)):
                 return
-            self.pending_images[image_id] = {"name": name, "size": size, "sha256": frame.get("sha256")}
+            self.pending_images[image_id] = {"name": name, "size": size, "sha256": digest}
             say(f"\n{peer.name} wants to send {name} ({size // 1024} KB). Type /image accept {image_id[:6]} or /image decline {image_id[:6]}")
         elif kind == "accept":
             self.start_worker(self.transfer_image, peer, image_id)
@@ -2308,7 +2331,8 @@ class Wire:
             while target.exists():
                 target = DOWNLOADS_DIR / f"{stem} ({number}){suffix}"
                 number += 1
-            temp = target.with_suffix(target.suffix + ".part")
+            temp = target.parent / f".{target.name}.{image_id}.part"
+            temp.unlink(missing_ok=True)
             self.incoming_images[image_id] = {"path": target, "temp": temp, "size": size, "sha256": frame.get("sha256"), "written": 0, "index": 0}
             say(f"\n{peer.name} is sending image: {name}")
         elif kind == "chunk" and image_id in self.incoming_images:
@@ -2408,6 +2432,14 @@ class Wire:
     def handle_message(self, peer: Peer, packet: dict) -> None:
         if packet.get("type") in {"control", "image", "voice", "audio", "file_relay", "msg"} and not peer.accept_nonce(packet):
             return
+        try:
+            self.handle_authenticated_message(peer, packet)
+        except (InvalidTag, KeyError, TypeError, ValueError, UnicodeError):
+            # A corrupt authenticated media frame is untrusted network input.
+            # Drop only that frame; do not let it tear down the whole room.
+            return
+
+    def handle_authenticated_message(self, peer: Peer, packet: dict) -> None:
         if packet.get("type") == "control":
             try:
                 control = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-control").decode("utf-8"))
@@ -2471,9 +2503,15 @@ class Wire:
                         self.refresh_typing_status()
                     def refresh_when_expired() -> None:
                         if self.typing_until.get(name, 0) <= expires:
+                            self.typing_until.pop(name, None)
+                            self.typing_timers.pop(name, None)
                             self.refresh_typing_status()
+                    previous_timer = self.typing_timers.pop(name, None)
+                    if previous_timer:
+                        previous_timer.cancel()
                     expiry_refresh = threading.Timer(5.05, refresh_when_expired)
                     expiry_refresh.daemon = True
+                    self.typing_timers[name] = expiry_refresh
                     expiry_refresh.start()
             except Exception: pass
             return
@@ -2495,8 +2533,8 @@ class Wire:
         text = AESGCM(peer.key).decrypt(nonce, data, b"wire-v1-message").decode("utf-8")
         if len(text) > MAX_MESSAGE_CHARS:
             return
-        message_id = packet.get("id") if isinstance(packet.get("id"), str) and len(packet["id"]) <= 64 else uuid.uuid4().hex
-        reply_to = packet.get("reply_to") if isinstance(packet.get("reply_to"), str) else None
+        message_id = packet.get("id") if valid_transfer_id(packet.get("id")) else uuid.uuid4().hex
+        reply_to = packet.get("reply_to") if valid_transfer_id(packet.get("reply_to")) else None
         self.record_history(peer.name, peer.name, text, message_id, reply_to)
         peer.send_control({"kind": "message_delivered", "id": message_id})
         # Wire renders incoming room messages immediately, so that is the
@@ -2523,7 +2561,7 @@ class Wire:
             if kind == "message_read": target["read"] = True
             self.save_history(peer.name, records)
             return
-        if kind == "message_react" and isinstance(control.get("reaction"), str):
+        if kind == "message_react" and isinstance(control.get("reaction"), str) and 0 < len(control["reaction"]) <= 24:
             reaction = control["reaction"]
             token = f"{peer.name}:{reaction}"
             target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{peer.name}:")] + [token]
@@ -2599,9 +2637,7 @@ class Wire:
                     RELAY_UPLOAD_BYTES_PER_SECOND,
                     int(advertised_rate / RELAY_UPLOAD_EXPANSION * 0.85),
                 )
-            DATA.mkdir(exist_ok=True)
-            SERVER_CONFIG.write_text(json.dumps({"host": host, "port": port}), encoding="utf-8")
-            protect_private_path(SERVER_CONFIG)
+            replace_private_bytes(SERVER_CONFIG, json.dumps({"host": host, "port": port}).encode("utf-8"))
             self.start_worker(self.server_loop, sock)
             self.sync_preferences()
             self.backup_identity()
@@ -2902,7 +2938,8 @@ class Wire:
         say(f"listening on TCP {port}")
 
     def accept_loop(self) -> None:
-        assert self.listener
+        if not self.listener:
+            return
         while not self.closing.is_set():
             try:
                 sock, address = self.listener.accept()
@@ -2951,6 +2988,19 @@ class Wire:
 
     def close(self) -> None:
         self.closing.set()
+        for timer in self.typing_timers.values():
+            timer.cancel()
+        self.typing_timers.clear()
+        for state in list(self.incoming_images.values()) + list(self.incoming_files.values()):
+            temp = state.get("temp")
+            if isinstance(temp, Path):
+                temp.unlink(missing_ok=True)
+        for state in self.outgoing_files.values():
+            if state.get("cleanup") and isinstance(state.get("path"), Path):
+                state["path"].unlink(missing_ok=True)
+        self.incoming_images.clear()
+        self.incoming_files.clear()
+        self.outgoing_files.clear()
         # Do this before sockets and the interpreter disappear; aiortc owns
         # background ICE / DTLS / RTP tasks that must be drained first.
         for media in list(self.webrtc_shares.values()):
@@ -3012,76 +3062,6 @@ class Wire:
                 pass
             peer.sock.close()
         say("chat closed")
-
-
-HELP = """WIRE HELP
-
-  signup [username]
-      Make a new Wire username. If you leave the name blank, Wire asks for it.
-
-  login [username]
-      Sign into a username you already made on this PC.
-
-  discover [name]
-      Show usernames in Wire. Add a name to search for one person.
-
-  friends
-      Show your saved friends and whether each is online.
-
-  friend add <username>
-      Save someone to your friend list.
-
-  friend remove <username>
-      Remove someone from your friend list.
-
-  block <username>
-      Block a person from opening rooms or sending you room messages.
-
-  unblock <username>
-      Remove a block.
-
-  blocked
-      Show everyone you have blocked.
-
-  open <username>
-      Ask someone to open a private room with you.
-
-  accept <username>
-      Accept a room request that person sent you.
-
-  history <username>
-      Show saved messages with that person without opening a room.
-
-  peers
-      Show the people you are currently connected to.
-
-  room <username>
-      Switch to a room with someone you are already connected to.
-
-  leave
-      Leave the current room. It does not delete chat history.
-
-  identity
-      Show your safety fingerprint. Share it only to verify your identity.
-
-  fingerprint <username>
-      Show the connected person's safety fingerprint.
-
-  help
-      Show this help screen.
-
-  settings [notifications on|off|voice|delete]
-      Show settings, change notifications, choose voice devices, or delete this local account.
-
-  exit
-      Close Wire.
-
-IN A ROOM
-  Type normally and press Enter to send a message.
-  Use /send <image path> to offer an encrypted image.
-  Use /image accept <code> or /image decline <code> for image offers.
-  Use /call, /acceptcall <name>, /declinecall <name>, /hangup, and /call stats for voice.
-  Use /help, /leave, or /exit for commands while chatting."""
 
 
 HELP = """WIRE HELP
@@ -3477,10 +3457,7 @@ def main() -> None:
                 elif command == "quit":
                     break
                 else:
-                    if len(app.peers) == 1:
-                        app.send_message(next(iter(app.peers.values())), line)
-                    else:
-                        print("unknown command; type help")
+                    print("unknown command; open a chat to send messages, or type help")
             except (ValueError, OSError, ConnectionError) as exc:
                 print(f"error: {exc}")
     finally:

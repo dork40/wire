@@ -46,9 +46,9 @@ directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
-Wire v1.4.53 requires directory server v1.4.22 or newer. The directory now uses
-TLS and a persistent signing identity; upgrade the server before upgrading
-clients. Keep the server state volume because it contains the pinned server key.
+Wire v1.4.54 requires directory server v1.4.22 or newer for authenticated TLS;
+server v1.4.23 is recommended for corrected identity-backup validation and logs.
+Keep the server state volume because it contains the pinned server key.
 
 ## Commands
 
@@ -71,6 +71,9 @@ their own TURN relay with `WIRE_TURN_URL`, `WIRE_TURN_USERNAME`, and
 
 Screen-share SDP and ICE signaling travels inside the room's end-to-end
 encrypted control channel. The directory only relays ciphertext.
+Windows probes and uses working H.264 NVENC, AMF, or QSV encoders when available,
+then falls back to software x264. DXGI capture automatically falls back to MSS
+if desktop duplication stops producing frames.
 
 The directory address is saved after `server <host> [port]` is used once. In a normal release, the official directory address would be built in, so chat users never need to enter an IP address.
 

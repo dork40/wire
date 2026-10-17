@@ -44,6 +44,27 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(peer.accept_nonce(packet))
         self.assertFalse(peer.accept_nonce(packet))
 
+    def test_corrupt_encrypted_media_does_not_disconnect_or_raise(self):
+        app = wire.Wire()
+        peer = wire.Peer("peer", None, os.urandom(32), os.urandom(32))
+        for packet_type in ("msg", "image", "voice", "audio", "file_relay", "control"):
+            packet = {"type": packet_type, "nonce": wire.b64(os.urandom(12)),
+                      "data": wire.b64(os.urandom(32))}
+            app.handle_message(peer, packet)
+
+    def test_typing_updates_keep_only_one_expiry_timer_per_peer(self):
+        app = wire.Wire()
+        key = os.urandom(32)
+        peer = wire.Peer("peer", None, key, os.urandom(32))
+        for _ in range(20):
+            nonce = os.urandom(12)
+            control = json.dumps({"kind": "typing"}, separators=(",", ":")).encode()
+            packet = {"type": "control", "nonce": wire.b64(nonce),
+                      "data": wire.b64(AESGCM(key).encrypt(nonce, control, b"wire-v1-control"))}
+            app.handle_message(peer, packet)
+        self.assertEqual(list(app.typing_timers), ["peer"])
+        app.close()
+
     def test_shutdown_drains_network_workers_before_stdout_finalizes(self):
         app = wire.Wire()
         server_side, server_peer = socket.socketpair()
@@ -335,7 +356,12 @@ class TransportTests(unittest.TestCase):
         app.server = socket_stub
         packets = iter([{"type": "share_answer", "id": "target", "answer": {"sdp": "answer"}}])
         old_receive, old_say = wire.recv_frame, wire.say
-        wire.recv_frame, wire.say = lambda _: next(packets), lambda _: None
+        def receive_once(_socket):
+            packet = next(packets, None)
+            if packet is None:
+                raise ConnectionError("test stream complete")
+            return packet
+        wire.recv_frame, wire.say = receive_once, lambda _: None
         try:
             app.server_loop(socket_stub)
         finally:
@@ -369,6 +395,57 @@ class TransportTests(unittest.TestCase):
         source = Path(wire.__file__).read_text(encoding="utf-8")
         self.assertNotIn("irm {INSTALL_SCRIPT_URL} | iex", source)
         self.assertIn("wire/archive/{commit}.zip", source)
+        root = Path(__file__).parents[1]
+        cmd_installer = (root / "install-wire.cmd").read_text(encoding="utf-8").lower()
+        linux_installer = (root / "install-wire.sh").read_text(encoding="utf-8")
+        self.assertNotIn("invoke-expression", cmd_installer)
+        self.assertNotIn("executionpolicy bypass", cmd_installer)
+        self.assertNotIn("pacman -Sy ", linux_installer)
+
+    def test_current_identity_backup_format_is_accepted_by_server(self):
+        server = load_server_module()
+        backup = {"salt": wire.b64(os.urandom(16)), "kdf": wire.CURRENT_KDF,
+                  "ciphertext": "encrypted", "recovery_verifier": "a" * 64}
+        self.assertTrue(server.valid_identity_backup(backup))
+        self.assertFalse(server.valid_identity_backup({**backup, "recovery_verifier": "not-hex"}))
+
+    def test_identity_backup_rolls_out_without_breaking_v1422(self):
+        app = wire.Wire()
+        app.name, app.account_secret = "alice", os.urandom(32)
+        account = {"name": "alice", "salt": wire.b64(os.urandom(16)), "kdf": wire.CURRENT_KDF}
+        sent, original_load = [], wire.load_users
+        wire.load_users = lambda: {"alice": account}
+        app.server_send = sent.append
+        try:
+            app.backup_identity()
+        finally:
+            wire.load_users = original_load
+        backup = sent[0]["backup"]
+        self.assertRegex(backup["recovery_verifier"], r"^[0-9a-f]{64}$")
+        self.assertRegex(backup["recovery_proof"], r"^[0-9a-f]{64}$")
+
+    def test_message_length_is_rejected_before_sending(self):
+        app = wire.Wire()
+        peer = wire.Peer("peer", None, os.urandom(32), os.urandom(32), lambda _: None)
+        with self.assertRaises(ValueError):
+            app.send_message(peer, "x" * (wire.MAX_MESSAGE_CHARS + 1))
+
+    def test_shutdown_removes_partial_and_temporary_transfers(self):
+        app = wire.Wire()
+        with tempfile.TemporaryDirectory() as temporary:
+            partial = Path(temporary) / ".partial"
+            archive = Path(temporary) / "folder.zip"
+            partial.write_bytes(b"partial")
+            archive.write_bytes(b"temporary archive")
+            app.incoming_files["a" * 32] = {"temp": partial}
+            app.outgoing_files["b" * 32] = {"path": archive, "cleanup": True}
+            app.close()
+            self.assertFalse(partial.exists())
+            self.assertFalse(archive.exists())
+
+    def test_closed_chat_does_not_fall_back_to_the_only_connected_peer(self):
+        source = Path(wire.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("if len(app.peers) == 1:", source)
 
 
 if __name__ == "__main__":

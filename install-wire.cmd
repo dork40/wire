@@ -1,6 +1,15 @@
 @echo off
 setlocal
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-RestMethod 'https://raw.githubusercontent.com/dork40/wire/main/install-wire.ps1' | Invoke-Expression"
+where py >nul 2>nul
+if errorlevel 1 (
+  echo Install Python 3.11 or newer from python.org, then run this command again.
+  exit /b 1
+)
+py -m pip install --user --upgrade pipx
+if errorlevel 1 exit /b 1
+py -m pipx ensurepath
+if errorlevel 1 exit /b 1
+py -m pipx install --force https://github.com/dork40/wire/archive/refs/heads/main.zip
 if errorlevel 1 (
   echo Wire installation failed.
   exit /b 1

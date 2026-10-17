@@ -10,7 +10,7 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v pipx >/dev/null 2>&1; th
   elif command -v dnf >/dev/null 2>&1; then
     sudo dnf install -y python3 python3-pipx portaudio
   elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -Sy --needed python python-pipx portaudio
+    sudo pacman -S --needed python python-pipx portaudio
   else
     printf '%s\n' 'Install Python 3.11+, pipx, and PortAudio with your distribution package manager, then run this command again.' >&2
     exit 1
