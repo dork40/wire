@@ -63,7 +63,7 @@ SERVER_SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
 
 def turn_credentials(name: str) -> dict | None:
     """Create Coturn REST credentials that expire instead of exposing its secret."""
-    if (not TURN_SECRET or not TURN_URLS or len(TURN_URLS) > 4
+    if (len(TURN_SECRET) < 32 or not TURN_URLS or len(TURN_URLS) > 4
             or any(not url.startswith(("turn:", "turns:")) or len(url) > 300 for url in TURN_URLS)):
         return None
     username = f"{int(time.time()) + 3600}:{name.lower()}"
@@ -440,6 +440,10 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             users[key] = {"name": name, "public": public, "sign_public": sign_public,
                           "allow_group_invites": bool(previous.get("allow_group_invites", True)),
                           "dnd": bool(previous.get("dnd", False)),
+                          # Accounts already present during this upgrade keep
+                          # relay access. A brand-new identity earns it only
+                          # after an existing person accepts a friend request.
+                          "turn_allowed": bool(previous.get("turn_allowed", bool(previous))),
                           "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
                           "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
             save_users(users)
@@ -449,7 +453,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             if queued_packets: save_queues(queues)
         ready = {"type": "ready", "name": name, "version": SERVER_VERSION,
                  "relay_rate": RELAY_RATE_BYTES_PER_SECOND}
-        turn = turn_credentials(name)
+        turn = turn_credentials(name) if users[key].get("turn_allowed", False) else None
         if turn:
             ready["turn"] = turn
         send(sock, ready)
@@ -537,6 +541,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         for left, right in ((key, target), (target, key)):
                             friends = users[left].setdefault("friends", [])
                             if right not in friends: friends.append(right)
+                            users[left]["turn_allowed"] = True
                     save_users(users)
                 if accepted:
                     deliver_or_queue(target, {"type": "friend_added", "name": name})
