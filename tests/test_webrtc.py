@@ -33,6 +33,8 @@ class ScreenTrackTests(unittest.TestCase):
         self.assertTrue(capture.paused.is_set())
         capture.set_paused(False)
         self.assertFalse(capture.paused.is_set())
+        capture.set_quality(1280, 720, 60)
+        self.assertEqual((capture.width, capture.height, capture.fps), (1280, 720, 60))
 
     def test_authenticated_directory_turn_configuration_is_validated(self):
         self.assertFalse(configure_turn({"urls": ["https://evil.invalid"], "username": "u", "credential": "p"}))

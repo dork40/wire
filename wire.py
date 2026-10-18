@@ -49,7 +49,7 @@ Image.MAX_IMAGE_PIXELS = 50_000_000
 import numpy as np
 from pywebrtc_audio import AudioProcessor
 import mss
-from wire_webrtc import WebRTCShare, configure_turn, probe_h264_hardware
+from wire_webrtc import WebRTCShare, configure_turn, network_diagnostics, probe_h264_hardware
 
 try:
     from prompt_toolkit import PromptSession
@@ -1082,6 +1082,10 @@ class Wire:
                     f"capture {stats['capture_fps']:.1f} fps ({stats['capture_ms']:.1f} ms); "
                     f"encode {stats['send_fps']:.1f} fps ({stats['encode_ms']:.1f} ms); "
                     f"receive {stats['receive_fps']:.1f} fps; {bitrate:.2f} Mbps")
+            if stats.get("route"):
+                line += f"; route {stats['route']} ({stats.get('candidate_types', 'unknown')})"
+            if stats.get("adaptation") and stats["adaptation"] != "none":
+                line += f"; auto {stats['adaptation']}"
             if "packets_lost" in stats:
                 line += f"; lost {stats['packets_lost']}"
             if "rtt_ms" in stats:
@@ -1096,7 +1100,7 @@ class Wire:
             media.set_paused(paused)
         say("screen share paused" if paused else "screen share resumed")
 
-    def diagnose(self) -> None:
+    def diagnose(self, network: bool = False) -> None:
         """Report local capability checks without exposing account secrets."""
         caps = stream_capabilities()
         try:
@@ -1113,6 +1117,16 @@ class Wire:
         say(f"data: {DATA}; diagnostics: {DIAGNOSTIC_LOG}")
         if self.webrtc_shares:
             self.show_share_stats()
+        if network:
+            say("testing ICE/STUN/TURN; this can take several seconds...")
+            try:
+                result = network_diagnostics()
+                kinds = ", ".join(result["candidate_types"]) or "none"
+                say(f"network candidates: {kinds}; TURN: " +
+                    ("reachable" if result["turn_reachable"] else
+                     "configured but unreachable" if result["turn_configured"] else "not configured"))
+            except Exception as exc:
+                say(f"network test failed: {type(exc).__name__}: {exc}")
 
     def require_login(self) -> None:
         if not self.private or not self.public or not self.sign_private or not self.sign_public or not self.name:
@@ -2021,7 +2035,7 @@ class Wire:
         share_id = uuid.uuid4().hex
         resolution = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         fps = STREAM_FPS[self.settings["stream_fps"]]
-        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000, self.settings["stream_hardware"])
+        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000, self.settings["stream_hardware"], self.settings["stream_profile"] == "auto")
         self.webrtc_shares[share_id] = media
         self.share_peers[share_id] = peer.name
         try:
@@ -3141,6 +3155,7 @@ SETTINGS AND UTILITIES
   /settings delete                   Delete this PC's local account data.
   /identity / /fingerprint <name>    Show safety fingerprints.
   /ping / /testnotify / /diagnose   Connection, notification, and capability checks.
+  /diagnose network                 Test real ICE, STUN, and TURN candidates.
   /update                            Close Wire and install the newest version.
   /checkupdate                       Check whether a newer version exists.
   /exit                              Close the active chat but keep Wire open.
@@ -3389,7 +3404,9 @@ def main() -> None:
                     app.pending_pings[ping_id] = time.monotonic()
                     app.server_send({"type": "ping", "id": ping_id})
                 elif command == "diagnose":
-                    app.diagnose()
+                    if argument not in ("", "network"):
+                        raise ValueError("use: /diagnose or /diagnose network")
+                    app.diagnose(network=argument == "network")
                 elif command == "update":
                     print("Wire will close, then install the newest version in a separate window.")
                     start_update_after_exit()

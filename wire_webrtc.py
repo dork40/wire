@@ -148,6 +148,23 @@ def ice_configuration():
     return RTCConfiguration(iceServers=servers)
 
 
+def network_diagnostics(timeout=20):
+    """Gather real ICE candidates and prove whether the configured TURN responds."""
+    async def probe():
+        pc = RTCPeerConnection(ice_configuration())
+        try:
+            pc.createDataChannel("wire-diagnostic")
+            await pc.setLocalDescription(await pc.createOffer())
+            gatherer = pc.sctp.transport.transport.iceGatherer
+            candidates = gatherer.getLocalCandidates()
+            kinds = sorted({candidate.type for candidate in candidates})
+            return {"candidate_types": kinds, "turn_configured": bool(_DIRECTORY_TURN or os.environ.get("WIRE_TURN_URL")),
+                    "turn_reachable": "relay" in kinds}
+        finally:
+            await pc.close()
+    return asyncio.run(asyncio.wait_for(probe(), timeout=timeout))
+
+
 def draw_windows_cursor(frame: np.ndarray, monitor: dict) -> None:
     """Paint a small high-contrast arrow into the BGRA frame without image conversion."""
     if os.name != "nt": return
@@ -180,6 +197,8 @@ class LatestFrameCapture:
     def _publish(self, raw, monitor):
         began = time.monotonic()
         draw_windows_cursor(raw, monitor)
+        with self.lock:
+            width, height = self.width, self.height
         # Resize and convert on the capture worker.  Doing this in
         # ScreenTrack.recv serialized CPU preprocessing with WebRTC/NVENC and
         # capped a 1080p60 share well below its requested frame rate.  The
@@ -187,7 +206,7 @@ class LatestFrameCapture:
         # longer needs another full-resolution numpy copy either.
         frame = VideoFrame.from_ndarray(raw, format="bgra")
         frame = self.reformatter.reformat(
-            frame, width=self.width, height=self.height, format="yuv420p",
+            frame, width=width, height=height, format="yuv420p",
             interpolation=Interpolation.FAST_BILINEAR,
         )
         with self.lock:
@@ -267,6 +286,9 @@ class LatestFrameCapture:
         with self.lock: return self.frame
     def set_paused(self, paused):
         self.paused.set() if paused else self.paused.clear()
+    def set_quality(self, width, height, fps):
+        with self.lock:
+            self.width, self.height, self.fps = width, height, fps
     def close(self):
         self.stop.set()
         if self.thread.is_alive() and threading.current_thread() is not self.thread:
@@ -346,12 +368,14 @@ class ScreenTrack(VideoStreamTrack):
 
 
 class WebRTCShare:
-    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000, hardware=True):
+    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000, hardware=True, adaptive=False):
         self.signal, self.on_frame, self.on_state = signal, on_frame, on_state
         self.width, self.height, self.fps = width, height, fps
         self.monitor_index = monitor_index
         self.codec_requested = str(codec).upper()
         self.hardware_requested = bool(hardware)
+        self.adaptive = bool(adaptive)
+        self.adaptation = "none"
         self.codec_used = "auto"
         # aiortc's bundled video encoders cap their validated operating range
         # at 0.5-20 Mbps. WebRTC congestion control can lower this as needed.
@@ -428,6 +452,43 @@ class WebRTCShare:
     async def remote(self, answer):
         await self.pc.setRemoteDescription(RTCSessionDescription(answer["sdp"], answer["type"]))
         asyncio.create_task(self._apply_encoder_bitrate())
+        if self.adaptive:
+            asyncio.create_task(self._adapt_quality())
+
+    async def _adapt_quality(self):
+        """Lower an unsustainable automatic profile without reacting to a static desktop."""
+        previous_capture = previous_sent = 0
+        slow_intervals = 0
+        while not self.closed.is_set() and self.capture:
+            await asyncio.sleep(5)
+            with self.stats.lock:
+                captured, sent = self.stats.capture_frames, self.stats.sent_frames
+                capture_ms = self.stats.capture_ms / max(1, captured)
+            capture_rate = (captured - previous_capture) / 5
+            send_rate = (sent - previous_sent) / 5
+            previous_capture, previous_sent = captured, sent
+            target = self.capture.fps
+            # Low frame counts with cheap capture generally mean the desktop
+            # is static, not that the machine is overloaded.
+            overloaded = capture_ms > (1000 / target) * 0.75
+            encoder_slow = capture_rate >= target * 0.75 and send_rate < target * 0.70
+            slow_intervals = slow_intervals + 1 if overloaded or encoder_slow else 0
+            if slow_intervals < 2:
+                continue
+            width, height, fps = self.capture.width, self.capture.height, self.capture.fps
+            if fps > 30:
+                fps = 30
+            elif width > 1920:
+                width, height = (1920, 1080)
+            elif width > 1280:
+                width, height = (1280, 720)
+            else:
+                return
+            self.capture.set_quality(width, height, fps)
+            self.width, self.height, self.fps = width, height, fps
+            self.adaptation = f"{width}x{height}@{fps}"
+            self.on_state(f"automatic quality adjusted to {self.adaptation}")
+            slow_intervals = 0
 
     async def _apply_encoder_bitrate(self):
         """Apply the chosen starting rate once aiortc creates its encoder."""
@@ -452,12 +513,23 @@ class WebRTCShare:
         if not self.pc:
             return result
         report = await self.pc.getStats()
+        result["adaptation"] = self.adaptation
         for entry in report.values():
             if entry.type in ("inbound-rtp", "outbound-rtp") and getattr(entry, "kind", None) == "video":
                 result["bitrate_bytes"] = getattr(entry, "bytesSent", getattr(entry, "bytesReceived", 0))
                 result["packets_lost"] = getattr(entry, "packetsLost", 0)
             if entry.type == "remote-inbound-rtp" and getattr(entry, "kind", None) == "video":
                 result["rtt_ms"] = round(getattr(entry, "roundTripTime", 0) * 1000)
+        try:
+            transports = [item.sender.transport.transport for item in self.pc.getTransceivers() if item.sender.transport]
+            pairs = [pair for transport in transports for pair in getattr(transport._connection, "_nominated", {}).values()]
+            if pairs:
+                local_type = pairs[0].local_candidate.type
+                remote_type = pairs[0].remote_candidate.type
+                result["route"] = "TURN RELAY" if "relay" in (local_type, remote_type) else "DIRECT"
+                result["candidate_types"] = f"{local_type}/{remote_type}"
+        except (AttributeError, TypeError):
+            pass
         return result
 
     def snapshot(self):
