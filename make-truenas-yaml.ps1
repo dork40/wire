@@ -43,7 +43,7 @@ services:
       - /mnt/nvme/wire:/data:ro
       - /mnt/nvme/wire-backups:/backups:ro
   wire-turn:
-    image: coturn/coturn:4.18.0-r0
+    image: coturn/coturn:4.17.2-r0
     restart: unless-stopped
     network_mode: host
     command:

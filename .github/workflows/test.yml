@@ -27,7 +27,7 @@ jobs:
           TURN_TEST_IP=$(hostname -I | awk '{print $1}')
           trap 'docker inspect -f "status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}}" wire-turn-test 2>/dev/null || true; docker logs wire-turn-test 2>/dev/null || true; docker rm -f wire-turn-test 2>/dev/null || true' EXIT
           docker run -d --name wire-turn-test --network host \
-            coturn/coturn:4.18.0-r0 \
+            coturn/coturn:4.17.2-r0 \
             --fingerprint --use-auth-secret \
             --static-auth-secret=wire-ci-turn-secret-at-least-32-bytes \
             --realm=wire.test --min-port=49160 --max-port=49200 \

@@ -30,7 +30,7 @@ services:
       - ./wire-server-data:/data:ro
       - ./wire-server-backups:/backups:ro
   wire-turn:
-    image: coturn/coturn:4.18.0-r0
+    image: coturn/coturn:4.17.2-r0
     restart: unless-stopped
     network_mode: host
     command:
