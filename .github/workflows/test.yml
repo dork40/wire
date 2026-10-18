@@ -25,6 +25,7 @@ jobs:
         name: Validate TrueNAS Community App package
         shell: bash
         run: |
+          python -m pip install pyyaml
           validation_root=$(mktemp -d)
           git clone --depth 1 --filter=blob:none --sparse https://github.com/truenas/apps.git "$validation_root"
           git -C "$validation_root" sparse-checkout set .github library
