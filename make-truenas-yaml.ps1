@@ -1,8 +1,5 @@
 $ErrorActionPreference = 'Stop'
 
-$projectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$serverSource = [IO.File]::ReadAllBytes((Join-Path $projectRoot 'wire-server.py'))
-$serverBase64 = [Convert]::ToBase64String($serverSource)
 $turnSecretBytes = New-Object byte[] 32
 $turnRng = [Security.Cryptography.RandomNumberGenerator]::Create()
 $turnRng.GetBytes($turnSecretBytes)
@@ -17,16 +14,8 @@ try {
 @"
 services:
   wire-server:
-    # Bump this whenever the embedded server protocol changes so TrueNAS
-    # rebuilds the custom image instead of reusing the prior local tag.
-    image: wire-server:1.4.27
-    build:
-      context: .
-      dockerfile_inline: |
-        FROM python:3.11-slim
-        RUN pip install --no-cache-dir cryptography==50.0.2
-        RUN mkdir -p /app && echo '$serverBase64' | base64 -d > /app/wire-server.py
-        CMD ["python", "/app/wire-server.py"]
+    image: ghcr.io/dork40/wire-server:1.4.27
+    pull_policy: always
     restart: unless-stopped
     environment:
       WIRE_STATE: /data

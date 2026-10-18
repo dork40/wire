@@ -2,11 +2,12 @@
 
 Target dataset: `nvme/wire`.
 
-This folder contains the source needed to run the encrypted-packet Wire directory on TrueNAS:
+The TrueNAS YAML uses the versioned public Wire server image from GitHub Container
+Registry and the official Coturn image. It does not embed the server source code.
 
-- `wire-server.py` - the server
-- `Dockerfile` - container build instructions
-- `compose.yaml` - container settings and persistent server data
+- `wire-server.py` and `Dockerfile` build the published server image.
+- `compose.yaml` provides the same two-service layout for ordinary Docker Compose.
+- `make-truenas-yaml.ps1` creates a fresh shared TURN secret each time.
 
 On Windows, run this to copy a ready-to-paste Custom App YAML file to the clipboard:
 

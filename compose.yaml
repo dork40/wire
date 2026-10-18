@@ -1,6 +1,7 @@
 services:
   wire-server:
-    build: .
+    image: ghcr.io/dork40/wire-server:1.4.27
+    pull_policy: always
     container_name: wire-server
     restart: unless-stopped
     environment:
