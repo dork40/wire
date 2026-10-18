@@ -84,6 +84,9 @@ if desktop duplication stops producing frames.
 capture uses Windows.Graphics.Capture, including the native cursor. The System
 audio setting captures the selected default Windows output through WASAPI
 loopback and sends 48 kHz stereo audio in the same DTLS-SRTP WebRTC session.
+On Windows, the separate viewer process presents frames through an accelerated
+Direct3D 11 streaming texture with vsync; press F11 or Alt+Enter to toggle
+fullscreen. Unsupported graphics/RDP environments retain the Tk fallback.
 
 The directory address is saved after `server <host> [port]` is used once. In a normal release, the official directory address would be built in, so chat users never need to enter an IP address.
 

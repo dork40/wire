@@ -590,7 +590,62 @@ def read_menu_key() -> str:
 
 
 def screen_viewer_process(frames: object, title: str, stop: object) -> None:
-    """Tk owns its interpreter in this process; never create it on a worker thread."""
+    """Render in an isolated process so the terminal remains responsive."""
+    if os.name == "nt":
+        try:
+            os.environ["PYGAME_HIDE_SUPPORT_PROMPT"] = "1"
+            import pygame
+            from pygame._sdl2.video import Renderer, Texture, Window, get_drivers
+            pygame.init()
+            window = Window(title, size=(960, 540), resizable=True, allow_high_dpi=True)
+            drivers = list(get_drivers())
+            direct3d11 = next((index for index, driver in enumerate(drivers) if driver.name == "direct3d11"), -1)
+            try:
+                renderer = Renderer(window, index=direct3d11, accelerated=1, vsync=True)
+            except pygame.error:
+                renderer = Renderer(window, accelerated=-1, vsync=True)
+            renderer.draw_color = (0, 0, 0, 255)
+            texture = None
+            fullscreen = False
+            while not stop.is_set():
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        stop.set()
+                    elif event.type == pygame.KEYDOWN and (event.key == pygame.K_F11 or
+                            event.key == pygame.K_RETURN and event.mod & pygame.KMOD_ALT):
+                        fullscreen = not fullscreen
+                        window.set_fullscreen(desktop=True) if fullscreen else window.set_windowed()
+                newest = None
+                try:
+                    while True:
+                        newest = frames.get_nowait()
+                except queue.Empty:
+                    pass
+                if newest is not None:
+                    height, width = newest.shape[:2]
+                    surface = pygame.image.frombuffer(newest, (width, height), "RGB")
+                    if texture is None or texture.width != width or texture.height != height:
+                        texture = Texture(renderer, (width, height), streaming=True, scale_quality=1)
+                    texture.update(surface)
+                    window_width, window_height = window.size
+                    scale = min(window_width / width, window_height / height)
+                    shown_width, shown_height = round(width * scale), round(height * scale)
+                    destination = pygame.Rect((window_width - shown_width) // 2,
+                                              (window_height - shown_height) // 2,
+                                              shown_width, shown_height)
+                    renderer.clear()
+                    texture.draw(dstrect=destination)
+                    renderer.present()
+                else:
+                    pygame.time.wait(5)
+            window.destroy()
+            pygame.quit()
+            return
+        except (ImportError, OSError, RuntimeError):
+            # Older Windows/RDP environments may not expose a hardware SDL
+            # renderer. The Tk path keeps those systems functional.
+            pass
+    # Tk owns its interpreter in this process; never create it on a worker thread.
     if tk is None or ImageTk is None:
         return
     root = tk.Tk(); root.title(title)

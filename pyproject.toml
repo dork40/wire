@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wire-messenger"
-version = "1.4.61"
+version = "1.4.62"
 description = "Encrypted terminal messenger with WebRTC screen sharing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ dependencies = [
   "mss==10.1.0",
   "dxcam==0.3.0; platform_system == 'Windows'",
   "windows-capture==2.0.1; platform_system == 'Windows'",
+  "pygame-ce==2.5.8; platform_system == 'Windows'",
   "aiortc==1.15.0",
   "psutil==7.2.2",
 ]
