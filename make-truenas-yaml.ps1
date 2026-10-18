@@ -29,6 +29,19 @@ services:
     volumes:
       - /mnt/nvme/wire:/data
       - /mnt/nvme/wire-backups:/backups
+  wire-web:
+    image: ghcr.io/dork40/wire-server:1.4.27
+    pull_policy: always
+    restart: unless-stopped
+    command: ["python", "/app/wire-web.py"]
+    environment:
+      WIRE_STATE: /data
+      WIRE_BACKUP_DIR: /backups
+    ports:
+      - "8097:8097/tcp"
+    volumes:
+      - /mnt/nvme/wire:/data:ro
+      - /mnt/nvme/wire-backups:/backups:ro
   wire-turn:
     image: coturn/coturn:4.18.0-r0
     restart: unless-stopped

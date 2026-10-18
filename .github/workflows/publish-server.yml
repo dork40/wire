@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - wire-server.py
+      - wire-web.py
       - Dockerfile
       - .github/workflows/publish-server.yml
   workflow_dispatch:

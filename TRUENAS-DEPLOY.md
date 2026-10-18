@@ -17,6 +17,9 @@ powershell -ExecutionPolicy Bypass -File .\make-truenas-yaml.ps1 | Set-Clipboard
 
 In TrueNAS, go to **Apps → Discover → more menu → Install via YAML**, name the app `wire`, paste the clipboard contents, and save. The deployment keeps its server data in `/mnt/nvme/wire`.
 
+After it starts, open Wire at `http://192.168.1.199:8097`. TrueNAS remains
+available independently at `https://192.168.1.199`.
+
 The server writes a checksummed backup every six hours to
 `/mnt/nvme/wire-backups` and retains the newest 28 archives. Backups include the
 directory signing/TLS identities and all persistent service data. Protect that
