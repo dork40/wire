@@ -80,6 +80,11 @@ Windows probes and uses working H.264 NVENC, AMF, or QSV encoders when available
 then falls back to software x264. DXGI capture automatically falls back to MSS
 if desktop duplication stops producing frames.
 
+`/setting` can share either a monitor or one visible application window. Window
+capture uses Windows.Graphics.Capture, including the native cursor. The System
+audio setting captures the selected default Windows output through WASAPI
+loopback and sends 48 kHz stereo audio in the same DTLS-SRTP WebRTC session.
+
 The directory address is saved after `server <host> [port]` is used once. In a normal release, the official directory address would be built in, so chat users never need to enter an IP address.
 
 ## Security and current scope

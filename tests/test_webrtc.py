@@ -1,9 +1,12 @@
 import asyncio
 import unittest
+from unittest import mock
 
 from av import VideoFrame
 
-from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats, configure_turn, ice_configuration
+import numpy as np
+
+from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats, SystemAudioTrack, configure_turn, ice_configuration
 
 
 class _Capture:
@@ -42,6 +45,40 @@ class ScreenTrackTests(unittest.TestCase):
         servers = ice_configuration().iceServers
         self.assertTrue(any(server.username == "123:user" for server in servers))
         configure_turn(None)
+
+    def test_system_audio_track_emits_stereo_48khz_frames(self):
+        class Capture:
+            def get(self):
+                return np.zeros((960, 2), dtype=np.float32)
+        frame = asyncio.run(SystemAudioTrack(Capture()).recv())
+        self.assertEqual(frame.sample_rate, 48_000)
+        self.assertEqual(frame.layout.name, "stereo")
+        self.assertEqual(frame.samples, 960)
+        self.assertEqual(frame.time_base.numerator, 1)
+        self.assertEqual(frame.time_base.denominator, 48_000)
+
+    def test_application_window_uses_windows_graphics_capture_backend(self):
+        class NativeFrame:
+            frame_buffer = np.zeros((16, 16, 4), dtype=np.uint8)
+        class FakeCapture:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.handlers = {}
+            def event(self, callback):
+                self.handlers[callback.__name__] = callback
+                return callback
+            def start_free_threaded(self):
+                class Control:
+                    def stop(self): pass
+                    def wait(self): pass
+                self.handlers["on_frame_arrived"](NativeFrame(), Control())
+                capture.stop.set()
+                return Control()
+        capture = LatestFrameCapture(16, 16, 30, ShareStats(), window_name="Calculator")
+        with mock.patch("wire_webrtc.WindowsCapture", FakeCapture):
+            capture._run_wgc()
+        self.assertEqual(capture.backend, "windows-graphics-capture")
+        self.assertEqual(capture.latest()[0].width, 16)
 
 
 if __name__ == "__main__":

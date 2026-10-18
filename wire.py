@@ -307,9 +307,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_latency": saved.get("stream_latency", "low")}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low")}
     except Exception:
-        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_latency": "low"}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low"}
 
 
 def save_settings(settings: dict) -> None:
@@ -1310,8 +1310,10 @@ class Wire:
         say("voice quality: high (48 kHz)")
         width, height = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         caps = stream_capabilities()
-        say(f"screen share: monitor {self.settings['stream_monitor']}; {self.settings['stream_profile']}; {width}x{height} at {STREAM_FPS[self.settings['stream_fps']]} FPS, {STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps target")
-        say(f"screen codec: {self.settings['stream_codec']}; hardware acceleration: {'on' if self.settings['stream_hardware'] else 'off'}; latency: {self.settings['stream_latency']}")
+        source = (f"window {self.settings['stream_window']}" if self.settings.get("stream_source") == "window"
+                  else f"monitor {self.settings['stream_monitor']}")
+        say(f"screen share: {source}; {self.settings['stream_profile']}; {width}x{height} at {STREAM_FPS[self.settings['stream_fps']]} FPS, {STREAM_BITRATES[self.settings['stream_bitrate']]} Mbps target")
+        say(f"screen codec: {self.settings['stream_codec']}; hardware acceleration: {'on' if self.settings['stream_hardware'] else 'off'}; system audio: {'on' if self.settings['stream_system_audio'] else 'off'}; latency: {self.settings['stream_latency']}")
         say(f"WebRTC: {'available' if caps['webrtc'] else 'not installed'}; available codecs: {', '.join(caps['codecs']) or 'none'}")
         say("images: ask before download")
 
@@ -1403,11 +1405,36 @@ class Wire:
         except Exception:
             return 1
 
+    def share_window_handles(self) -> dict[str, int]:
+        """Return visible top-level Windows titles and their current HWNDs."""
+        if os.name != "nt":
+            return {}
+        windows = {}
+        callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def collect(hwnd, _param):
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if not 0 < length <= 1024:
+                return True
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
+            title = safe_terminal_text(buffer.value).strip()
+            if title and title not in windows and not title.startswith("Wire screen share -"):
+                windows[title] = int(hwnd)
+            return True
+        ctypes.windll.user32.EnumWindows(callback_type(collect), 0)
+        return windows
+
+    def share_windows(self) -> list[str]:
+        return list(self.share_window_handles())
+
     def settings_menu(self) -> None:
         """Small keyboard-only menu for Windows, Linux, and macOS terminals."""
         selected = 0
         while True:
             inputs, outputs = self.voice_devices("input"), self.voice_devices("output")
+            windows = self.share_windows()
             input_id, output_id = self.settings.get("voice_input"), self.settings.get("voice_output")
             input_name = next((name for index, name in inputs if index == input_id), "Windows default")
             output_name = next((name for index, name in outputs if index == output_id), "Windows default")
@@ -1421,6 +1448,8 @@ class Wire:
                 ("Auto volume", "On" if self.settings["voice_gain"] else "Off"),
                 ("Microphone (next call)", input_name),
                 ("Speakers (next call)", output_name),
+                ("Share source", "Application window" if self.settings["stream_source"] == "window" else "Monitor"),
+                ("Share window", self.settings["stream_window"] or "Choose with arrows"),
                 ("Share monitor", str(min(self.settings["stream_monitor"], self.monitor_count()))),
                 ("Share resolution", f"{STREAM_RESOLUTIONS[self.settings['stream_resolution']][0]}x{STREAM_RESOLUTIONS[self.settings['stream_resolution']][1]}"),
                 ("Share FPS target", str(STREAM_FPS[self.settings["stream_fps"]]) + " (max 60)"),
@@ -1428,6 +1457,7 @@ class Wire:
                 ("Share profile", self.settings["stream_profile"]),
                 ("Share codec", self.settings["stream_codec"]),
                 ("Hardware acceleration", "On" if self.settings["stream_hardware"] else "Off"),
+                ("System audio", "On" if self.settings["stream_system_audio"] else "Off"),
                 ("Latency mode", self.settings["stream_latency"]),
                 ("Back", ""),
             ]
@@ -1441,6 +1471,8 @@ class Wire:
                 "Keeps voice volume steady.",
                 "Selects the microphone for your next call.",
                 "Selects the speakers for your next call.",
+                "Choose a whole monitor or one application window.",
+                "Selects the application captured through Windows.Graphics.Capture.",
                 "Selects which display /share captures.",
                 "Higher resolutions need more encoder and network capacity.",
                 "60 is the highest supported target; use /share stats to see actual capture and send FPS.",
@@ -1448,6 +1480,7 @@ class Wire:
                 "Profiles choose sensible resolution, FPS, and bitrate starting points.",
                 "Auto selects a compatible WebRTC codec when possible.",
                 "Uses supported GPU acceleration where the active WebRTC stack provides it.",
+                "Shares the default Windows speaker mix over encrypted WebRTC audio.",
                 "Low minimizes buffering; balanced is more tolerant of network variation.",
                 "Return to chat.",
             ]
@@ -1487,29 +1520,39 @@ class Wire:
                             position = next((i for i, (device_id, _) in enumerate(choices) if device_id == current), -1)
                             self.settings[setting] = choices[(position + direction) % len(choices)][0]
                     elif selected == 9:
-                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
+                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
                     elif selected == 10:
-                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
+                        if windows:
+                            current = self.settings.get("stream_window", "")
+                            position = windows.index(current) if current in windows else -1
+                            self.settings["stream_window"] = windows[(position + direction) % len(windows)]
+                            self.settings["stream_source"] = "window"
                     elif selected == 11:
-                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 12:
-                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 13:
+                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                    elif selected == 14:
+                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                    elif selected == 15:
                         options = list(STREAM_PROFILES)
                         self.settings["stream_profile"] = options[(options.index(self.settings["stream_profile"]) + direction) % len(options)]
                         apply_stream_profile(self.settings)
-                    elif selected == 14:
+                    elif selected == 16:
                         options = ["auto", "H264", "VP8", "VP9", "AV1", "HEVC"]
                         self.settings["stream_codec"] = options[(options.index(self.settings["stream_codec"]) + direction) % len(options)]
-                    elif selected == 15:
+                    elif selected == 17:
                         self.settings["stream_hardware"] = not self.settings["stream_hardware"]
-                    elif selected == 16:
+                    elif selected == 18:
+                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                    elif selected == 19:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
                     self.sync_settings()
                     self.apply_voice_settings()
                     self.sync_preferences()
-            elif key in ("enter", "escape") and selected == 17:
+            elif key in ("enter", "escape") and selected == 20:
                 print()
                 return
             elif key == "escape":
@@ -2134,7 +2177,13 @@ class Wire:
         share_id = uuid.uuid4().hex
         resolution = STREAM_RESOLUTIONS[self.settings["stream_resolution"]]
         fps = STREAM_FPS[self.settings["stream_fps"]]
-        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000, self.settings["stream_hardware"], self.settings["stream_profile"] == "auto")
+        window_name = self.settings.get("stream_window") if self.settings.get("stream_source") == "window" else None
+        window_hwnd = self.share_window_handles().get(window_name) if window_name else None
+        if window_name and window_hwnd is None:
+            raise ValueError("the selected share window is no longer open; choose another in /setting")
+        if self.settings.get("stream_source") == "window" and not window_name:
+            raise ValueError("choose an application window in /setting before sharing")
+        media = WebRTCShare(lambda _: None, lambda _: None, lambda state: say(f"screen share: {state}"), *resolution, fps, self.settings["stream_monitor"], self.settings["stream_codec"], STREAM_BITRATES[self.settings["stream_bitrate"]] * 1_000_000, self.settings["stream_hardware"], self.settings["stream_profile"] == "auto", self.settings["stream_system_audio"], window_name, window_hwnd)
         self.webrtc_shares[share_id] = media
         self.share_peers[share_id] = peer.name
         try:

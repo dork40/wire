@@ -1,18 +1,20 @@
 """Cross-platform WebRTC screen-share core.
 
-Windows prefers DXGI capture and falls back to MSS. Capture/encode/transport are isolated here so a
-Windows.Graphics.Capture/D3D11 backend or Linux PipeWire backend can replace only
-LatestFrameCapture later; the signaling/UI layers do not depend on Windows APIs.
+Windows uses Windows.Graphics.Capture for application windows, prefers DXGI for
+monitors, and falls back to MSS. Capture/encode/transport remain isolated so a
+future Linux PipeWire backend can replace only LatestFrameCapture.
 """
-import asyncio, ctypes, logging, os, threading, time
+import asyncio, ctypes, logging, os, queue, threading, time, warnings
 from fractions import Fraction
 import av
 import mss
 import numpy as np
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, MediaStreamError
+from aiortc import AudioStreamTrack, RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, MediaStreamError
 import aiortc.codecs.h264 as aiortc_h264
 from aiortc.rtcrtpsender import RTCRtpSender
 from av import VideoFrame
+from av import AudioFrame
+from av.audio.resampler import AudioResampler
 from av.video.reformatter import Interpolation, VideoReformatter
 
 try:
@@ -24,6 +26,16 @@ else:
     # can otherwise print the same warning hundreds of times into Wire.
     logging.getLogger("dxcam.dxcam").setLevel(logging.ERROR)
     logging.getLogger("dxcam.core.dxgi_duplicator").setLevel(logging.ERROR)
+
+try:
+    import soundcard as sc
+except ImportError:
+    sc = None
+
+try:
+    from windows_capture import WindowsCapture
+except (ImportError, OSError):
+    WindowsCapture = None
 
 
 _H264_PROBE_LOCK = threading.Lock()
@@ -184,19 +196,22 @@ def draw_windows_cursor(frame: np.ndarray, monitor: dict) -> None:
 
 class LatestFrameCapture:
     """One-slot capture queue: slow encoders always receive the newest frame."""
-    def __init__(self, width, height, fps, stats, monitor_index=1):
+    def __init__(self, width, height, fps, stats, monitor_index=1, window_name=None, window_hwnd=None):
         self.width, self.height, self.fps = width, height, fps
         self.stats = stats
         self.monitor_index = monitor_index
+        self.window_name = window_name
+        self.window_hwnd = window_hwnd
         self.frame = None; self.sequence = 0; self.lock = threading.Lock(); self.stop = threading.Event()
         self.paused = threading.Event()
         self.reformatter = VideoReformatter()
         self.backend = "mss"
         self.thread = threading.Thread(target=self._run, daemon=True)
     def start(self): self.thread.start()
-    def _publish(self, raw, monitor):
+    def _publish(self, raw, monitor, capture_cursor=True):
         began = time.monotonic()
-        draw_windows_cursor(raw, monitor)
+        if capture_cursor:
+            draw_windows_cursor(raw, monitor)
         with self.lock:
             width, height = self.width, self.height
         # Resize and convert on the capture worker.  Doing this in
@@ -213,6 +228,33 @@ class LatestFrameCapture:
             self.sequence += 1
             self.frame = (frame, self.sequence)
         self.stats.record_capture(time.monotonic() - began)
+
+    def _run_wgc(self):
+        """Capture one application through Windows.Graphics.Capture."""
+        if WindowsCapture is None or not (self.window_name or self.window_hwnd):
+            raise RuntimeError("Windows.Graphics.Capture is unavailable")
+        capture = WindowsCapture(cursor_capture=True, draw_border=False,
+                                 minimum_update_interval=max(1, round(1000 / self.fps)),
+                                 window_name=None if self.window_hwnd else self.window_name,
+                                 window_hwnd=self.window_hwnd)
+
+        @capture.event
+        def on_frame_arrived(frame, capture_control):
+            if self.stop.is_set():
+                capture_control.stop()
+                return
+            if not self.paused.is_set():
+                self._publish(frame.frame_buffer, {"left": 0, "top": 0}, capture_cursor=False)
+
+        @capture.event
+        def on_closed():
+            self.stop.set()
+
+        self.backend = "windows-graphics-capture"
+        control = capture.start_free_threaded()
+        self.stop.wait()
+        control.stop()
+        control.wait()
 
     def _run_dxcam(self):
         # DXcam uses Windows Desktop Duplication. It is much faster than a GDI
@@ -272,6 +314,14 @@ class LatestFrameCapture:
                 time.sleep(max(0, interval - (time.monotonic() - began)))
 
     def _run(self):
+        if os.name == "nt" and (self.window_name or self.window_hwnd):
+            try:
+                self._run_wgc()
+                return
+            except Exception:
+                # If a remembered window was closed, fall back to the selected
+                # monitor so /share still works instead of crashing.
+                self.backend = "mss"
         if os.name == "nt" and dxcam is not None:
             try:
                 self.backend = "dxgi"
@@ -367,14 +417,155 @@ class ScreenTrack(VideoStreamTrack):
             return frame
 
 
+class SystemAudioCapture:
+    """Bounded WASAPI loopback capture; a slow sender drops old audio blocks."""
+    def __init__(self):
+        if os.name != "nt" or sc is None:
+            raise RuntimeError("system audio sharing is unavailable on this computer")
+        self.error = None
+        self.ready = threading.Event()
+        self.blocks = queue.Queue(maxsize=3)
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="wire-system-audio", daemon=True)
+        self.thread.start()
+        if not self.ready.wait(3) or self.error:
+            self.stop.set()
+            raise RuntimeError(f"Windows system audio capture failed: {self.error or 'startup timed out'}")
+
+    def _run(self):
+        com_initialized = False
+        try:
+            result = ctypes.windll.ole32.CoInitializeEx(None, 0)
+            if result not in (0, 1):
+                raise OSError(f"COM initialization failed: 0x{result & 0xffffffff:08x}")
+            com_initialized = True
+            # Resolve and activate the WASAPI endpoint on its owning thread;
+            # COM-backed audio objects must not be created on one thread and
+            # then used from another.
+            speaker = sc.default_speaker()
+            if speaker is None:
+                raise RuntimeError("no default Windows speaker is available")
+            loopback = sc.get_microphone(speaker.id, include_loopback=True)
+            if loopback is None or not loopback.isloopback:
+                raise RuntimeError("Windows WASAPI loopback capture is unavailable")
+            with warnings.catch_warnings():
+                # A bounded queue intentionally drops late loopback blocks.
+                # Soundcard reports that recoverable condition per block; do
+                # not flood the terminal while WebRTC continues normally.
+                warnings.simplefilter("ignore", sc.SoundcardRuntimeWarning)
+                with loopback.recorder(samplerate=48_000, channels=2, blocksize=960) as recorder:
+                    self.ready.set()
+                    while not self.stop.is_set():
+                        block = recorder.record(numframes=960)
+                        try:
+                            while self.blocks.full():
+                                self.blocks.get_nowait()
+                            self.blocks.put_nowait(block)
+                        except queue.Empty:
+                            pass
+        except Exception as exc:
+            self.error = exc
+            self.stop.set()
+            self.ready.set()
+        finally:
+            if com_initialized:
+                ctypes.windll.ole32.CoUninitialize()
+
+    def get(self):
+        while not self.stop.is_set():
+            try:
+                return self.blocks.get(timeout=0.1)
+            except queue.Empty:
+                continue
+        raise MediaStreamError from self.error
+
+    def close(self):
+        self.stop.set()
+        if self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=2)
+
+
+class SystemAudioTrack(AudioStreamTrack):
+    def __init__(self, capture):
+        super().__init__()
+        self.capture = capture
+        self.timestamp = 0
+
+    async def recv(self):
+        samples = await asyncio.to_thread(self.capture.get)
+        pcm = np.clip(samples, -1, 1)
+        pcm = (pcm * 32767).astype(np.int16, copy=False)
+        frame = AudioFrame.from_ndarray(pcm.reshape(1, -1), format="s16", layout="stereo")
+        frame.sample_rate = 48_000
+        frame.pts = self.timestamp
+        frame.time_base = Fraction(1, 48_000)
+        self.timestamp += len(samples)
+        return frame
+
+
+class SystemAudioPlayback:
+    """Dedicated COM/WASAPI output worker with a bounded low-latency queue."""
+    def __init__(self):
+        self.blocks = queue.Queue(maxsize=5)
+        self.stop = threading.Event()
+        self.ready = threading.Event()
+        self.error = None
+        self.thread = threading.Thread(target=self._run, name="wire-system-audio-playback", daemon=True)
+        self.thread.start()
+        if not self.ready.wait(3) or self.error:
+            self.stop.set()
+            raise RuntimeError(f"Windows system audio playback failed: {self.error or 'startup timed out'}")
+
+    def _run(self):
+        com_initialized = False
+        try:
+            result = ctypes.windll.ole32.CoInitializeEx(None, 0)
+            if result not in (0, 1):
+                raise OSError(f"COM initialization failed: 0x{result & 0xffffffff:08x}")
+            com_initialized = True
+            speaker = sc.default_speaker()
+            if speaker is None:
+                raise RuntimeError("no default Windows speaker is available")
+            with speaker.player(samplerate=48_000, channels=2, blocksize=960) as player:
+                self.ready.set()
+                while not self.stop.is_set():
+                    try:
+                        player.play(self.blocks.get(timeout=0.1))
+                    except queue.Empty:
+                        continue
+        except Exception as exc:
+            self.error = exc
+            self.stop.set()
+            self.ready.set()
+        finally:
+            if com_initialized:
+                ctypes.windll.ole32.CoUninitialize()
+
+    def put(self, block):
+        try:
+            while self.blocks.full():
+                self.blocks.get_nowait()
+            self.blocks.put_nowait(block)
+        except queue.Empty:
+            pass
+
+    def close(self):
+        self.stop.set()
+        if self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=2)
+
+
 class WebRTCShare:
-    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000, hardware=True, adaptive=False):
+    def __init__(self, signal, on_frame, on_state, width, height, fps, monitor_index=1, codec="auto", bitrate=8_000_000, hardware=True, adaptive=False, system_audio=False, window_name=None, window_hwnd=None):
         self.signal, self.on_frame, self.on_state = signal, on_frame, on_state
         self.width, self.height, self.fps = width, height, fps
         self.monitor_index = monitor_index
+        self.window_name = window_name
+        self.window_hwnd = window_hwnd
         self.codec_requested = str(codec).upper()
         self.hardware_requested = bool(hardware)
         self.adaptive = bool(adaptive)
+        self.system_audio = bool(system_audio)
         self.adaptation = "none"
         self.codec_used = "auto"
         # aiortc's bundled video encoders cap their validated operating range
@@ -382,7 +573,7 @@ class WebRTCShare:
         self.target_bitrate = max(500_000, min(int(bitrate), 20_000_000))
         self.sender = None
         self.encoder_used = "pending"
-        self.loop = asyncio.new_event_loop(); self.pc = None; self.capture = None
+        self.loop = asyncio.new_event_loop(); self.pc = None; self.capture = None; self.audio_capture = None
         self.stats = ShareStats()
         self.closed = threading.Event(); self.close_lock = threading.Lock()
         self.thread = threading.Thread(target=self._run, daemon=True); self.thread.start()
@@ -425,6 +616,7 @@ class WebRTCShare:
         @self.pc.on("track")
         def track(track):
             if track.kind == "video": asyncio.create_task(self._receive(track))
+            elif track.kind == "audio": asyncio.create_task(self._receive_audio(track))
         return self.pc
     async def _receive(self, track):
         try:
@@ -434,17 +626,38 @@ class WebRTCShare:
                 self.on_frame(frame.to_ndarray(format="rgb24"))
         except (MediaStreamError, asyncio.CancelledError):
             self.on_state("stream ended")
+    async def _receive_audio(self, track):
+        if os.name != "nt" or sc is None:
+            return
+        resampler = AudioResampler(format="flt", layout="stereo", rate=48_000)
+        playback = None
+        try:
+            playback = SystemAudioPlayback()
+            while True:
+                frame = await track.recv()
+                for converted in resampler.resample(frame):
+                    playback.put(converted.to_ndarray().reshape(-1, 2))
+        except (MediaStreamError, asyncio.CancelledError):
+            return
+        except Exception:
+            self.on_state("system audio unavailable")
+        finally:
+            if playback:
+                playback.close()
     async def offer(self):
         global _PREFER_H264_HARDWARE
         _PREFER_H264_HARDWARE = self.hardware_requested
-        pc = await self._pc(); self.capture = LatestFrameCapture(self.width, self.height, self.fps, self.stats, self.monitor_index); self.capture.start()
+        pc = await self._pc(); self.capture = LatestFrameCapture(self.width, self.height, self.fps, self.stats, self.monitor_index, self.window_name, self.window_hwnd); self.capture.start()
         transceiver = pc.addTransceiver(ScreenTrack(self.capture), direction="sendonly")
         self.sender = transceiver.sender
         preferences = self.codec_preferences()
         if preferences:
             transceiver.setCodecPreferences(preferences)
+        if self.system_audio:
+            self.audio_capture = SystemAudioCapture()
+            pc.addTransceiver(SystemAudioTrack(self.audio_capture), direction="sendonly")
         offer = await pc.createOffer(); await pc.setLocalDescription(offer)
-        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "resolution": [self.width, self.height], "fps": self.fps, "codec": self.codec_used, "bitrate": self.target_bitrate}
+        return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "resolution": [self.width, self.height], "fps": self.fps, "codec": self.codec_used, "bitrate": self.target_bitrate, "system_audio": self.system_audio, "source": "window" if self.window_name else "monitor"}
     async def answer(self, offer):
         pc = await self._pc(); await pc.setRemoteDescription(RTCSessionDescription(offer["sdp"], offer["type"]))
         answer = await pc.createAnswer(); await pc.setLocalDescription(answer)
@@ -549,6 +762,8 @@ class WebRTCShare:
     async def _shutdown(self):
         if self.capture:
             self.capture.close()
+        if self.audio_capture:
+            self.audio_capture.close()
         if self.pc:
             await self.pc.close()
 
