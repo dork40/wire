@@ -7,10 +7,14 @@ services:
       WIRE_STATE: /data
       WIRE_TURN_URLS: ${WIRE_TURN_URLS:-turn:wirecmd.ddns.net:3478?transport=udp,turn:wirecmd.ddns.net:3478?transport=tcp}
       WIRE_TURN_SECRET: ${WIRE_TURN_SECRET:?set WIRE_TURN_SECRET}
+      WIRE_BACKUP_DIR: /backups
+      WIRE_BACKUP_INTERVAL: 21600
+      WIRE_BACKUP_RETAIN: 28
     ports:
       - "47666:47666/tcp"
     volumes:
       - ./wire-server-data:/data
+      - ./wire-server-backups:/backups
   wire-turn:
     image: coturn/coturn:4.18.0-r0
     restart: unless-stopped

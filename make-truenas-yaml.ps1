@@ -19,7 +19,7 @@ services:
   wire-server:
     # Bump this whenever the embedded server protocol changes so TrueNAS
     # rebuilds the custom image instead of reusing the prior local tag.
-    image: wire-server:1.4.26
+    image: wire-server:1.4.27
     build:
       context: .
       dockerfile_inline: |
@@ -32,10 +32,14 @@ services:
       WIRE_STATE: /data
       WIRE_TURN_URLS: turn:wirecmd.ddns.net:3478?transport=udp,turn:wirecmd.ddns.net:3478?transport=tcp
       WIRE_TURN_SECRET: $turnSecret
+      WIRE_BACKUP_DIR: /backups
+      WIRE_BACKUP_INTERVAL: 21600
+      WIRE_BACKUP_RETAIN: 28
     ports:
       - "47666:47666/tcp"
     volumes:
       - /mnt/nvme/wire:/data
+      - /mnt/nvme/wire-backups:/backups
   wire-turn:
     image: coturn/coturn:4.18.0-r0
     restart: unless-stopped

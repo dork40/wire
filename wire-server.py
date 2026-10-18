@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import argparse
 import hmac
 import hashlib
 import json
@@ -13,6 +14,7 @@ import threading
 import time
 import os
 import sys
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,7 +25,7 @@ from cryptography.x509.oid import NameOID
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.26"
+SERVER_VERSION = "1.4.27"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
@@ -33,6 +35,9 @@ GROUPS_FILE = STATE / "groups.json"
 BACKUPS_FILE = STATE / "identity-backups.json"
 QUEUES_FILE = STATE / "offline-queue.json"
 SYNC_FILE = STATE / "encrypted-sync.json"
+BACKUP_DIR = Path(os.environ["WIRE_BACKUP_DIR"]) if os.environ.get("WIRE_BACKUP_DIR") else None
+BACKUP_INTERVAL_SECONDS = max(900, int(os.environ.get("WIRE_BACKUP_INTERVAL", "21600")))
+BACKUP_RETAIN = max(2, min(365, int(os.environ.get("WIRE_BACKUP_RETAIN", "28"))))
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str, str]] = {}
 # A client can be sent packets by its own handler and by any number of other
@@ -65,6 +70,81 @@ MAX_RECOVERY_ATTEMPTS = 5
 SERVER_KEY_LOCK = threading.Lock()
 SERVER_SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
 STARTED_AT = time.time()
+
+
+def state_file_names() -> tuple[str, ...]:
+    return ("users.json", "groups.json", "identity-backups.json", "offline-queue.json",
+            "encrypted-sync.json", "server-signing-key", "server-certificate.pem", "server-tls-key.pem")
+
+
+def create_state_backup() -> Path | None:
+    """Write a consistent, checksummed state snapshot and rotate older copies."""
+    if BACKUP_DIR is None:
+        return None
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    protect_state_path(BACKUP_DIR, directory=True)
+    with LOCK:
+        files = {name: (STATE / name).read_bytes() for name in state_file_names() if (STATE / name).is_file()}
+    created = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest = {"format": 1, "created": created, "server_version": SERVER_VERSION,
+                "files": {name: hashlib.sha256(data).hexdigest() for name, data in files.items()}}
+    target = BACKUP_DIR / f"wire-state-{created}.zip"
+    temp = target.with_suffix(".tmp")
+    with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, separators=(",", ":")))
+        for name, data in files.items():
+            archive.writestr(f"state/{name}", data)
+    protect_state_path(temp)
+    temp.replace(target)
+    protect_state_path(target)
+    for old in sorted(BACKUP_DIR.glob("wire-state-*.zip"), reverse=True)[BACKUP_RETAIN:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return target
+
+
+def verified_backup_files(source: Path) -> dict[str, bytes]:
+    """Return verified state bytes without trusting archive paths or metadata."""
+    with zipfile.ZipFile(source, "r") as archive:
+        if any(info.file_size > 512 * 1024 * 1024 for info in archive.infolist()):
+            raise ValueError("backup contains an oversized entry")
+        manifest = json.loads(archive.read("manifest.json"))
+        hashes = manifest.get("files") if manifest.get("format") == 1 else None
+        if not isinstance(hashes, dict) or not hashes:
+            raise ValueError("backup manifest is invalid")
+        allowed = set(state_file_names())
+        if not set(hashes).issubset(allowed):
+            raise ValueError("backup contains an unknown state file")
+        files = {}
+        for name, expected in hashes.items():
+            data = archive.read(f"state/{name}")
+            if not isinstance(expected, str) or not hmac.compare_digest(hashlib.sha256(data).hexdigest(), expected):
+                raise ValueError(f"backup verification failed for {name}")
+            files[name] = data
+        return files
+
+
+def restore_state_backup(source: Path) -> None:
+    files = verified_backup_files(source)
+    prepare_state()
+    for name, data in files.items():
+        target = STATE / name
+        temp = target.with_suffix(target.suffix + ".restore.tmp")
+        temp.write_bytes(data)
+        protect_state_path(temp)
+        temp.replace(target)
+        protect_state_path(target)
+
+
+def backup_worker() -> None:
+    while True:
+        try:
+            create_state_backup()
+        except Exception as exc:
+            print(f"backup failed: {exc}", flush=True)
+        time.sleep(BACKUP_INTERVAL_SECONDS)
 
 
 def turn_credentials(name: str) -> dict | None:
@@ -854,7 +934,29 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Wire directory server and state backup utility")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--backup", action="store_true", help="create one verified state backup")
+    actions.add_argument("--verify-backup", type=Path, metavar="FILE")
+    actions.add_argument("--restore-backup", type=Path, metavar="FILE")
+    args = parser.parse_args()
+    if args.verify_backup:
+        files = verified_backup_files(args.verify_backup)
+        print(f"verified Wire backup: {len(files)} state files")
+        return
+    if args.restore_backup:
+        restore_state_backup(args.restore_backup)
+        print(f"restored Wire backup: {args.restore_backup}")
+        return
+    if args.backup:
+        target = create_state_backup()
+        if target is None:
+            raise SystemExit("WIRE_BACKUP_DIR is not configured")
+        print(f"created Wire backup: {target}")
+        return
     secure_context = tls_context()
+    if BACKUP_DIR is not None:
+        threading.Thread(target=backup_worker, name="wire-backup", daemon=True).start()
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind((HOST, PORT))
