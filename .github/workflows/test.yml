@@ -24,13 +24,16 @@ jobs:
       - if: runner.os == 'Linux'
         shell: bash
         run: |
+          TURN_TEST_IP=$(hostname -I | awk '{print $1}')
+          trap 'docker logs wire-turn-test 2>/dev/null || true; docker rm -f wire-turn-test 2>/dev/null || true' EXIT
           docker run -d --name wire-turn-test --network host \
             coturn/coturn:4.18.0-r0 \
             --fingerprint --use-auth-secret \
             --static-auth-secret=wire-ci-turn-secret-at-least-32-bytes \
             --realm=wire.test --min-port=49160 --max-port=49200 \
+            --listening-ip="$TURN_TEST_IP" --relay-ip="$TURN_TEST_IP" \
             --no-cli --no-tls --no-dtls --log-file=stdout
-          python - <<'PY'
+          TURN_TEST_IP="$TURN_TEST_IP" python - <<'PY'
           import os, socket, struct, time
           tx = os.urandom(12)
           request = struct.pack("!HHI12s", 1, 0, 0x2112A442, tx)
@@ -38,7 +41,7 @@ jobs:
           sock.settimeout(1)
           for attempt in range(10):
               try:
-                  sock.sendto(request, ("127.0.0.1", 3478))
+                  sock.sendto(request, (os.environ["TURN_TEST_IP"], 3478))
                   response, _ = sock.recvfrom(2048)
                   assert response[:2] == b"\x01\x01" and response[8:20] == tx
                   break
@@ -48,4 +51,3 @@ jobs:
                   time.sleep(1)
           PY
           docker logs wire-turn-test
-          docker rm -f wire-turn-test

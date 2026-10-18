@@ -38,6 +38,8 @@ services:
       - --use-auth-secret
       - --static-auth-secret=${WIRE_TURN_SECRET:?set WIRE_TURN_SECRET}
       - --realm=wirecmd.ddns.net
+      - --listening-ip=${WIRE_PRIVATE_IP:-192.168.1.199}
+      - --relay-ip=${WIRE_PRIVATE_IP:-192.168.1.199}
       - --external-ip=${WIRE_PUBLIC_IP:?set WIRE_PUBLIC_IP}/${WIRE_PRIVATE_IP:-192.168.1.199}
       - --min-port=49160
       - --max-port=49200

@@ -51,6 +51,8 @@ services:
       - --use-auth-secret
       - --static-auth-secret=$turnSecret
       - --realm=wirecmd.ddns.net
+      - --listening-ip=192.168.1.199
+      - --relay-ip=192.168.1.199
       - --external-ip=$publicAddress/192.168.1.199
       - --min-port=49160
       - --max-port=49200
