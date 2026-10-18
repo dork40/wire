@@ -47,7 +47,7 @@ It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
 Wire v1.4.57 requires directory server v1.4.22 or newer for authenticated TLS;
-server v1.4.24 is recommended for short-lived authenticated TURN credentials.
+server v1.4.25 is recommended for short-lived authenticated TURN credentials.
 Keep the server state volume because it contains the pinned server key.
 
 ## Commands

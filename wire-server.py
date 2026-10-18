@@ -23,7 +23,7 @@ from cryptography.x509.oid import NameOID
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.24"
+SERVER_VERSION = "1.4.25"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
@@ -440,10 +440,6 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             users[key] = {"name": name, "public": public, "sign_public": sign_public,
                           "allow_group_invites": bool(previous.get("allow_group_invites", True)),
                           "dnd": bool(previous.get("dnd", False)),
-                          # Accounts already present during this upgrade keep
-                          # relay access. A brand-new identity earns it only
-                          # after an existing person accepts a friend request.
-                          "turn_allowed": bool(previous.get("turn_allowed", bool(previous))),
                           "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
                           "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
             save_users(users)
@@ -453,7 +449,10 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
             if queued_packets: save_queues(queues)
         ready = {"type": "ready", "name": name, "version": SERVER_VERSION,
                  "relay_rate": RELAY_RATE_BYTES_PER_SECOND}
-        turn = turn_credentials(name) if users[key].get("turn_allowed", False) else None
+        # Every signed-in Wire identity can use the relay. Security comes from
+        # expiring credentials, quotas, and Coturn's private-network blocks,
+        # not from limiting normal app features to friends.
+        turn = turn_credentials(name)
         if turn:
             ready["turn"] = turn
         send(sock, ready)
@@ -541,7 +540,6 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         for left, right in ((key, target), (target, key)):
                             friends = users[left].setdefault("friends", [])
                             if right not in friends: friends.append(right)
-                            users[left]["turn_allowed"] = True
                     save_users(users)
                 if accepted:
                     deliver_or_queue(target, {"type": "friend_added", "name": name})
