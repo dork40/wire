@@ -30,6 +30,43 @@ def load_server_module():
 
 
 class TransportTests(unittest.TestCase):
+    def test_background_completion_restarts_only_an_empty_prompt(self):
+        class Loop:
+            @staticmethod
+            def call_soon_threadsafe(callback): callback()
+        class Renderer:
+            def __init__(self): self.resets = 0
+            def reset(self, **_kwargs): self.resets += 1
+        class Buffer:
+            text = ""
+        class Application:
+            is_running = True
+            loop = Loop()
+            renderer = Renderer()
+            current_buffer = Buffer()
+            def __init__(self): self.exits = 0; self.redraws = 0
+            def exit(self, result):
+                self.exits += 1
+                self.result = result
+            def _redraw(self): self.redraws += 1
+        class ImmediateTimer:
+            daemon = False
+            def __init__(self, _delay, callback): self.callback = callback
+            def start(self): self.callback()
+
+        application = Application()
+        old_application, old_timer = wire.PROMPT_APPLICATION, wire.threading.Timer
+        wire.PROMPT_APPLICATION, wire.threading.Timer = application, ImmediateTimer
+        try:
+            wire.restart_blank_prompt_after_background_output()
+            self.assertEqual((application.exits, application.result), (1, ""))
+            application.current_buffer.text = "unsent words"
+            wire.restart_blank_prompt_after_background_output()
+            self.assertEqual(application.exits, 1)
+            self.assertEqual(application.redraws, 1)
+        finally:
+            wire.PROMPT_APPLICATION, wire.threading.Timer = old_application, old_timer
+
     def test_server_turn_credentials_are_short_lived_and_hmac_authenticated(self):
         server = load_server_module()
         server.TURN_URLS = ["turn:relay.example:3478?transport=udp"]

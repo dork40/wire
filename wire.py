@@ -583,8 +583,8 @@ def schedule_prompt_refresh(delay: float = 0.3) -> None:
         PROMPT_REFRESH_TIMER.start()
 
 
-def restart_blank_prompt_after_connect(delay: float = 0.5) -> None:
-    """Finish an empty hidden prompt after a background room connection.
+def restart_blank_prompt_after_background_output(delay: float = 0.5) -> None:
+    """Finish an empty hidden prompt after a background operation.
 
     This is the safe equivalent of pressing Enter once: it never submits or
     clears text the user has started typing. Ending the empty prompt makes the
@@ -599,10 +599,10 @@ def restart_blank_prompt_after_connect(delay: float = 0.5) -> None:
         def restart_or_repaint() -> None:
             buffer = application.current_buffer
             if not buffer.text:
-                # Force the blank prompt onto the physical console now. A
-                # normal invalidate can be coalesced away as "unchanged".
-                application.renderer.reset(_scroll=True, leave_alternate_screen=False)
-                application._redraw()
+                # Safely complete only an empty read. The main loop immediately
+                # opens a fresh prompt below the background output, exactly as
+                # if Enter had been pressed, without ever submitting user text.
+                application.exit(result="")
             else:
                 application.renderer.reset(_scroll=True, leave_alternate_screen=False)
                 application._redraw()
@@ -2066,6 +2066,7 @@ class Wire:
                         raise ConnectionError("receiver did not verify the file")
                     completed = True
                     say(f"sent file directly: {path.name}")
+                    restart_blank_prompt_after_background_output()
                 except socket.timeout:
                     break
                 except (ConnectionError, OSError):
@@ -2154,6 +2155,7 @@ class Wire:
                 toast(f"file received from {peer.name}: {offer['name']}")
                 if state["path"].suffix.lower() in VIDEO_EXTENSIONS:
                     say(f"video received. Type /preview \"{state['path']}\" to watch its first 5 seconds.")
+                restart_blank_prompt_after_background_output()
         except Exception as exc:
             self.incoming_files.pop(file_id, None)
             state["temp"].unlink(missing_ok=True)
@@ -2256,6 +2258,7 @@ class Wire:
             toast(f"file received from {peer.name}: {name}")
             if target.suffix.lower() in VIDEO_EXTENSIONS:
                 say(f"video received. Type /preview \"{target}\" to watch its first 5 seconds.")
+            restart_blank_prompt_after_background_output()
         except Exception as exc:
             self.paused_files[file_id] = {"peer": peer, "host": host, "port": port, "offer": offer, "target": target}
             say(f"file transfer paused: {exc}; type /file resume {file_id[:6]} within 10 minutes")
@@ -2721,7 +2724,7 @@ class Wire:
         say(f"connected: {peer.name}  fingerprint: {fingerprint(peer.public_key)}")
         say(f"room open: {peer.name} (type normally; /help for commands)")
         self.show_history(peer.name)
-        restart_blank_prompt_after_connect()
+        restart_blank_prompt_after_background_output()
         redraw_prompt()
         if peer.sock:
             self.start_worker(self.receive_loop, peer)
@@ -2780,6 +2783,7 @@ class Wire:
                     if state:
                         if state.get("cleanup"): state["path"].unlink(missing_ok=True)
                         say(f"file sent and verified: {state['path'].name}")
+                        restart_blank_prompt_after_background_output()
                 elif control.get("kind") == "file_relay_abort":
                     file_id = control.get("id")
                     if isinstance(file_id, str):
