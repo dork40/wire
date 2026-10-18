@@ -81,7 +81,7 @@ APP = "wire"
 PORT = 46565
 DEFAULT_DIRECTORY_HOST = "wirecmd.ddns.net"
 DEFAULT_DIRECTORY_PORT = 47666
-RELEASE_MANIFEST_URL = "https://raw.githubusercontent.com/dork40/wire/main/release-manifest.json"
+RELEASE_MANIFEST_URL = "https://api.github.com/repos/dork40/wire/contents/release-manifest.json?ref=main"
 RELEASE_SIGNING_PUBLIC_KEY = "BRO0YhoJwdmaB3ezYutx7VVbaSI205xR2x0pjS+H53M="
 # Account data must never live beside a versioned package/executable.  Updates,
 # pipx environments and portable builds can be replaced without losing users.
@@ -377,7 +377,12 @@ def version_parts(value: str) -> tuple[int, ...]:
 
 def verified_release_manifest() -> dict:
     """Fetch and authenticate the immutable commit selected for an update."""
-    request = urllib.request.Request(RELEASE_MANIFEST_URL, headers={"User-Agent": "Wire-Updater"})
+    # raw.githubusercontent.com may retain the previous, still-valid manifest
+    # briefly after a release. A unique query bypasses that CDN object; the
+    # Ed25519 signature remains the authority, not the transport cache.
+    manifest_url = f"{RELEASE_MANIFEST_URL}&wire={time.time_ns()}"
+    request = urllib.request.Request(manifest_url, headers={"User-Agent": "Wire-Updater",
+        "Accept": "application/vnd.github.raw+json", "Cache-Control": "no-cache"})
     with urllib.request.urlopen(request, timeout=10) as response:
         manifest = json.loads(response.read().decode("utf-8"))
     version = manifest.get("version")
