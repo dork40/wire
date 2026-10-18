@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -25,14 +25,47 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - id: version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^SERVER_VERSION = "\(.*\)"/\1/p' wire-server.py)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - id: build
+        uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/dork40/wire-server:1.4.28
+            ghcr.io/dork40/wire-server:${{ steps.version.outputs.version }}
             ghcr.io/dork40/wire-server:latest
           labels: |
             org.opencontainers.image.source=https://github.com/dork40/wire
-            org.opencontainers.image.version=1.4.28
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+      - name: Keep the TrueNAS package on the newest verified server image
+        shell: python
+        env:
+          SERVER_VERSION: ${{ steps.version.outputs.version }}
+          SERVER_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          import os, re
+          from pathlib import Path
+          values = Path("truenas-app/ix_values.yaml")
+          text = values.read_text(encoding="utf-8")
+          text = re.sub(r'tag: "[^"]+"', f'tag: "{os.environ["SERVER_VERSION"]}@{os.environ["SERVER_DIGEST"]}"', text, count=1)
+          values.write_text(text, encoding="utf-8")
+          app = Path("truenas-app/app.yaml")
+          text = app.read_text(encoding="utf-8")
+          text = re.sub(r"^app_version: .+$", f'app_version: {os.environ["SERVER_VERSION"]}', text, flags=re.M)
+          text = re.sub(r"^version: .+$", f'version: {os.environ["SERVER_VERSION"]}', text, flags=re.M)
+          app.write_text(text, encoding="utf-8")
+      - name: Publish catalog update metadata
+        shell: bash
+        run: |
+          if git diff --quiet -- truenas-app; then exit 0; fi
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add truenas-app/app.yaml truenas-app/ix_values.yaml
+          git commit -m "Update TrueNAS server image to ${{ steps.version.outputs.version }} [skip ci]"
+          git push

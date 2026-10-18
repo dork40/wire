@@ -10,6 +10,7 @@ import queue
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import platform
@@ -97,6 +98,58 @@ SETTINGS_FILE = DATA / "settings.json"
 DIRECTORY_KEYS_FILE = DATA / "directory-keys.json"
 DOWNLOADS_DIR = Path.home() / "Downloads" / "Wire"
 DIAGNOSTIC_LOG = DATA / "wire-diagnostics.log"
+
+
+def parse_directory_endpoint(value: str) -> tuple[str, int]:
+    """Parse a private Wire host without accepting URLs or shell-like input."""
+    raw = value.strip()
+    if not raw:
+        raise ValueError("use: /private <server-ip-or-name>[:port]")
+    if "://" in raw or any(char.isspace() for char in raw) or any(char in raw for char in "/\\@?#"):
+        raise ValueError("enter only a server IP or DNS name, optionally followed by :port")
+    host, port = raw, DEFAULT_DIRECTORY_PORT
+    if raw.startswith("["):
+        closing = raw.find("]")
+        if closing < 0:
+            raise ValueError("invalid IPv6 address")
+        host = raw[1:closing]
+        suffix = raw[closing + 1:]
+        if suffix:
+            if not suffix.startswith(":"):
+                raise ValueError("invalid private server address")
+            port = int(suffix[1:])
+    elif raw.count(":") == 1:
+        possible_host, possible_port = raw.rsplit(":", 1)
+        if possible_port.isdigit():
+            host, port = possible_host, int(possible_port)
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if (len(host) > 253 or not re.fullmatch(
+                r"(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?", host)):
+            # The pattern above intentionally excludes spaces, underscores and
+            # punctuation that cannot occur in a normal DNS hostname.
+            raise ValueError("invalid private server IP or DNS name")
+    if not 1 <= port <= 65535:
+        raise ValueError("server port must be between 1 and 65535")
+    return host.rstrip("."), port
+
+
+def load_directory_config() -> dict:
+    try:
+        saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
+        host, port = str(saved["host"]), int(saved["port"])
+        if not 1 <= port <= 65535:
+            raise ValueError
+        inferred_mode = "public" if host.lower() == DEFAULT_DIRECTORY_HOST and port == DEFAULT_DIRECTORY_PORT else "private"
+        mode = saved.get("mode") if saved.get("mode") in ("public", "private") else inferred_mode
+        return {"mode": mode, "host": host, "port": port}
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        return {"mode": "public", "host": DEFAULT_DIRECTORY_HOST, "port": DEFAULT_DIRECTORY_PORT}
+
+
+def save_directory_config(mode: str, host: str, port: int) -> None:
+    replace_private_bytes(SERVER_CONFIG, json.dumps({"mode": mode, "host": host, "port": port}).encode("utf-8"))
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 IMAGE_CHUNK_BYTES = 40 * 1024
@@ -782,8 +835,7 @@ def local_directory_requested() -> bool:
     if os.environ.get("WIRE_LOCAL_DIRECTORY") == "1":
         return True
     try:
-        saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
-        return str(saved.get("host", "")).lower() in ("localhost", "127.0.0.1", "::1")
+        return load_directory_config()["host"].lower() in ("localhost", "127.0.0.1", "::1")
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return False
 
@@ -1108,12 +1160,8 @@ class Wire:
     def restore_identity(self, name: str, password: str) -> dict:
         """Recover an identity only after proving knowledge of its password."""
         try:
-            try:
-                saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8")); host, port = saved["host"], int(saved["port"])
-                if str(host).lower() in ("localhost", "127.0.0.1", "::1"):
-                    host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
-            except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
+            configured = load_directory_config()
+            host, port = configured["host"], configured["port"]
             sock, _ = open_directory_socket(str(host), int(port), timeout=10)
             send_frame(sock, {"type": "identity_fetch", "name": name})
             reply = recv_frame(sock)
@@ -2848,13 +2896,8 @@ class Wire:
     def connect_server(self, host: Optional[str] = None, port: Optional[int] = None) -> None:
         self.require_login()
         if host is None:
-            try:
-                saved = json.loads(SERVER_CONFIG.read_text(encoding="utf-8"))
-                host, port = saved["host"], int(saved["port"])
-                if str(host).lower() in ("localhost", "127.0.0.1", "::1"):
-                    host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
-            except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                host, port = DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT
+            configured = load_directory_config()
+            host, port = configured["host"], configured["port"]
         port = port or DEFAULT_DIRECTORY_PORT
         if self.server:
             self.server.close()
@@ -2887,7 +2930,6 @@ class Wire:
                     RELAY_UPLOAD_BYTES_PER_SECOND,
                     int(advertised_rate / RELAY_UPLOAD_EXPANSION * 0.85),
                 )
-            replace_private_bytes(SERVER_CONFIG, json.dumps({"host": host, "port": port}).encode("utf-8"))
             self.start_worker(self.server_loop, sock)
             self.server_send({"type": "sync_fetch"})
             self.sync_preferences()
@@ -2897,6 +2939,26 @@ class Wire:
         except Exception:
             sock.close()
             raise
+
+    def switch_directory(self, mode: str, host: str, port: int) -> None:
+        """Persist a directory choice and reconnect without mixing private realms."""
+        if self.peers:
+            raise ValueError("close the active chat with /exit before switching servers")
+        old = load_directory_config()
+        save_directory_config(mode, host, port)
+        if not self.name:
+            say(f"{mode} server saved: {host}:{port}; log in to connect")
+            return
+        try:
+            self.connect_server(host, port)
+        except Exception:
+            save_directory_config(str(old["mode"]), str(old["host"]), int(old["port"]))
+            try:
+                self.connect_server(str(old["host"]), int(old["port"]))
+            except Exception:
+                pass
+            raise
+        say(f"using {mode} server: {host}:{port}")
 
     def server_send(self, packet: dict) -> None:
         if not self.server:
@@ -3329,6 +3391,8 @@ HELP = """WIRE HELP
 
 ACCOUNT AND PEOPLE
   signup [name] / login [name]       Create or sign in to an account.
+  /private <server-ip-or-name>       Use a self-hosted Wire server (port 47666 by default).
+  /public                            Return to Wire's public directory server.
   discover [name]                    Find a Wire username.
   open <name> / accept <name>        Open or accept a private chat.
   friends                             Show friends, online state, and pending requests.
@@ -3483,6 +3547,18 @@ def main() -> None:
                     app.signup(argument or input("username: ").strip())
                 elif command == "login":
                     app.login(argument or input("username: ").strip())
+                elif command == "private":
+                    if not argument:
+                        configured = load_directory_config()
+                        if configured["mode"] == "private":
+                            print(f"private server: {configured['host']}:{configured['port']}")
+                        else:
+                            raise ValueError("use: /private <server-ip-or-name>[:port]")
+                    else:
+                        host, port = parse_directory_endpoint(argument)
+                        app.switch_directory("private", host, port)
+                elif command == "public":
+                    app.switch_directory("public", DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT)
                 elif command == "discover":
                     app.server_send({"type": "discover", "query": argument})
                 elif command == "friends":
@@ -3673,10 +3749,7 @@ def main() -> None:
                     if pieces == ["stats"]:
                         app.server_send({"type": "server_stats"})
                         continue
-                    if len(pieces) > 2:
-                        raise ValueError("use: server [host] [port]")
-                    app.connect_server(pieces[0] if pieces else "127.0.0.1",
-                                       int(pieces[1]) if len(pieces) == 2 else 47666)
+                    raise ValueError("use /private <server-ip-or-name> or /public; /server stats shows health")
                 elif command == "open":
                     if not argument:
                         raise ValueError("use: open <username>")

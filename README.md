@@ -32,6 +32,21 @@ PipeWire/XDG Desktop Portal backend is implemented and tested.
 New installs automatically connect to the Wire username directory at
 `wirecmd.ddns.net`; no IP address or server command is needed for normal use.
 
+## Private self-hosted server
+
+The `truenas-app` folder is a TrueNAS Community Apps catalog definition with
+local-only defaults, persistent state, backups, and a clickable status web UI.
+After installing it, point each Wire client at the NAS:
+
+```text
+/private 192.168.1.50
+```
+
+Use the NAS Tailscale IP or MagicDNS name instead for private remote access.
+Nothing is automatically opened on the router. `/public` switches the client
+back to Wire's public directory. Private servers use a separate username and
+recovery namespace, and Wire pins each server identity independently.
+
 In-app updates verify an Ed25519-signed release manifest before installing the
 exact authorized Git commit. A changed version, commit, or signature is rejected;
 the release signing key is kept outside the repository.
@@ -50,7 +65,7 @@ directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
-Wire v1.4.59 requires directory server v1.4.22 or newer for authenticated TLS;
+Wire v1.4.64 requires directory server v1.4.22 or newer for authenticated TLS;
 server v1.4.28 is recommended for encrypted multi-device sync, server status,
 and automatic verified state backups.
 Keep the server state volume because it contains the pinned server key.

@@ -1,0 +1,14 @@
+images:
+  image:
+    repository: ghcr.io/dork40/wire-server
+    tag: "1.4.28@sha256:fcb6bea440065e1940b3daccc0609c72bd47c1e11714bf9462315a4af52668fc"
+  container_utils_image:
+    repository: ixsystems/container-utils
+    tag: "1.0.2@sha256:46eba20714c1cc6784f60e245c32c33a2d9f616e47d804694a9854248c89a992"
+
+consts:
+  server_container_name: wire-server
+  web_container_name: wire-web
+  perms_container_name: permissions
+  server_internal_port: 47666
+  web_internal_port: 8097
