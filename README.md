@@ -32,6 +32,10 @@ PipeWire/XDG Desktop Portal backend is implemented and tested.
 New installs automatically connect to the Wire username directory at
 `wirecmd.ddns.net`; no IP address or server command is needed for normal use.
 
+In-app updates verify an Ed25519-signed release manifest before installing the
+exact authorized Git commit. A changed version, commit, or signature is rejected;
+the release signing key is kept outside the repository.
+
 ## Start
 
 Open Command Prompt and run:

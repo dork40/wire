@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import ctypes
 import multiprocessing as mp
 import queue
@@ -80,7 +81,8 @@ APP = "wire"
 PORT = 46565
 DEFAULT_DIRECTORY_HOST = "wirecmd.ddns.net"
 DEFAULT_DIRECTORY_PORT = 47666
-GITHUB_API_MAIN = "https://api.github.com/repos/dork40/wire/commits/main"
+RELEASE_MANIFEST_URL = "https://raw.githubusercontent.com/dork40/wire/main/release-manifest.json"
+RELEASE_SIGNING_PUBLIC_KEY = "BRO0YhoJwdmaB3ezYutx7VVbaSI205xR2x0pjS+H53M="
 # Account data must never live beside a versioned package/executable.  Updates,
 # pipx environments and portable builds can be replaced without losing users.
 if os.name == "nt":
@@ -373,13 +375,39 @@ def version_parts(value: str) -> tuple[int, ...]:
     return tuple(int(piece) for piece in value.split(".") if piece.isdigit())
 
 
-def check_for_update(quiet: bool = False) -> None:
-    """Check the public source version without delaying the interactive prompt."""
+def verified_release_manifest() -> dict:
+    """Fetch and authenticate the immutable commit selected for an update."""
+    request = urllib.request.Request(RELEASE_MANIFEST_URL, headers={"User-Agent": "Wire-Updater"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        manifest = json.loads(response.read().decode("utf-8"))
+    version = manifest.get("version")
+    commit = manifest.get("commit")
+    signature_text = manifest.get("signature")
+    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+        raise ValueError("release manifest has an invalid version")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("release manifest has an invalid commit")
+    if not isinstance(signature_text, str):
+        raise ValueError("release manifest has no signature")
     try:
-        with urllib.request.urlopen("https://raw.githubusercontent.com/dork40/wire/main/pyproject.toml", timeout=5) as response:
-            remote = response.read().decode("utf-8")
-        marker = 'version = "'
-        latest = remote.split(marker, 1)[1].split('"', 1)[0]
+        signature = base64.b64decode(signature_text, validate=True)
+        public = base64.b64decode(RELEASE_SIGNING_PUBLIC_KEY, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise ValueError("release manifest has invalid base64") from exc
+    if len(signature) != 64 or len(public) != 32:
+        raise ValueError("release manifest has an invalid signature")
+    message = b"wire-update-v1\0" + commit.encode("ascii") + b"\0" + version.encode("ascii")
+    try:
+        ed25519.Ed25519PublicKey.from_public_bytes(public).verify(signature, message)
+    except Exception as exc:
+        raise ValueError("release manifest signature verification failed") from exc
+    return {"version": version, "commit": commit}
+
+
+def check_for_update(quiet: bool = False) -> None:
+    """Check the authenticated public release without delaying the prompt."""
+    try:
+        latest = verified_release_manifest()["version"]
         current = wire_version().removeprefix("Wire v")
         if current == "Wire version unknown":
             if not quiet:
@@ -626,14 +654,14 @@ def toast(text: str) -> None:
 
 
 def start_update_after_exit() -> None:
-    """Install one immutable Git commit without executing a downloaded script."""
+    """Install the immutable Git commit authorized by the signed manifest."""
     if os.name != "nt":
         raise ValueError("automatic updating is currently available on Windows only")
-    request = urllib.request.Request(GITHUB_API_MAIN, headers={"User-Agent": "Wire-Updater"})
-    with urllib.request.urlopen(request, timeout=10) as response:
-        commit = json.loads(response.read().decode("utf-8")).get("sha", "")
-    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
-        raise ValueError("GitHub returned an invalid release commit")
+    release = verified_release_manifest()
+    current = wire_version().removeprefix("Wire v")
+    if current != "Wire version unknown" and version_parts(release["version"]) <= version_parts(current):
+        raise ValueError(f"Wire is already up to date ({current})")
+    commit = release["commit"]
     source = f"https://github.com/dork40/wire/archive/{commit}.zip"
     script = (
         f"$wirePid = {os.getpid()}; "
