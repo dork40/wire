@@ -22,6 +22,18 @@ jobs:
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
       - if: runner.os == 'Linux'
+        name: Validate TrueNAS Community App package
+        shell: bash
+        run: |
+          validation_root=$(mktemp -d)
+          git clone --depth 1 --filter=blob:none --sparse https://github.com/truenas/apps.git "$validation_root"
+          git -C "$validation_root" sparse-checkout set .github library
+          mkdir -p "$validation_root/ix-dev/community/wire"
+          cp -R truenas-app/. "$validation_root/ix-dev/community/wire/"
+          cd "$validation_root"
+          python .github/scripts/ci.py --app wire --train community \
+            --test-file basic-values.yaml --render-only true --skip-metadata
+      - if: runner.os == 'Linux'
         shell: bash
         run: |
           TURN_TEST_IP=$(hostname -I | awk '{print $1}')
