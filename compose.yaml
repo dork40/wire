@@ -32,6 +32,7 @@ services:
   wire-turn:
     image: coturn/coturn:4.18.0-r0
     restart: unless-stopped
+    network_mode: host
     command:
       - --fingerprint
       - --use-auth-secret
@@ -57,7 +58,9 @@ services:
       - --denied-peer-ip=192.168.0.0-192.168.255.255
       - --denied-peer-ip=224.0.0.0-255.255.255.255
       - --log-file=stdout
-    ports:
-      - "3478:3478/tcp"
-      - "3478:3478/udp"
-      - "49160-49200:49160-49200/udp"
+x-portals:
+  - host: 0.0.0.0
+    name: Wire Web UI
+    path: /
+    port: 8097
+    scheme: http

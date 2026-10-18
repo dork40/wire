@@ -19,6 +19,8 @@ In TrueNAS, go to **Apps → Discover → more menu → Install via YAML**, name
 
 After it starts, open Wire at `http://192.168.1.199:8097`. TrueNAS remains
 available independently at `https://192.168.1.199`.
+The Wire app card also provides a **Wire Web UI** portal button that opens this
+address without requiring it to be typed manually.
 
 The server writes a checksummed backup every six hours to
 `/mnt/nvme/wire-backups` and retains the newest 28 archives. Backups include the

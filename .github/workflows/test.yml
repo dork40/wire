@@ -21,3 +21,31 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install .
       - run: python -m unittest discover -s tests -v
+      - if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          docker run -d --name wire-turn-test --network host \
+            coturn/coturn:4.18.0-r0 \
+            --fingerprint --use-auth-secret \
+            --static-auth-secret=wire-ci-turn-secret-at-least-32-bytes \
+            --realm=wire.test --min-port=49160 --max-port=49200 \
+            --no-cli --no-tls --no-dtls --log-file=stdout
+          python - <<'PY'
+          import os, socket, struct, time
+          tx = os.urandom(12)
+          request = struct.pack("!HHI12s", 1, 0, 0x2112A442, tx)
+          sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          sock.settimeout(1)
+          for attempt in range(10):
+              try:
+                  sock.sendto(request, ("127.0.0.1", 3478))
+                  response, _ = sock.recvfrom(2048)
+                  assert response[:2] == b"\x01\x01" and response[8:20] == tx
+                  break
+              except TimeoutError:
+                  if attempt == 9:
+                      raise
+                  time.sleep(1)
+          PY
+          docker logs wire-turn-test
+          docker rm -f wire-turn-test
