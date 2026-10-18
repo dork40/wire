@@ -31,8 +31,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: |
-            ghcr.io/dork40/wire-server:1.4.27
+            ghcr.io/dork40/wire-server:1.4.28
             ghcr.io/dork40/wire-server:latest
           labels: |
             org.opencontainers.image.source=https://github.com/dork40/wire
-            org.opencontainers.image.version=1.4.27
+            org.opencontainers.image.version=1.4.28
