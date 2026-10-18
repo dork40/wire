@@ -46,3 +46,12 @@ Forward these router ports to `192.168.1.199`:
 
 Do not expose the TrueNAS web administration interface. TURN relays encrypted
 DTLS-SRTP packets and does not decrypt screen-share or call contents.
+# Updating a custom-YAML installation
+
+The generated YAML uses `ghcr.io/dork40/wire-server:latest` with
+`pull_policy: always`. TrueNAS therefore pulls the newest published Wire server
+image whenever you redeploy or update the custom app. The `/data` and `/backups`
+datasets remain mounted and are not replaced. TrueNAS does not currently apply
+custom-app updates silently, so use **Update** or save/redeploy the app when an
+update is reported.
+

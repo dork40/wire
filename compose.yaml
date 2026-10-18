@@ -1,6 +1,6 @@
 services:
   wire-server:
-    image: ghcr.io/dork40/wire-server:1.4.28
+    image: ghcr.io/dork40/wire-server:latest
     pull_policy: always
     container_name: wire-server
     restart: unless-stopped
@@ -17,7 +17,7 @@ services:
       - ./wire-server-data:/data
       - ./wire-server-backups:/backups
   wire-web:
-    image: ghcr.io/dork40/wire-server:1.4.28
+    image: ghcr.io/dork40/wire-server:latest
     pull_policy: always
     restart: unless-stopped
     command: ["python", "/app/wire-web.py"]

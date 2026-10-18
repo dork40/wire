@@ -14,7 +14,7 @@ try {
 @"
 services:
   wire-server:
-    image: ghcr.io/dork40/wire-server:1.4.28
+    image: ghcr.io/dork40/wire-server:latest
     pull_policy: always
     restart: unless-stopped
     environment:
@@ -30,7 +30,7 @@ services:
       - /mnt/nvme/wire:/data
       - /mnt/nvme/wire-backups:/backups
   wire-web:
-    image: ghcr.io/dork40/wire-server:1.4.28
+    image: ghcr.io/dork40/wire-server:latest
     pull_policy: always
     restart: unless-stopped
     command: ["python", "/app/wire-web.py"]
