@@ -32,7 +32,7 @@ jobs:
             --static-auth-secret=wire-ci-turn-secret-at-least-32-bytes \
             --realm=wire.test --min-port=49160 --max-port=49200 \
             --listening-ip="$TURN_TEST_IP" --relay-ip="$TURN_TEST_IP" \
-            --no-cli --no-tls --no-dtls --log-file=stdout
+            --no-tls --no-dtls --log-file=stdout
           TURN_TEST_IP="$TURN_TEST_IP" python - <<'PY'
           import os, socket, struct, time
           tx = os.urandom(12)

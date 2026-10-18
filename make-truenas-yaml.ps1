@@ -56,7 +56,6 @@ services:
       - --external-ip=$publicAddress/192.168.1.199
       - --min-port=49160
       - --max-port=49200
-      - --no-cli
       - --no-tls
       - --no-dtls
       - --no-multicast-peers
