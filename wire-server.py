@@ -23,7 +23,7 @@ from cryptography.x509.oid import NameOID
 
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.25"
+SERVER_VERSION = "1.4.26"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
@@ -32,6 +32,7 @@ USERS_FILE = STATE / "users.json"
 GROUPS_FILE = STATE / "groups.json"
 BACKUPS_FILE = STATE / "identity-backups.json"
 QUEUES_FILE = STATE / "offline-queue.json"
+SYNC_FILE = STATE / "encrypted-sync.json"
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str, str]] = {}
 # A client can be sent packets by its own handler and by any number of other
@@ -45,6 +46,10 @@ MAX_CLIENT_FRAME_BYTES = 256 * 1024
 MAX_OFFLINE_QUEUE_PACKETS = 250
 MAX_OFFLINE_QUEUE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_OFFLINE_QUEUE_BYTES = 512 * 1024 * 1024
+MAX_SYNC_MESSAGES_PER_USER = 1000
+MAX_SYNC_BLOB_BYTES = 64 * 1024
+MAX_SYNC_BYTES_PER_USER = 16 * 1024 * 1024
+MAX_SYNC_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_GROUP_MEMBERS = 100
 RELAY_RATE_BYTES_PER_SECOND = 40 * 1024 * 1024
 RELAY_RATE_BURST_BYTES = 64 * 1024 * 1024
@@ -59,6 +64,7 @@ RECOVERY_WINDOW_SECONDS = 15 * 60
 MAX_RECOVERY_ATTEMPTS = 5
 SERVER_KEY_LOCK = threading.Lock()
 SERVER_SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
+STARTED_AT = time.time()
 
 
 def turn_credentials(name: str) -> dict | None:
@@ -205,6 +211,22 @@ def load_queues() -> dict:
 
 def save_queues(queues: dict) -> None:
     replace_private_json(QUEUES_FILE, json.dumps(queues, separators=(",", ":")))
+
+
+def load_sync() -> dict:
+    try:
+        value = json.loads(SYNC_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_sync(value: dict) -> None:
+    replace_private_json(SYNC_FILE, json.dumps(value, separators=(",", ":")))
+
+
+def valid_sync_blob(value: object) -> bool:
+    return isinstance(value, str) and 1 <= len(value.encode("ascii", errors="ignore")) <= MAX_SYNC_BLOB_BYTES
 
 
 def valid_group_name(value: object) -> bool:
@@ -567,6 +589,59 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                         account["allow_group_invites"] = bool(packet.get("allow_group_invites", True))
                         account["dnd"] = bool(packet.get("dnd", False))
                         save_users(users)
+            elif kind == "sync_put_settings":
+                blob = packet.get("blob")
+                if not valid_sync_blob(blob):
+                    send(sock, {"type": "error", "message": "invalid encrypted settings sync"}); continue
+                with LOCK:
+                    synced = load_sync(); account_sync = synced.setdefault(key, {"messages": {}})
+                    account_sync["settings"] = blob; save_sync(synced)
+                send(sock, {"type": "sync_saved", "kind": "settings"})
+            elif kind == "sync_put_message":
+                message_id, blob = packet.get("id"), packet.get("blob")
+                if not (isinstance(message_id, str) and len(message_id) == 32
+                        and all(char in "0123456789abcdef" for char in message_id) and valid_sync_blob(blob)):
+                    send(sock, {"type": "error", "message": "invalid encrypted message sync"}); continue
+                with LOCK:
+                    synced = load_sync(); account_sync = synced.setdefault(key, {"messages": {}})
+                    messages = account_sync.setdefault("messages", {})
+                    messages[message_id] = blob
+                    while (len(messages) > MAX_SYNC_MESSAGES_PER_USER
+                           or sum(len(item) for item in messages.values() if isinstance(item, str)) > MAX_SYNC_BYTES_PER_USER):
+                        messages.pop(next(iter(messages)))
+                    encoded = json.dumps(synced, separators=(",", ":"))
+                    if len(encoded.encode("utf-8")) <= MAX_SYNC_TOTAL_BYTES:
+                        replace_private_json(SYNC_FILE, encoded)
+            elif kind == "sync_fetch":
+                with LOCK:
+                    account_sync = load_sync().get(key, {})
+                    setting_blob = account_sync.get("settings") if valid_sync_blob(account_sync.get("settings")) else None
+                    items = [[message_id, blob] for message_id, blob in account_sync.get("messages", {}).items()
+                             if isinstance(message_id, str) and valid_sync_blob(blob)]
+                if not items:
+                    send(sock, {"type": "sync_state", "settings": setting_blob, "messages": [], "done": True})
+                else:
+                    first = True
+                    while items:
+                        batch = []
+                        while items:
+                            trial = batch + [items[0]]
+                            candidate = {"type": "sync_state", "settings": setting_blob if first else None,
+                                         "messages": trial, "done": False}
+                            if batch and packet_size(candidate) > 200 * 1024:
+                                break
+                            batch.append(items.pop(0))
+                        send(sock, {"type": "sync_state", "settings": setting_blob if first else None,
+                                    "messages": batch, "done": not items})
+                        first = False
+            elif kind == "server_stats":
+                with LOCK:
+                    users, groups, queues = load_users(), load_groups(), load_queues()
+                    queued_packets = sum(len(items) for items in queues.values() if isinstance(items, list))
+                    status = {"type": "server_stats", "version": SERVER_VERSION, "uptime": int(time.time() - STARTED_AT),
+                              "online": len(ONLINE), "accounts": len(users), "groups": len(groups),
+                              "queued_packets": queued_packets, "turn": bool(TURN_SECRET and TURN_URLS)}
+                send(sock, status)
             elif kind == "identity_backup":
                 backup = packet.get("backup")
                 if not valid_identity_backup(backup):

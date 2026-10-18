@@ -31,7 +31,7 @@ from typing import Callable, Optional
 
 from cryptography import x509
 from cryptography.exceptions import InvalidTag
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -1293,6 +1293,68 @@ class Wire:
             self.server_send({"type": "preferences", "dnd": self.settings["do_not_disturb"],
                               "allow_group_invites": self.settings["allow_group_invites"]})
 
+    def sync_settings(self) -> None:
+        if not self.server or not self.history_key:
+            return
+        payload = json.dumps({"updated": time.time_ns(), "settings": self.settings}, separators=(",", ":")).encode("utf-8")
+        blob = Fernet(self.history_key).encrypt(payload).decode("ascii")
+        try:
+            self.server_send({"type": "sync_put_settings", "blob": blob})
+        except (OSError, ConnectionError):
+            pass
+
+    def sync_record(self, peer_name: str, record: dict) -> None:
+        if not self.server or not self.history_key or not valid_transfer_id(record.get("id")):
+            return
+        if not re.fullmatch(r"(?:group-)?[A-Za-z0-9_-]{3,40}", peer_name):
+            return
+        payload = json.dumps({"peer": peer_name, "record": record}, separators=(",", ":")).encode("utf-8")
+        blob = Fernet(self.history_key).encrypt(payload).decode("ascii")
+        try:
+            self.server_send({"type": "sync_put_message", "id": record["id"], "blob": blob})
+        except (OSError, ConnectionError):
+            pass
+
+    def apply_sync_state(self, packet: dict) -> None:
+        if not self.history_key:
+            return
+        setting_blob = packet.get("settings")
+        if isinstance(setting_blob, str):
+            try:
+                value = json.loads(Fernet(self.history_key).decrypt(setting_blob.encode("ascii")))
+                remote = value.get("settings") if isinstance(value, dict) else None
+                if isinstance(remote, dict):
+                    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                    replace_private_bytes(SETTINGS_FILE, json.dumps(remote).encode("utf-8"))
+                    self.settings = load_settings()
+            except (ValueError, InvalidTag, InvalidToken, json.JSONDecodeError):
+                pass
+        elif packet.get("done") and not packet.get("messages"):
+            self.sync_settings()
+        for item in packet.get("messages", []):
+            try:
+                message_id, blob = item
+                value = json.loads(Fernet(self.history_key).decrypt(blob.encode("ascii")))
+                peer_name, record = value["peer"], value["record"]
+                if (not re.fullmatch(r"(?:group-)?[A-Za-z0-9_-]{3,40}", peer_name)
+                        or not isinstance(record, dict) or record.get("id") != message_id
+                        or not valid_transfer_id(message_id)
+                        or not isinstance(record.get("from"), str)
+                        or not isinstance(record.get("text", ""), str)
+                        or len(record.get("text", "")) > MAX_MESSAGE_CHARS):
+                    continue
+                with self.history_lock:
+                    records = self.read_history(peer_name)
+                    existing = next((index for index, saved in enumerate(records) if saved.get("id") == message_id), None)
+                    if existing is None:
+                        records.append(record)
+                    else:
+                        records[existing] = record
+                    encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
+                    replace_private_bytes(self.history_path(peer_name), encrypted)
+            except (ValueError, TypeError, KeyError, InvalidTag, InvalidToken, json.JSONDecodeError):
+                continue
+
     def notifications_allowed(self) -> bool:
         return bool(self.settings["notifications"] and not self.settings["do_not_disturb"])
 
@@ -1416,6 +1478,7 @@ class Wire:
                     elif selected == 16:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
+                    self.sync_settings()
                     self.apply_voice_settings()
                     self.sync_preferences()
             elif key in ("enter", "escape") and selected == 17:
@@ -1453,6 +1516,7 @@ class Wire:
             raise ValueError("that is not a valid voice device") from exc
         self.settings[f"voice_{direction}"] = index
         save_settings(self.settings)
+        self.sync_settings()
         say(f"voice {direction} set to {index}: {device['name']}")
 
     def set_voice_mode(self, value: str) -> None:
@@ -1460,6 +1524,7 @@ class Wire:
             raise ValueError("use: settings voice mode open|ptt")
         self.settings["voice_mode"] = value
         save_settings(self.settings)
+        self.sync_settings()
         self.apply_voice_settings()
         say("voice is always on" if value == "open" else "voice is push-to-talk (hold F12)")
 
@@ -1470,6 +1535,7 @@ class Wire:
         self.settings["voice_echo"] = value == "on"
         self.settings["voice_noise"] = 2 if value == "on" else 0
         save_settings(self.settings)
+        self.sync_settings()
         self.apply_voice_settings()
         say(f"voice effects {value}")
 
@@ -1478,6 +1544,7 @@ class Wire:
             raise ValueError("use: settings notifications on|off")
         self.settings["notifications"] = value == "on"
         save_settings(self.settings)
+        self.sync_settings()
         say(f"notifications {value}")
 
     def delete_account(self) -> None:
@@ -1520,14 +1587,18 @@ class Wire:
             records.append({"id": message_id, "at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text, "reply_to": reply_to, "reactions": []})
             encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
             replace_private_bytes(self.history_path(peer_name), encrypted)
+            changed = records[-1]
+        self.sync_record(peer_name, changed)
         return message_id
 
-    def save_history(self, peer_name: str, records: list[dict]) -> None:
+    def save_history(self, peer_name: str, records: list[dict], changed: dict | None = None) -> None:
         self.require_login()
         if not self.history_key:
             raise ValueError("sign in first")
         encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
         replace_private_bytes(self.history_path(peer_name), encrypted)
+        if changed:
+            self.sync_record(peer_name, changed)
 
     def matching_message(self, peer_name: str, prefix: str, own_only: bool = False) -> tuple[list[dict], dict]:
         records = self.read_history(peer_name)
@@ -1625,14 +1696,14 @@ class Wire:
         if target.get("deleted"):
             raise ValueError("cannot edit a deleted message")
         target["text"], target["edited"] = text, True
-        self.save_history(peer.name, records)
+        self.save_history(peer.name, records, target)
         peer.send_control({"kind": "message_edit", "id": target["id"], "text": text})
         say(f"edited message {target['id'][:6]}")
 
     def delete_message(self, peer: Peer, prefix: str) -> None:
         records, target = self.matching_message(peer.name, prefix, own_only=True)
         target["deleted"], target["text"] = True, ""
-        self.save_history(peer.name, records)
+        self.save_history(peer.name, records, target)
         peer.send_control({"kind": "message_delete", "id": target["id"]})
         say(f"deleted message {target['id'][:6]}")
 
@@ -1643,7 +1714,7 @@ class Wire:
         token = f"{self.name}:{reaction}"
         reactions = [item for item in target.get("reactions", []) if not str(item).startswith(f"{self.name}:")]
         reactions.append(token); target["reactions"] = reactions
-        self.save_history(peer.name, records)
+        self.save_history(peer.name, records, target)
         peer.send_control({"kind": "message_react", "id": target["id"], "reaction": reaction})
 
     @staticmethod
@@ -2600,7 +2671,7 @@ class Wire:
                 return
             target["delivered"] = True
             if kind == "message_read": target["read"] = True
-            self.save_history(peer.name, records)
+            self.save_history(peer.name, records, target)
             return
         if kind == "message_react" and isinstance(control.get("reaction"), str) and 0 < len(control["reaction"]) <= 24:
             reaction = control["reaction"]
@@ -2615,7 +2686,7 @@ class Wire:
             say(f"\n{peer.name} deleted message {message_id[:6]}")
         else:
             return
-        self.save_history(peer.name, records)
+        self.save_history(peer.name, records, target)
         redraw_prompt()
 
     def receive_loop(self, peer: Peer) -> None:
@@ -2681,6 +2752,7 @@ class Wire:
                 )
             replace_private_bytes(SERVER_CONFIG, json.dumps({"host": host, "port": port}).encode("utf-8"))
             self.start_worker(self.server_loop, sock)
+            self.server_send({"type": "sync_fetch"})
             self.sync_preferences()
             self.backup_identity()
             version = reply.get("version")
@@ -2941,6 +3013,16 @@ class Wire:
                     # Routine login backup succeeded. Avoid an async startup
                     # line here; it can arrive exactly as the first prompt opens.
                     pass
+                elif kind == "sync_state":
+                    self.apply_sync_state(packet)
+                elif kind == "sync_saved":
+                    pass
+                elif kind == "server_stats":
+                    uptime = int(packet.get("uptime", 0))
+                    say("\nWIRE SERVER STATUS")
+                    say(f"version {packet.get('version', '?')}; uptime {uptime // 86400}d {(uptime % 86400) // 3600}h")
+                    say(f"online {packet.get('online', 0)}; accounts {packet.get('accounts', 0)}; groups {packet.get('groups', 0)}")
+                    say(f"queued packets {packet.get('queued_packets', 0)}; TURN {'enabled' if packet.get('turn') else 'disabled'}")
                 elif kind == "accepted":
                     self.attach_relay_peer(packet["name"], packet["public"], packet["sign_public"], packet["identity_signature"])
                 elif kind == "relay":
@@ -3160,6 +3242,7 @@ SETTINGS AND UTILITIES
   /checkupdate                       Check whether a newer version exists.
   /exit                              Close the active chat but keep Wire open.
   /quit                              Close Wire.
+  /server stats                      Show privacy-safe directory health totals.
 
 Typing indicators clear automatically five seconds after typing stops."""
 
@@ -3450,6 +3533,9 @@ def main() -> None:
                     app.end_call(room_peer)
                 elif command == "server":
                     pieces = argument.split()
+                    if pieces == ["stats"]:
+                        app.server_send({"type": "server_stats"})
+                        continue
                     if len(pieces) > 2:
                         raise ValueError("use: server [host] [port]")
                     app.connect_server(pieces[0] if pieces else "127.0.0.1",
