@@ -95,5 +95,18 @@ jobs:
             exit 0
           fi
           notes=$(mktemp)
-          printf '## Updating\n\n%s\n\n## What changed\n\n' "$INSTRUCTIONS" > "$notes"
+          case "$TAG" in
+            server-v*) match='server-v*' ;;
+            truenas-v*) match='truenas-v*' ;;
+            *) match='v*' ;;
+          esac
+          previous=$(git describe --tags --abbrev=0 "$TAG^" --match "$match" 2>/dev/null || true)
+          changes=""
+          if [ -n "$previous" ]; then
+            changes=$(git log --format='- %s' "$previous..$TAG" | grep -Ev '^- (Sign|Authorize final) Wire v' || true)
+          fi
+          if [ -z "$changes" ]; then
+            changes='- Maintenance and compatibility improvements.'
+          fi
+          printf '## Updating\n\n%s\n\n## What changed\n\n%s\n\n' "$INSTRUCTIONS" "$changes" > "$notes"
           gh release create "$TAG" --verify-tag --title "$TITLE" --generate-notes --notes-file "$notes"
