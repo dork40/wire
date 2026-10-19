@@ -105,8 +105,27 @@ class WebConsoleTests(unittest.TestCase):
                 expected_fingerprint = " ".join(hashlib.sha256(identity_public).hexdigest().upper()[i:i + 4] for i in range(0, 64, 4))
                 self.assertIn(expected_fingerprint, account_page)
                 self.assertIn("Security boundaries", status)
+                with self.assertRaises(urllib.error.HTTPError) as rejected_logout:
+                    urllib.request.urlopen(urllib.request.Request(base + "/logout", headers={"Cookie": cookie.split(";", 1)[0]}))
+                self.assertEqual(rejected_logout.exception.code, 405)
+                logout = urllib.request.Request(base + "/logout", data=b"", method="POST",
+                                                headers={"Cookie": cookie.split(";", 1)[0]})
+                try: opener.open(logout)
+                except urllib.error.HTTPError as response: self.assertEqual(response.code, 303)
             finally:
                 server.shutdown(); server.server_close(); worker.join(timeout=2)
+
+    def test_malformed_account_metadata_does_not_crash_pages(self):
+        web = load_web()
+        with tempfile.TemporaryDirectory() as folder:
+            web.STATE = Path(folder); web.BACKUPS = Path(folder)
+            (web.STATE / "users.json").write_text(json.dumps({"alice": {"name": "Alice", "friends": "not-a-list", "public": "broken"},
+                                                               "bob": "not-an-account"}), encoding="utf-8")
+            (web.STATE / "groups.json").write_text(json.dumps({"bad": {"name": "Bad", "members": "alice"}}), encoding="utf-8")
+            for page in (web.overview_page, web.people_page, web.groups_page, web.account_page):
+                rendered = page("alice").decode("utf-8")
+                self.assertIn("Wire", rendered)
+            self.assertIn("Unavailable", web.account_page("alice").decode("utf-8"))
 
     def test_legacy_account_without_kdf_uses_client_compatible_defaults(self):
         web = load_web()
@@ -127,6 +146,20 @@ class WebConsoleTests(unittest.TestCase):
 
             self.assertEqual(web.verify_account("dorki", password), account)
             self.assertIsNone(web.verify_account("dorki", "wrong password"))
+
+    def test_web_login_rejects_excessive_kdf_before_derivation(self):
+        web = load_web()
+        with tempfile.TemporaryDirectory() as folder:
+            web.STATE = Path(folder)
+            backup = {"salt": base64.b64encode(b"0123456789abcdef").decode(),
+                      "kdf": {"n": 2**20, "r": 32, "p": 16}, "ciphertext": "unused"}
+            (web.STATE / "identity-backups.json").write_text(json.dumps({"alice": backup}), encoding="utf-8")
+            original = web.hashlib.scrypt
+            def unexpected_derivation(*args, **kwargs):
+                raise AssertionError("unsafe KDF reached scrypt")
+            web.hashlib.scrypt = unexpected_derivation
+            try: self.assertIsNone(web.verify_account("alice", "password"))
+            finally: web.hashlib.scrypt = original
 
 
 if __name__ == "__main__": unittest.main()

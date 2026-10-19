@@ -44,6 +44,15 @@ New installs automatically connect to the Wire username directory at
 - Kept the dashboard privacy-safe: it does not display message contents,
   passwords, or private identity keys.
 
+## What's new in server 1.4.33
+
+- Added a visible mobile sign-out control and changed sign-out to a POST action.
+- Prevented malformed account, friend, and group records from crashing pages.
+- Made backup inventory resilient when files change during a dashboard refresh.
+- Restricted Web login KDF parameters to Wire's exact safe client whitelist,
+  preventing malicious backups from triggering excessive memory or CPU use.
+- Added regression coverage for damaged state, safe logout, and unsafe KDF data.
+
 ## Private self-hosted server
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with

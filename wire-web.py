@@ -26,10 +26,15 @@ def esc(value): return html.escape(str(value))
 
 def backup_inventory(limit=8):
     """Return recent backup metadata and verify every displayed archive."""
-    archives = sorted(BACKUPS.glob("wire-state-*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
+    archives = []
+    for item in BACKUPS.glob("wire-state-*.zip"):
+        try: archives.append((item.stat().st_mtime, item))
+        except OSError: continue
+    archives.sort(key=lambda item: item[0], reverse=True)
     entries = []
-    for latest in archives[:limit]:
+    for _, latest in archives[:limit]:
         try:
+            stat = latest.stat()
             with zipfile.ZipFile(latest) as archive:
                 manifest = json.loads(archive.read("manifest.json"))
                 hashes = manifest.get("files") if manifest.get("format") == 1 else None
@@ -44,8 +49,10 @@ def backup_inventory(limit=8):
             ok = True
         except (OSError, KeyError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
             ok = False
-        entries.append({"name": latest.name, "ok": ok, "age": max(0, int(time.time() - latest.stat().st_mtime)),
-                        "size": latest.stat().st_size})
+            try: stat = latest.stat()
+            except OSError: continue
+        entries.append({"name": latest.name, "ok": ok, "age": max(0, int(time.time() - stat.st_mtime)),
+                        "size": stat.st_size})
     return entries
 
 def verify_latest_backup():
@@ -78,7 +85,7 @@ def server_security_status():
     return {"identity": identity_ok, "turn": turn_reachable(), "backup": backup}
 
 STYLE = """
-:root{--bg:#07090d;--panel:#0d1219;--card:#121922;--line:#252e3b;--text:#f4f7fb;--muted:#8e9aac;--mint:#6ee7c8;--blue:#79a8ff;--danger:#ff8e9a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -10%,#173f40,transparent 32%),var(--bg);color:var(--text);font:15px Inter,Segoe UI,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:250px 1fr;min-height:100vh}aside{border-right:1px solid var(--line);padding:28px 18px;background:#090c11ee;position:sticky;top:0;height:100vh}.brand{font-size:22px;font-weight:900;letter-spacing:.18em;margin:0 10px 36px}.brand i{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--mint);box-shadow:0 0 22px var(--mint);margin-right:11px}nav{display:grid;gap:6px}nav a{color:var(--muted);padding:12px 14px;border-radius:11px;text-decoration:none}nav a:hover{background:#121a23;color:var(--text)}nav a.on{background:var(--mint);color:#07110f;font-weight:800}.logout{position:absolute;bottom:25px;left:18px;right:18px}main{padding:42px;max-width:1220px;width:100%;margin:auto}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:32px;margin:0 0 6px}h2{font-size:17px;margin:0 0 17px}.muted,small{color:var(--muted)}.live,.pill{display:inline-flex;border:1px solid #31574e;background:#10221e;color:var(--mint);padding:7px 12px;border-radius:999px;font-weight:700}.pill{padding:4px 9px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.card{grid-column:span 4;background:linear-gradient(145deg,#131a23,#0d1218);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 18px 50px #0004}.wide{grid-column:span 8}.full{grid-column:1/-1}.num{font-size:34px;font-weight:850;margin-top:8px}.list-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 2px;border-bottom:1px solid #1d2631}.list-row:last-child{border:0}.person{display:flex;align-items:center;gap:13px}.avatar{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:#1b2c31;color:var(--mint);font-weight:850}.stack{display:flex;flex-direction:column;gap:3px}.note{color:#b5bfcc;line-height:1.7}.ok{color:var(--mint)}.bad{color:var(--danger)}.metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1d2631}.metric:last-child{border:0}.login{width:min(430px,calc(100% - 32px));margin:12vh auto;padding:36px}.login.card{display:block}label{display:block;color:var(--muted);margin:18px 0 7px}input{width:100%;border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:#090d12;color:var(--text);font:inherit;outline:none}input:focus{border-color:var(--mint)}button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:11px;background:var(--mint);color:#07110f;font-weight:850;font:inherit;cursor:pointer}.error{color:var(--danger);margin-top:16px}.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:13px}@media(max-width:780px){.shell{display:block}aside{height:auto;position:static;border-right:0;border-bottom:1px solid var(--line);padding:18px}.brand{margin:0 0 14px}nav{grid-template-columns:repeat(5,1fr)}nav a{text-align:center;padding:10px 4px;font-size:12px}.logout{position:static;display:none}main{padding:24px 16px}.card,.wide{grid-column:1/-1}header{align-items:start}.live{font-size:12px}}
+:root{--bg:#07090d;--panel:#0d1219;--card:#121922;--line:#252e3b;--text:#f4f7fb;--muted:#8e9aac;--mint:#6ee7c8;--blue:#79a8ff;--danger:#ff8e9a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -10%,#173f40,transparent 32%),var(--bg);color:var(--text);font:15px Inter,Segoe UI,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:250px 1fr;min-height:100vh}aside{border-right:1px solid var(--line);padding:28px 18px;background:#090c11ee;position:sticky;top:0;height:100vh}.brand{font-size:22px;font-weight:900;letter-spacing:.18em;margin:0 10px 36px}.brand i{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--mint);box-shadow:0 0 22px var(--mint);margin-right:11px}nav{display:grid;gap:6px}nav a{color:var(--muted);padding:12px 14px;border-radius:11px;text-decoration:none}nav a:hover{background:#121a23;color:var(--text)}nav a.on{background:var(--mint);color:#07110f;font-weight:800}.logout{position:absolute;bottom:25px;left:18px;right:18px}.logout button{margin:0;background:#141b24;color:var(--muted);border:1px solid var(--line)}main{padding:42px;max-width:1220px;width:100%;margin:auto}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:32px;margin:0 0 6px}h2{font-size:17px;margin:0 0 17px}.muted,small{color:var(--muted)}.live,.pill{display:inline-flex;border:1px solid #31574e;background:#10221e;color:var(--mint);padding:7px 12px;border-radius:999px;font-weight:700}.pill{padding:4px 9px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.card{grid-column:span 4;background:linear-gradient(145deg,#131a23,#0d1218);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 18px 50px #0004}.wide{grid-column:span 8}.full{grid-column:1/-1}.num{font-size:34px;font-weight:850;margin-top:8px}.list-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 2px;border-bottom:1px solid #1d2631}.list-row:last-child{border:0}.person{display:flex;align-items:center;gap:13px}.avatar{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:#1b2c31;color:var(--mint);font-weight:850}.stack{display:flex;flex-direction:column;gap:3px}.note{color:#b5bfcc;line-height:1.7}.ok{color:var(--mint)}.bad{color:var(--danger)}.metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1d2631}.metric:last-child{border:0}.login{width:min(430px,calc(100% - 32px));margin:12vh auto;padding:36px}.login.card{display:block}label{display:block;color:var(--muted);margin:18px 0 7px}input{width:100%;border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:#090d12;color:var(--text);font:inherit;outline:none}input:focus{border-color:var(--mint)}button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:11px;background:var(--mint);color:#07110f;font-weight:850;font:inherit;cursor:pointer}.error{color:var(--danger);margin-top:16px}.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:13px}@media(max-width:780px){.shell{display:block}aside{height:auto;position:static;border-right:0;border-bottom:1px solid var(--line);padding:18px}.brand{margin:0 0 14px}nav{grid-template-columns:repeat(5,1fr)}nav a{text-align:center;padding:10px 4px;font-size:12px}.logout{position:static;margin-top:12px}main{padding:24px 16px}.card,.wide{grid-column:1/-1}header{align-items:start}.live{font-size:12px}}
 """
 
 def shell(content, title="Wire"):
@@ -97,7 +104,9 @@ def verify_account(username, password):
         # choosing a newer default derives a different key and rejects the
         # user's otherwise-correct password.
         kdf = backup.get("kdf") or {}; n, r, p = int(kdf.get("n", 2**14)), int(kdf.get("r", 8)), int(kdf.get("p", 1))
-        if not (2**14 <= n <= 2**20 and 1 <= r <= 32 and 1 <= p <= 16): return None
+        # Match the client whitelist exactly. Merely bounding each number still
+        # permits combinations whose memory/work cost can exhaust the web host.
+        if n not in (2**14, 2**15, 2**16, 2**17) or r != 8 or not 1 <= p <= 5: return None
         salt = base64.b64decode(backup["salt"], validate=True)
         secret = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, dklen=32)
         account = json.loads(Fernet(base64.urlsafe_b64encode(secret)).decrypt(backup["ciphertext"].encode()))
@@ -131,7 +140,10 @@ def state_size():
 def user_context(username):
     users, groups = load("users.json", {}), load("groups.json", {})
     record = users.get(username, {})
-    friends = [item for item in record.get("friends", []) if isinstance(item, str) and item in users]
+    if not isinstance(record, dict): record = {}
+    raw_friends = record.get("friends", [])
+    if not isinstance(raw_friends, list): raw_friends = []
+    friends = [item for item in raw_friends if isinstance(item, str) and isinstance(users.get(item), dict)]
     memberships = [group for group in groups.values() if isinstance(group, dict)
                    and isinstance(group.get("members"), list) and username in group["members"]]
     return users, groups, record, friends, memberships
@@ -141,7 +153,7 @@ def app_page(username, active, title, subtitle, content):
              ("groups", "/groups", "Groups"), ("account", "/account", "Account"),
              ("server", "/server", "Server"))
     nav = "".join(f'<a class="{"on" if active == key else ""}" href="{href}">{label}</a>' for key, href, label in links)
-    return shell(f'<div class="shell"><aside><div class="brand"><i></i>WIRE</div><nav>{nav}</nav><a class="logout muted" href="/logout">Sign out</a></aside><main><header><div><h1>{esc(title)}</h1><div class="muted">{esc(subtitle)}</div></div><div class="live">● Connected</div></header>{content}</main></div>', f'{title} · Wire')
+    return shell(f'<div class="shell"><aside><div class="brand"><i></i>WIRE</div><nav>{nav}</nav><form class="logout" method="post" action="/logout"><button>Sign out</button></form></aside><main><header><div><h1>{esc(title)}</h1><div class="muted">{esc(subtitle)}</div></div><div class="live">&#9679; Connected</div></header>{content}</main></div>', f'{title} - Wire')
 
 def people_rows(friends, users):
     if not friends: return '<div class="empty">No friends yet. Add people from the Wire terminal with <b>/friend username</b>.</div>'
@@ -222,7 +234,8 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(10)
     def session_user(self):
-        item = cookies.SimpleCookie(self.headers.get("Cookie", "")).get("wire_session")
+        try: item = cookies.SimpleCookie(self.headers.get("Cookie", "")).get("wire_session")
+        except cookies.CookieError: return None
         if not item: return None
         with LOCK:
             session = SESSIONS.get(item.value)
@@ -239,11 +252,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health": self.reply(200, b'{"ok":true,"service":"wire-web"}', "application/json"); return
-        if path == "/logout":
-            item = cookies.SimpleCookie(self.headers.get("Cookie", "")).get("wire_session")
-            if item:
-                with LOCK: SESSIONS.pop(item.value, None)
-            self.reply(303, b"", "text/plain", {"Location":"/", "Set-Cookie":"wire_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"}); return
+        if path == "/logout": self.reply(405, b"method not allowed", "text/plain", {"Allow":"POST"}); return
         user = self.session_user()
         if not user:
             if path in ("/", "/people", "/groups", "/account", "/server"): self.reply(200, login_page()); return
@@ -254,7 +263,14 @@ class Handler(BaseHTTPRequestHandler):
         if not page: self.reply(404, b"not found", "text/plain"); return
         self.reply(200, page(user))
     def do_POST(self):
-        if urlparse(self.path).path != "/login": self.reply(404, b"not found", "text/plain"); return
+        path = urlparse(self.path).path
+        if path == "/logout":
+            try: item = cookies.SimpleCookie(self.headers.get("Cookie", "")).get("wire_session")
+            except cookies.CookieError: item = None
+            if item:
+                with LOCK: SESSIONS.pop(item.value, None)
+            self.reply(303, b"", "text/plain", {"Location":"/", "Set-Cookie":"wire_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"}); return
+        if path != "/login": self.reply(404, b"not found", "text/plain"); return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 1 <= length <= 4096: raise ValueError
