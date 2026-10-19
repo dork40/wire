@@ -80,7 +80,11 @@ def verify_account(username, password):
     backup = load("identity-backups.json", {}).get(username.lower())
     if not isinstance(backup, dict): return None
     try:
-        kdf = backup.get("kdf") or {}; n, r, p = int(kdf.get("n", 2**17)), int(kdf.get("r", 8)), int(kdf.get("p", 1))
+        # Accounts created before KDF metadata was stored use the client's
+        # legacy scrypt parameters. Matching that exact fallback is required:
+        # choosing a newer default derives a different key and rejects the
+        # user's otherwise-correct password.
+        kdf = backup.get("kdf") or {}; n, r, p = int(kdf.get("n", 2**14)), int(kdf.get("r", 8)), int(kdf.get("p", 1))
         if not (2**14 <= n <= 2**20 and 1 <= r <= 32 and 1 <= p <= 16): return None
         salt = base64.b64decode(backup["salt"], validate=True)
         secret = hashlib.scrypt(password.encode(), salt=salt, n=n, r=r, p=p, dklen=32)

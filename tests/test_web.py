@@ -91,5 +91,25 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 server.shutdown(); server.server_close(); worker.join(timeout=2)
 
+    def test_legacy_account_without_kdf_uses_client_compatible_defaults(self):
+        web = load_web()
+        with tempfile.TemporaryDirectory() as folder:
+            web.STATE = Path(folder)
+            password, salt = "legacy password", b"legacy-salt-1234"
+            secret = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+            account = {"name": "dorki", "private": "encrypted"}
+            backup = {
+                "salt": base64.b64encode(salt).decode(),
+                "ciphertext": Fernet(base64.urlsafe_b64encode(secret)).encrypt(
+                    json.dumps(account).encode()
+                ).decode(),
+            }
+            (web.STATE / "identity-backups.json").write_text(
+                json.dumps({"dorki": backup}), encoding="utf-8"
+            )
+
+            self.assertEqual(web.verify_account("dorki", password), account)
+            self.assertIsNone(web.verify_account("dorki", "wrong password"))
+
 
 if __name__ == "__main__": unittest.main()
