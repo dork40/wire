@@ -1261,6 +1261,10 @@ class Wire:
                 say(f"network candidates: {kinds}; TURN: " +
                     ("reachable" if result["turn_reachable"] else
                      "configured but unreachable" if result["turn_configured"] else "not configured"))
+                if result["turn_configured"] and not result["turn_reachable"]:
+                    say("TURN fix: forward UDP and TCP 3478 plus UDP 49160-49200 to the TURN server, then run /diagnose network again.")
+                elif result["turn_reachable"]:
+                    say("TURN relay candidate verified; restrictive-network calls and shares can use the encrypted relay.")
             except Exception as exc:
                 say(f"network test failed: {type(exc).__name__}: {exc}")
 

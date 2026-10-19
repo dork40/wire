@@ -65,7 +65,7 @@ directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
-Wire v1.4.65 requires directory server v1.4.22 or newer for authenticated TLS;
+Wire v1.4.66 requires directory server v1.4.22 or newer for authenticated TLS;
 server v1.4.29 is recommended for encrypted multi-device sync, server status,
 and automatic verified state backups. The authenticated web dashboard verifies
 the newest backup checksum and probes the local TURN listener instead of merely

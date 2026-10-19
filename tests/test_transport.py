@@ -30,6 +30,22 @@ def load_server_module():
 
 
 class TransportTests(unittest.TestCase):
+    def test_network_diagnostics_explains_missing_turn_forwarding(self):
+        app = wire.Wire()
+        app.server = object()
+        app.directory_public = b"directory"
+        app.turn_configured = True
+        old_diagnostics, old_say = wire.network_diagnostics, wire.say
+        lines = []
+        wire.network_diagnostics = lambda: {"candidate_types": ["host", "srflx"],
+                                            "turn_configured": True, "turn_reachable": False}
+        wire.say = lines.append
+        try:
+            app.diagnose(network=True)
+        finally:
+            wire.network_diagnostics, wire.say = old_diagnostics, old_say
+        self.assertTrue(any("UDP and TCP 3478" in line and "49160-49200" in line for line in lines))
+
     def test_background_completion_restarts_only_an_empty_prompt(self):
         class Loop:
             @staticmethod
