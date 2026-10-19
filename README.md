@@ -36,6 +36,8 @@ New installs automatically connect to the Wire username directory at
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with
 local-only defaults, persistent state, backups, and a clickable status web UI.
+Its install form can also enable a hardened authenticated Coturn relay without
+copying a permanent TURN secret into the client.
 After installing it, point each Wire client at the NAS:
 
 ```text

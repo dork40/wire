@@ -3,7 +3,9 @@
 This package installs a private Wire username directory, encrypted packet relay,
 backups, and the Wire status web UI. By default it only becomes reachable on
 networks that can already reach the TrueNAS host; it does not configure a router,
-UPnP, public DNS, or a public TURN relay.
+UPnP, or public DNS. An optional authenticated TURN relay can be enabled in the
+install form when the owner supplies its public hostname plus the NAS public and
+private IPv4 addresses.
 
 Every GitHub server release publishes a new container and updates this catalog
 definition to its immutable verified digest. TrueNAS then reports an available
@@ -26,8 +28,10 @@ host and port, so a changed server key is refused rather than silently trusted.
 Only TCP port `47666` is required for private chat, discovery, groups, encrypted
 file relay, and screen-share signaling. The web UI defaults to port `30097` and
 appears as a clickable portal on the installed app. Calls and screen sharing can
-connect directly on a LAN or Tailscale network; difficult public NAT setups need
-a separately configured TURN service.
+connect directly on a LAN or Tailscale network. Difficult public NAT setups can
+use the built-in optional Coturn service. Wire generates and shares its secret
+only inside the rendered server and Coturn containers. Public TURN also requires
+router forwards for TCP/UDP `3478` and UDP `49160-49200`.
 
 This directory is a separate account namespace. Existing local Wire identities
 can register on it, but encrypted cross-device recovery exists only after that

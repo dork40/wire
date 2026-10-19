@@ -3,10 +3,51 @@ groups:
     description: Configure the LAN ports used by Wire.
   - name: Storage Configuration
     description: Configure persistent encrypted identity and server state storage.
+  - name: TURN Relay Configuration
+    description: Optional public relay for calls and screen sharing on restrictive networks.
   - name: Resources Configuration
     description: Configure resource limits.
 
 questions:
+  - variable: turn
+    label: ""
+    group: TURN Relay Configuration
+    schema:
+      type: dict
+      attrs:
+        - variable: enabled
+          label: Enable TURN Relay
+          description: Enables authenticated Coturn. Router forwarding is still required for public use.
+          schema:
+            type: boolean
+            default: false
+        - variable: hostname
+          label: Public TURN Hostname
+          description: Public DNS name clients use, without a scheme or port (for example wire.example.net).
+          schema:
+            type: string
+            default: ""
+            required: true
+            show_if: [["enabled", "=", true]]
+            valid_chars: "^[A-Za-z0-9.-]+$"
+            valid_chars_error: Enter a DNS hostname without https://, a path, or a port.
+        - variable: public_ip
+          label: Public IPv4 Address
+          description: Router WAN address advertised by Coturn. Keep your DDNS hostname pointed at this address.
+          schema:
+            type: ipaddr
+            default: ""
+            required: true
+            show_if: [["enabled", "=", true]]
+        - variable: private_ip
+          label: TrueNAS LAN IPv4 Address
+          description: LAN address of this TrueNAS system receiving the router forwards.
+          schema:
+            type: ipaddr
+            default: ""
+            required: true
+            show_if: [["enabled", "=", true]]
+
   - variable: network
     label: ""
     group: Network Configuration
