@@ -32,6 +32,18 @@ PipeWire/XDG Desktop Portal backend is implemented and tested.
 New installs automatically connect to the Wire username directory at
 `wirecmd.ddns.net`; no IP address or server command is needed for normal use.
 
+## What's new in server 1.4.32
+
+- Added an Account page to the TrueNAS Web UI with identity-backup status,
+  do-not-disturb status, group-invite preference, and privacy boundaries.
+- Added the same safety fingerprint shown by the Wire terminal so an account's
+  public identity can be compared through another trusted channel.
+- Limited active Web UI sessions and automatically removes expired sessions.
+- Hardened backup inspection against oversized or malformed archive entries.
+- Prevented malformed group data from crashing the Groups dashboard.
+- Kept the dashboard privacy-safe: it does not display message contents,
+  passwords, or private identity keys.
+
 ## Private self-hosted server
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with
