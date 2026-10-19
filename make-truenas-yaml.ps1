@@ -40,7 +40,7 @@ services:
       WIRE_TURN_PROBE_HOST: 192.168.1.199
       WIRE_TURN_PROBE_PORT: 3478
     ports:
-      - "8097:8097/tcp"
+      - "192.168.1.199:8097:8097/tcp"
     volumes:
       - /mnt/nvme/wire:/data:ro
       - /mnt/nvme/wire-backups:/backups:ro

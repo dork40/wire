@@ -261,4 +261,6 @@ class WireWebServer(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     print("Wire web UI listening on 8097", flush=True)
-    WireWebServer(("0.0.0.0", 8097), Handler).serve_forever()
+    # The container must accept traffic from its bridge interface. Host-side
+    # exposure is restricted by the TrueNAS port mapping/firewall.
+    WireWebServer(("0.0.0.0", 8097), Handler).serve_forever()  # nosec B104
