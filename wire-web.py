@@ -1,7 +1,7 @@
 """Authenticated LAN web console for a self-hosted Wire server."""
 from __future__ import annotations
 
-import base64, hashlib, hmac, html, json, os, secrets, socket, struct, threading, time, zipfile
+import base64, binascii, hashlib, hmac, html, json, os, secrets, socket, struct, threading, time, zipfile
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -10,7 +10,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 STATE = Path(os.environ.get("WIRE_STATE", "/data"))
 BACKUPS = Path(os.environ.get("WIRE_BACKUP_DIR", "/backups"))
-STARTED = time.time(); SESSION_TTL = 12 * 60 * 60
+STARTED = time.time(); SESSION_TTL = 12 * 60 * 60; MAX_SESSIONS = 256
 SESSIONS: dict[str, tuple[str, float]] = {}; ATTEMPTS: dict[str, list[float]] = {}; LOCK = threading.Lock()
 TURN_PROBE_HOST = os.environ.get("WIRE_TURN_PROBE_HOST", "").strip()
 TURN_PROBE_PORT = int(os.environ.get("WIRE_TURN_PROBE_PORT", "3478"))
@@ -33,10 +33,13 @@ def backup_inventory(limit=8):
             with zipfile.ZipFile(latest) as archive:
                 manifest = json.loads(archive.read("manifest.json"))
                 hashes = manifest.get("files") if manifest.get("format") == 1 else None
-                if not isinstance(hashes, dict) or not hashes: raise ValueError("invalid manifest")
+                if not isinstance(hashes, dict) or not hashes or len(hashes) > 32: raise ValueError("invalid manifest")
+                infos = {item.filename: item for item in archive.infolist()}
                 for name, expected in hashes.items():
                     if not isinstance(name, str) or not isinstance(expected, str): raise ValueError("invalid checksum")
-                    actual = hashlib.sha256(archive.read(f"state/{name}")).hexdigest()
+                    entry = infos.get(f"state/{name}")
+                    if entry is None or entry.file_size > 512 * 1024 * 1024: raise ValueError("unsafe backup entry")
+                    actual = hashlib.sha256(archive.read(entry)).hexdigest()
                     if not hmac.compare_digest(actual, expected): raise ValueError("checksum mismatch")
             ok = True
         except (OSError, KeyError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
@@ -75,7 +78,7 @@ def server_security_status():
     return {"identity": identity_ok, "turn": turn_reachable(), "backup": backup}
 
 STYLE = """
-:root{--bg:#07090d;--panel:#0d1219;--card:#121922;--line:#252e3b;--text:#f4f7fb;--muted:#8e9aac;--mint:#6ee7c8;--blue:#79a8ff;--danger:#ff8e9a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -10%,#173f40,transparent 32%),var(--bg);color:var(--text);font:15px Inter,Segoe UI,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:250px 1fr;min-height:100vh}aside{border-right:1px solid var(--line);padding:28px 18px;background:#090c11ee;position:sticky;top:0;height:100vh}.brand{font-size:22px;font-weight:900;letter-spacing:.18em;margin:0 10px 36px}.brand i{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--mint);box-shadow:0 0 22px var(--mint);margin-right:11px}nav{display:grid;gap:6px}nav a{color:var(--muted);padding:12px 14px;border-radius:11px;text-decoration:none}nav a:hover{background:#121a23;color:var(--text)}nav a.on{background:var(--mint);color:#07110f;font-weight:800}.logout{position:absolute;bottom:25px;left:18px;right:18px}main{padding:42px;max-width:1220px;width:100%;margin:auto}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:32px;margin:0 0 6px}h2{font-size:17px;margin:0 0 17px}.muted,small{color:var(--muted)}.live,.pill{display:inline-flex;border:1px solid #31574e;background:#10221e;color:var(--mint);padding:7px 12px;border-radius:999px;font-weight:700}.pill{padding:4px 9px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.card{grid-column:span 4;background:linear-gradient(145deg,#131a23,#0d1218);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 18px 50px #0004}.wide{grid-column:span 8}.full{grid-column:1/-1}.num{font-size:34px;font-weight:850;margin-top:8px}.list-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 2px;border-bottom:1px solid #1d2631}.list-row:last-child{border:0}.person{display:flex;align-items:center;gap:13px}.avatar{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:#1b2c31;color:var(--mint);font-weight:850}.stack{display:flex;flex-direction:column;gap:3px}.note{color:#b5bfcc;line-height:1.7}.ok{color:var(--mint)}.bad{color:var(--danger)}.metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1d2631}.metric:last-child{border:0}.login{width:min(430px,calc(100% - 32px));margin:12vh auto;padding:36px}.login.card{display:block}label{display:block;color:var(--muted);margin:18px 0 7px}input{width:100%;border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:#090d12;color:var(--text);font:inherit;outline:none}input:focus{border-color:var(--mint)}button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:11px;background:var(--mint);color:#07110f;font-weight:850;font:inherit;cursor:pointer}.error{color:var(--danger);margin-top:16px}.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:13px}@media(max-width:780px){.shell{display:block}aside{height:auto;position:static;border-right:0;border-bottom:1px solid var(--line);padding:18px}.brand{margin:0 0 14px}nav{grid-template-columns:repeat(4,1fr)}nav a{text-align:center;padding:10px 4px}.logout{position:static;display:none}main{padding:24px 16px}.card,.wide{grid-column:1/-1}header{align-items:start}.live{font-size:12px}}
+:root{--bg:#07090d;--panel:#0d1219;--card:#121922;--line:#252e3b;--text:#f4f7fb;--muted:#8e9aac;--mint:#6ee7c8;--blue:#79a8ff;--danger:#ff8e9a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 80% -10%,#173f40,transparent 32%),var(--bg);color:var(--text);font:15px Inter,Segoe UI,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:250px 1fr;min-height:100vh}aside{border-right:1px solid var(--line);padding:28px 18px;background:#090c11ee;position:sticky;top:0;height:100vh}.brand{font-size:22px;font-weight:900;letter-spacing:.18em;margin:0 10px 36px}.brand i{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--mint);box-shadow:0 0 22px var(--mint);margin-right:11px}nav{display:grid;gap:6px}nav a{color:var(--muted);padding:12px 14px;border-radius:11px;text-decoration:none}nav a:hover{background:#121a23;color:var(--text)}nav a.on{background:var(--mint);color:#07110f;font-weight:800}.logout{position:absolute;bottom:25px;left:18px;right:18px}main{padding:42px;max-width:1220px;width:100%;margin:auto}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:32px;margin:0 0 6px}h2{font-size:17px;margin:0 0 17px}.muted,small{color:var(--muted)}.live,.pill{display:inline-flex;border:1px solid #31574e;background:#10221e;color:var(--mint);padding:7px 12px;border-radius:999px;font-weight:700}.pill{padding:4px 9px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px}.card{grid-column:span 4;background:linear-gradient(145deg,#131a23,#0d1218);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 18px 50px #0004}.wide{grid-column:span 8}.full{grid-column:1/-1}.num{font-size:34px;font-weight:850;margin-top:8px}.list-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 2px;border-bottom:1px solid #1d2631}.list-row:last-child{border:0}.person{display:flex;align-items:center;gap:13px}.avatar{display:grid;place-items:center;width:40px;height:40px;border-radius:12px;background:#1b2c31;color:var(--mint);font-weight:850}.stack{display:flex;flex-direction:column;gap:3px}.note{color:#b5bfcc;line-height:1.7}.ok{color:var(--mint)}.bad{color:var(--danger)}.metric{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid #1d2631}.metric:last-child{border:0}.login{width:min(430px,calc(100% - 32px));margin:12vh auto;padding:36px}.login.card{display:block}label{display:block;color:var(--muted);margin:18px 0 7px}input{width:100%;border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:#090d12;color:var(--text);font:inherit;outline:none}input:focus{border-color:var(--mint)}button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:11px;background:var(--mint);color:#07110f;font-weight:850;font:inherit;cursor:pointer}.error{color:var(--danger);margin-top:16px}.empty{padding:22px;text-align:center;color:var(--muted);border:1px dashed var(--line);border-radius:13px}@media(max-width:780px){.shell{display:block}aside{height:auto;position:static;border-right:0;border-bottom:1px solid var(--line);padding:18px}.brand{margin:0 0 14px}nav{grid-template-columns:repeat(5,1fr)}nav a{text-align:center;padding:10px 4px;font-size:12px}.logout{position:static;display:none}main{padding:24px 16px}.card,.wide{grid-column:1/-1}header{align-items:start}.live{font-size:12px}}
 """
 
 def shell(content, title="Wire"):
@@ -129,12 +132,14 @@ def user_context(username):
     users, groups = load("users.json", {}), load("groups.json", {})
     record = users.get(username, {})
     friends = [item for item in record.get("friends", []) if isinstance(item, str) and item in users]
-    memberships = [group for group in groups.values() if isinstance(group, dict) and username in group.get("members", [])]
+    memberships = [group for group in groups.values() if isinstance(group, dict)
+                   and isinstance(group.get("members"), list) and username in group["members"]]
     return users, groups, record, friends, memberships
 
 def app_page(username, active, title, subtitle, content):
     links = (("overview", "/", "Overview"), ("people", "/people", "People"),
-             ("groups", "/groups", "Groups"), ("server", "/server", "Server"))
+             ("groups", "/groups", "Groups"), ("account", "/account", "Account"),
+             ("server", "/server", "Server"))
     nav = "".join(f'<a class="{"on" if active == key else ""}" href="{href}">{label}</a>' for key, href, label in links)
     return shell(f'<div class="shell"><aside><div class="brand"><i></i>WIRE</div><nav>{nav}</nav><a class="logout muted" href="/logout">Sign out</a></aside><main><header><div><h1>{esc(title)}</h1><div class="muted">{esc(subtitle)}</div></div><div class="live">● Connected</div></header>{content}</main></div>', f'{title} · Wire')
 
@@ -169,13 +174,35 @@ def groups_page(username):
     users, groups, record, friends, memberships = user_context(username)
     rows = []
     for group in sorted(memberships, key=lambda item: str(item.get("name", "")).lower()):
-        members = [item for item in group.get("members", []) if item in users]
-        role = "Owner" if group.get("owner") == username else "Admin" if username in group.get("admins", []) else "Member"
+        raw_members = group.get("members", []) if isinstance(group.get("members"), list) else []
+        raw_admins = group.get("admins", []) if isinstance(group.get("admins"), list) else []
+        raw_pins = group.get("pins", []) if isinstance(group.get("pins"), list) else []
+        members = [item for item in raw_members if item in users]
+        role = "Owner" if group.get("owner") == username else "Admin" if username in raw_admins else "Member"
         owner = users.get(group.get("owner"), {}).get("name", group.get("owner", "Unknown"))
-        rows.append(f'<div class="list-row"><div class="stack"><b>{esc(group.get("name", "Unnamed group"))}</b><small>{len(members)} members · owner {esc(owner)} · {len(group.get("pins", []))} pins</small></div><span class="pill">{role}</span></div>')
+        rows.append(f'<div class="list-row"><div class="stack"><b>{esc(group.get("name", "Unnamed group"))}</b><small>{len(members)} members · owner {esc(owner)} · {len(raw_pins)} pins</small></div><span class="pill">{role}</span></div>')
     group_rows = "".join(rows) if rows else '<div class="empty">No group memberships yet.</div>'
     content = f'<div class="grid"><section class="card full"><h2>Your groups · {len(memberships)}</h2>{group_rows}</section></div>'
     return app_page(username, "groups", "Groups", "Rooms and membership roles", content)
+
+def account_page(username):
+    users, groups, record, friends, memberships = user_context(username)
+    try:
+        public_key = base64.b64decode(record.get("public", ""), validate=True)
+        if len(public_key) != 32: raise ValueError("invalid public key")
+        digest = hashlib.sha256(public_key).hexdigest().upper()
+        fingerprint = " ".join(digest[index:index + 4] for index in range(0, len(digest), 4))
+    except (TypeError, ValueError, binascii.Error):
+        fingerprint = "Unavailable"
+    has_backup = isinstance(load("identity-backups.json", {}).get(username), dict)
+    content = f'''<div class="grid">
+      <section class="card full"><h2>Safety fingerprint</h2><p class="note">Compare this fingerprint through another trusted channel when verifying your account identity.</p><p style="word-spacing:.35em;line-height:1.8"><b>{fingerprint}</b></p></section>
+      <section class="card"><span class="muted">Identity backup</span><div class="num {"ok" if has_backup else "bad"}">{"Saved" if has_backup else "Missing"}</div></section>
+      <section class="card"><span class="muted">Do not disturb</span><div class="num">{"On" if record.get("dnd") else "Off"}</div></section>
+      <section class="card"><span class="muted">Group invites</span><div class="num">{"Allowed" if record.get("allow_group_invites", True) else "Blocked"}</div></section>
+      <section class="card full"><h2>Account privacy</h2><div class="metric"><span>Private identity keys</span><b class="ok">Not exposed to this page</b></div><div class="metric"><span>Message contents</span><b class="ok">Not exposed to this page</b></div><div class="metric"><span>Account deletion</span><b>Available in Wire /settings</b></div></section>
+    </div>'''
+    return app_page(username, "account", "Account", "Identity and privacy preferences", content)
 
 def server_page(username):
     security, backups = server_security_status(), backup_inventory()
@@ -219,9 +246,10 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(303, b"", "text/plain", {"Location":"/", "Set-Cookie":"wire_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"}); return
         user = self.session_user()
         if not user:
-            if path in ("/", "/people", "/groups", "/server"): self.reply(200, login_page()); return
+            if path in ("/", "/people", "/groups", "/account", "/server"): self.reply(200, login_page()); return
             self.reply(404, b"not found", "text/plain"); return
-        pages = {"/": overview_page, "/people": people_page, "/groups": groups_page, "/server": server_page}
+        pages = {"/": overview_page, "/people": people_page, "/groups": groups_page,
+                 "/account": account_page, "/server": server_page}
         page = pages.get(path)
         if not page: self.reply(404, b"not found", "text/plain"); return
         self.reply(200, page(user))
@@ -235,9 +263,14 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, UnicodeDecodeError): self.reply(400, login_page("Invalid request.")); return
         if not allow_attempt(self.client_address[0]): self.reply(429, login_page("Too many attempts. Try again later.")); return
         if not verify_account(username, password): self.reply(401, login_page("Incorrect username or password.")); return
-        with LOCK: ATTEMPTS.pop(self.client_address[0], None)
         token = secrets.token_urlsafe(32)
-        with LOCK: SESSIONS[token] = (username.lower(), time.time() + SESSION_TTL)
+        with LOCK:
+            ATTEMPTS.pop(self.client_address[0], None)
+            now = time.time()
+            for saved_token, item in list(SESSIONS.items()):
+                if item[1] < now: SESSIONS.pop(saved_token, None)
+            while len(SESSIONS) >= MAX_SESSIONS: SESSIONS.pop(next(iter(SESSIONS)))
+            SESSIONS[token] = (username.lower(), now + SESSION_TTL)
         self.reply(303, b"", "text/plain", {"Location":"/", "Set-Cookie":f"wire_session={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict"})
     def log_message(self, fmt, *args): print("wire-web:", fmt % args, flush=True)
 

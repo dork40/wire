@@ -23,9 +23,11 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.x509.oid import NameOID
 
-HOST = os.environ.get("WIRE_HOST", "0.0.0.0")
+# The directory must accept remote clients inside its container; host exposure is
+# restricted by the compose port mapping and firewall.
+HOST = os.environ.get("WIRE_HOST", "0.0.0.0")  # nosec B104
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.31"
+SERVER_VERSION = "1.4.32"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")

@@ -65,11 +65,12 @@ class WebConsoleTests(unittest.TestCase):
             password, salt = "correct horse battery staple", b"0123456789abcdef"
             kdf = {"n": 2**14, "r": 8, "p": 1}
             secret = hashlib.scrypt(password.encode(), salt=salt, dklen=32, **kdf)
+            identity_public = bytes(range(32))
             account = {"name": "Alice", "private": "encrypted", "friends": ["bob"]}
             backup = {"salt": base64.b64encode(salt).decode(), "kdf": kdf,
                       "ciphertext": Fernet(base64.urlsafe_b64encode(secret)).encrypt(json.dumps(account).encode()).decode()}
             (web.STATE / "identity-backups.json").write_text(json.dumps({"alice": backup}), encoding="utf-8")
-            (web.STATE / "users.json").write_text(json.dumps({"alice": {"name": "Alice", "friends": ["bob"]}, "bob": {"name": "Bob"}}), encoding="utf-8")
+            (web.STATE / "users.json").write_text(json.dumps({"alice": {"name": "Alice", "friends": ["bob"], "public": base64.b64encode(identity_public).decode()}, "bob": {"name": "Bob"}}), encoding="utf-8")
             server = web.WireWebServer(("127.0.0.1", 0), web.Handler)
             self.assertTrue(server.daemon_threads)
             worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
@@ -95,9 +96,14 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertIn("Hello, Alice", dashboard); self.assertIn("Bob", dashboard)
                 people = urllib.request.urlopen(urllib.request.Request(base + "/people", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
                 groups = urllib.request.urlopen(urllib.request.Request(base + "/groups", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
+                account_page = urllib.request.urlopen(urllib.request.Request(base + "/account", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
                 status = urllib.request.urlopen(urllib.request.Request(base + "/server", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
                 self.assertIn("Encrypted contact", people)
                 self.assertIn("No group memberships yet", groups)
+                self.assertIn("Safety fingerprint", account_page)
+                self.assertNotIn("correct horse battery staple", account_page)
+                expected_fingerprint = " ".join(hashlib.sha256(identity_public).hexdigest().upper()[i:i + 4] for i in range(0, 64, 4))
+                self.assertIn(expected_fingerprint, account_page)
                 self.assertIn("Security boundaries", status)
             finally:
                 server.shutdown(); server.server_close(); worker.join(timeout=2)
