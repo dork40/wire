@@ -17,6 +17,13 @@ services:
     image: ghcr.io/dork40/wire-server:latest
     pull_policy: always
     restart: unless-stopped
+    init: true
+    read_only: true
+    stop_grace_period: 15s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     environment:
       WIRE_STATE: /data
       WIRE_TURN_URLS: turn:wirecmd.ddns.net:3478?transport=udp,turn:wirecmd.ddns.net:3478?transport=tcp
@@ -33,6 +40,13 @@ services:
     image: ghcr.io/dork40/wire-server:latest
     pull_policy: always
     restart: unless-stopped
+    init: true
+    read_only: true
+    stop_grace_period: 10s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
     command: ["python", "/app/wire-web.py"]
     environment:
       WIRE_STATE: /data
@@ -47,6 +61,10 @@ services:
   wire-turn:
     image: coturn/coturn:4.17.2-r0
     restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     network_mode: host
     command:
       - --fingerprint

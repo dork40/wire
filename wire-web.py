@@ -36,7 +36,9 @@ def backup_inventory(limit=8):
         try:
             stat = latest.stat()
             with zipfile.ZipFile(latest) as archive:
-                manifest = json.loads(archive.read("manifest.json"))
+                manifest_entry = archive.getinfo("manifest.json")
+                if manifest_entry.file_size > 1024 * 1024: raise ValueError("oversized manifest")
+                manifest = json.loads(archive.read(manifest_entry))
                 hashes = manifest.get("files") if manifest.get("format") == 1 else None
                 if not isinstance(hashes, dict) or not hashes or len(hashes) > 32: raise ValueError("invalid manifest")
                 infos = {item.filename: item for item in archive.infolist()}
@@ -44,7 +46,10 @@ def backup_inventory(limit=8):
                     if not isinstance(name, str) or not isinstance(expected, str): raise ValueError("invalid checksum")
                     entry = infos.get(f"state/{name}")
                     if entry is None or entry.file_size > 512 * 1024 * 1024: raise ValueError("unsafe backup entry")
-                    actual = hashlib.sha256(archive.read(entry)).hexdigest()
+                    digest = hashlib.sha256()
+                    with archive.open(entry) as source:
+                        while chunk := source.read(1024 * 1024): digest.update(chunk)
+                    actual = digest.hexdigest()
                     if not hmac.compare_digest(actual, expected): raise ValueError("checksum mismatch")
             ok = True
         except (OSError, KeyError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
@@ -78,8 +83,11 @@ def turn_reachable(host=None, port=None, timeout=0.6):
     finally:
         connection.close()
 
-def server_security_status():
-    backup = verify_latest_backup()
+def server_security_status(backups=None):
+    backups = backup_inventory() if backups is None else backups
+    latest = backups[0] if backups else None
+    backup = {"count": len(backups), "ok": bool(latest and latest["ok"]),
+              "age": latest["age"] if latest else None, "name": latest["name"] if latest else None}
     required = ("server-signing-key", "server-certificate.pem", "server-tls-key.pem")
     identity_ok = all((STATE / name).is_file() and (STATE / name).stat().st_size > 0 for name in required)
     return {"identity": identity_ok, "turn": turn_reachable(), "backup": backup}
@@ -164,7 +172,7 @@ def people_rows(friends, users):
 
 def overview_page(username):
     users, groups, record, friends, memberships = user_context(username)
-    security, backups = server_security_status(), backup_inventory()
+    backups = backup_inventory(); security = server_security_status(backups)
     latest = backups[0] if backups else None
     healthy = security["identity"] and security["turn"] is True and bool(latest and latest["ok"])
     content = f'''<div class="grid">
@@ -217,7 +225,7 @@ def account_page(username):
     return app_page(username, "account", "Account", "Identity and privacy preferences", content)
 
 def server_page(username):
-    security, backups = server_security_status(), backup_inventory()
+    backups = backup_inventory(); security = server_security_status(backups)
     turn = "Reachable" if security["turn"] is True else "Not configured" if security["turn"] is None else "Unreachable"
     backup_rows = "".join(f'<div class="list-row"><span class="stack"><b>{esc(item["name"])}</b><small>{age_text(item["age"])} · {size_text(item["size"])}</small></span><span class="pill {"ok" if item["ok"] else "bad"}">{"Verified" if item["ok"] else "Damaged"}</span></div>' for item in backups)
     content = f'''<div class="grid">

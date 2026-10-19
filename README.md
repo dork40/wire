@@ -53,6 +53,16 @@ New installs automatically connect to the Wire username directory at
   preventing malicious backups from triggering excessive memory or CPU use.
 - Added regression coverage for damaged state, safe logout, and unsafe KDF data.
 
+## What's new in server 1.4.34
+
+- Streams backup checksums in bounded chunks instead of loading large state
+  files into Web UI memory.
+- Rejects oversized backup manifests and avoids duplicate verification work on
+  Overview and Server page refreshes.
+- Hardens generated TrueNAS containers with read-only roots, dropped Linux
+  capabilities, no-new-privileges, bounded temporary storage, and graceful
+  shutdown periods.
+
 ## Private self-hosted server
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with

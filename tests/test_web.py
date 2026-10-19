@@ -76,28 +76,32 @@ class WebConsoleTests(unittest.TestCase):
             worker = threading.Thread(target=server.serve_forever, daemon=True); worker.start()
             base = f"http://127.0.0.1:{server.server_port}"
             try:
-                public = urllib.request.urlopen(base + "/").read().decode()
+                with urllib.request.urlopen(base + "/") as response:
+                    public = response.read().decode()
                 self.assertIn("Welcome back", public); self.assertNotIn("Bob", public)
-                protected = urllib.request.urlopen(base + "/server")
-                self.assertIn("Welcome back", protected.read().decode())
-                self.assertIn("default-src 'none'", protected.headers["Content-Security-Policy"])
-                self.assertEqual(protected.headers["Permissions-Policy"], "camera=(), microphone=(), geolocation=()")
+                with urllib.request.urlopen(base + "/server") as protected:
+                    self.assertIn("Welcome back", protected.read().decode())
+                    self.assertIn("default-src 'none'", protected.headers["Content-Security-Policy"])
+                    self.assertEqual(protected.headers["Permissions-Policy"], "camera=(), microphone=(), geolocation=()")
                 request = urllib.request.Request(base + "/login", data=urllib.parse.urlencode({"username":"alice", "password":password}).encode(), method="POST")
                 class NoRedirect(urllib.request.HTTPRedirectHandler):
                     def redirect_request(self, req, fp, code, msg, headers, newurl): return None
                 opener = urllib.request.build_opener(NoRedirect())
-                response_obj = None
                 try: opener.open(request)
                 except urllib.error.HTTPError as response:
-                    self.assertEqual(response.code, 303); response_obj = response
-                cookie = response_obj.headers.get("Set-Cookie")
+                    self.assertEqual(response.code, 303)
+                    cookie = response.headers.get("Set-Cookie")
+                    response.close()
                 self.assertIn("HttpOnly", cookie); self.assertIn("SameSite=Strict", cookie)
-                dashboard = urllib.request.urlopen(urllib.request.Request(base + "/", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
+                def authenticated_page(path):
+                    request = urllib.request.Request(base + path, headers={"Cookie": cookie.split(";", 1)[0]})
+                    with urllib.request.urlopen(request) as response: return response.read().decode()
+                dashboard = authenticated_page("/")
                 self.assertIn("Hello, Alice", dashboard); self.assertIn("Bob", dashboard)
-                people = urllib.request.urlopen(urllib.request.Request(base + "/people", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
-                groups = urllib.request.urlopen(urllib.request.Request(base + "/groups", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
-                account_page = urllib.request.urlopen(urllib.request.Request(base + "/account", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
-                status = urllib.request.urlopen(urllib.request.Request(base + "/server", headers={"Cookie": cookie.split(";", 1)[0]})).read().decode()
+                people = authenticated_page("/people")
+                groups = authenticated_page("/groups")
+                account_page = authenticated_page("/account")
+                status = authenticated_page("/server")
                 self.assertIn("Encrypted contact", people)
                 self.assertIn("No group memberships yet", groups)
                 self.assertIn("Safety fingerprint", account_page)
@@ -108,10 +112,14 @@ class WebConsoleTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as rejected_logout:
                     urllib.request.urlopen(urllib.request.Request(base + "/logout", headers={"Cookie": cookie.split(";", 1)[0]}))
                 self.assertEqual(rejected_logout.exception.code, 405)
+                rejected_logout.exception.close()
                 logout = urllib.request.Request(base + "/logout", data=b"", method="POST",
                                                 headers={"Cookie": cookie.split(";", 1)[0]})
                 try: opener.open(logout)
-                except urllib.error.HTTPError as response: self.assertEqual(response.code, 303)
+                except urllib.error.HTTPError as response:
+                    self.assertEqual(response.code, 303)
+                    response.close()
+                opener.close()
             finally:
                 server.shutdown(); server.server_close(); worker.join(timeout=2)
 
