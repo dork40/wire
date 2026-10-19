@@ -27,7 +27,7 @@ from cryptography.x509.oid import NameOID
 # restricted by the compose port mapping and firewall.
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")  # nosec B104
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.34"
+SERVER_VERSION = "1.4.35"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
@@ -694,6 +694,13 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     encoded = json.dumps(synced, separators=(",", ":"))
                     if len(encoded.encode("utf-8")) <= MAX_SYNC_TOTAL_BYTES:
                         replace_private_json(SYNC_FILE, encoded)
+                        saved = True
+                    else:
+                        saved = False
+                if saved:
+                    send(sock, {"type": "sync_saved", "kind": "message"})
+                else:
+                    send(sock, {"type": "error", "message": "encrypted sync storage is full"})
             elif kind == "sync_fetch":
                 with LOCK:
                     account_sync = load_sync().get(key, {})

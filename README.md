@@ -63,6 +63,14 @@ New installs automatically connect to the Wire username directory at
   capabilities, no-new-privileges, bounded temporary storage, and graceful
   shutdown periods.
 
+## What's new in server 1.4.35
+
+- Completes the encrypted message-sync request with an explicit success reply,
+  preventing clients and diagnostics from waiting indefinitely after storage.
+- Reports a clear error when the encrypted server-side sync quota is full.
+- Adds a real two-device regression test covering authenticated upload,
+  disconnect, reconnect, encrypted download, and local history merge.
+
 ## What's new in Wire 1.4.69
 
 - Isolates Windows.Graphics.Capture in a bounded shared-memory worker so a
@@ -113,11 +121,11 @@ use `truenas-vX.Y.Z`. The release job refuses tags that do not match the
 version stored in the corresponding source, and each release includes update
 instructions plus a generated list of changes.
 
-Wire v1.4.68 requires directory server v1.4.22 or newer for authenticated TLS;
-server v1.4.29 is recommended for encrypted multi-device sync, server status,
-and automatic verified state backups. The authenticated web dashboard verifies
-the newest backup checksum and probes the local TURN listener instead of merely
-reporting that those services were configured.
+Wire v1.4.69 requires directory server v1.4.22 or newer for authenticated TLS;
+server v1.4.35 is recommended for encrypted multi-device sync, server status,
+automatic verified state backups, and the hardened TrueNAS containers. The
+authenticated web dashboard verifies the newest backup checksum and probes the
+local TURN listener instead of merely reporting that those services were configured.
 Keep the server state volume because it contains the pinned server key.
 
 ## Commands
