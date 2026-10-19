@@ -50,6 +50,34 @@ class EncryptedSyncTests(unittest.TestCase):
             finally:
                 wire.SETTINGS_FILE = original_settings
 
+    def test_older_remote_settings_do_not_roll_back_this_device(self):
+        with tempfile.TemporaryDirectory() as folder:
+            original_settings = wire.SETTINGS_FILE
+            try:
+                wire.SETTINGS_FILE = Path(folder) / "settings.json"
+                app = wire.Wire.__new__(wire.Wire)
+                app.history_key = Fernet.generate_key()
+                app.history_lock = threading.Lock()
+                app.server = None
+                app.settings = wire.load_settings()
+                app.settings["notifications"] = False
+                app.settings["_sync_updated"] = 200
+                wire.replace_private_bytes(wire.SETTINGS_FILE, json.dumps(app.settings).encode())
+                app.history_path = lambda peer: Path(folder) / f"{peer}.wire"
+                stale = dict(app.settings)
+                stale["notifications"] = True
+                stale["_sync_updated"] = 100
+                blob = Fernet(app.history_key).encrypt(
+                    json.dumps({"updated": 100, "settings": stale}).encode()
+                ).decode()
+
+                app.apply_sync_state({"settings": blob, "messages": [], "done": True})
+
+                self.assertFalse(app.settings["notifications"])
+                self.assertEqual(app.settings["_sync_updated"], 200)
+            finally:
+                wire.SETTINGS_FILE = original_settings
+
 
 if __name__ == "__main__":
     unittest.main()

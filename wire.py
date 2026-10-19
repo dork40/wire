@@ -360,12 +360,15 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low")}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
     except Exception:
-        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low"}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
 
 
 def save_settings(settings: dict) -> None:
+    # This marker is encrypted with the settings. It lets another device
+    # reject an older snapshot instead of rolling back newer local choices.
+    settings["_sync_updated"] = time.time_ns()
     replace_private_bytes(SETTINGS_FILE, json.dumps(settings).encode("utf-8"))
 
 
@@ -1438,7 +1441,9 @@ class Wire:
     def sync_settings(self) -> None:
         if not self.server or not self.history_key:
             return
-        payload = json.dumps({"updated": time.time_ns(), "settings": self.settings}, separators=(",", ":")).encode("utf-8")
+        if not self.settings.get("_sync_updated"):
+            save_settings(self.settings)
+        payload = json.dumps({"updated": self.settings["_sync_updated"], "settings": self.settings}, separators=(",", ":")).encode("utf-8")
         blob = Fernet(self.history_key).encrypt(payload).decode("ascii")
         try:
             self.server_send({"type": "sync_put_settings", "blob": blob})
@@ -1465,7 +1470,10 @@ class Wire:
             try:
                 value = json.loads(Fernet(self.history_key).decrypt(setting_blob.encode("ascii")))
                 remote = value.get("settings") if isinstance(value, dict) else None
-                if isinstance(remote, dict):
+                remote_updated = value.get("updated", 0) if isinstance(value, dict) else 0
+                local_updated = int(self.settings.get("_sync_updated", 0))
+                if isinstance(remote, dict) and isinstance(remote_updated, int) and remote_updated > local_updated:
+                    remote["_sync_updated"] = remote_updated
                     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
                     replace_private_bytes(SETTINGS_FILE, json.dumps(remote).encode("utf-8"))
                     self.settings = load_settings()
