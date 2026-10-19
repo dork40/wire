@@ -1,7 +1,7 @@
 images:
   image:
     repository: ghcr.io/dork40/wire-server
-    tag: "1.4.33@sha256:a7a0c45b870f933d09212634c27e122816e8bdea92c6dbc0c0a0d9e2d5f83616"
+    tag: "1.4.34@sha256:60e05560fc9b4fca678c20368dcab3ca2759c6913a552d39e66f5bb6f17519f0"
   container_utils_image:
     repository: ixsystems/container-utils
     tag: "1.0.2@sha256:46eba20714c1cc6784f60e245c32c33a2d9f616e47d804694a9854248c89a992"
