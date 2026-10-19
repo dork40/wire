@@ -46,6 +46,12 @@ Forward these router ports to `192.168.1.199`:
 
 Do not expose the TrueNAS web administration interface. TURN relays encrypted
 DTLS-SRTP packets and does not decrypt screen-share or call contents.
+
+The Wire web dashboard verifies the newest backup archive and probes Coturn on
+the NAS. A green local TURN result proves the container is running; remote Wire
+clients still require all three router-forwarding rules above. Use `/diagnose
+network` from an outside network and require a `relay` candidate before treating
+public TURN as deployed.
 # Updating a custom-YAML installation
 
 The generated YAML uses `ghcr.io/dork40/wire-server:latest` with

@@ -2,6 +2,8 @@ import base64
 import hashlib
 import importlib.util
 import json
+import socket
+import struct
 import tempfile
 import threading
 import unittest
@@ -9,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+import zipfile
 
 from cryptography.fernet import Fernet
 
@@ -22,6 +25,39 @@ def load_web():
 
 
 class WebConsoleTests(unittest.TestCase):
+    def test_security_status_verifies_backup_and_turn_listener(self):
+        web = load_web()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); web.STATE = root; web.BACKUPS = root
+            for name in ("server-signing-key", "server-certificate.pem", "server-tls-key.pem"):
+                (root / name).write_bytes(b"protected")
+            state_data = b'{"alice":{"name":"Alice"}}'
+            manifest = {"format": 1, "files": {"users.json": hashlib.sha256(state_data).hexdigest()}}
+            backup = root / "wire-state-20261018T000000Z.zip"
+            with zipfile.ZipFile(backup, "w") as archive:
+                archive.writestr("manifest.json", json.dumps(manifest))
+                archive.writestr("state/users.json", state_data)
+
+            listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            listener.bind(("127.0.0.1", 0)); port = listener.getsockname()[1]
+            def answer():
+                request, address = listener.recvfrom(2048)
+                listener.sendto(struct.pack("!HHI", 0x0101, 0, 0x2112A442) + request[8:20], address)
+            worker = threading.Thread(target=answer); worker.start()
+            try:
+                self.assertTrue(web.turn_reachable("127.0.0.1", port))
+                status = web.server_security_status()
+                self.assertTrue(status["identity"])
+                self.assertTrue(status["backup"]["ok"])
+                self.assertEqual(status["backup"]["count"], 1)
+            finally:
+                worker.join(timeout=2); listener.close()
+
+            with zipfile.ZipFile(backup, "w") as archive:
+                archive.writestr("manifest.json", json.dumps(manifest))
+                archive.writestr("state/users.json", b"tampered")
+            self.assertFalse(web.verify_latest_backup()["ok"])
+
     def test_requires_wire_account_login_before_showing_private_data(self):
         web = load_web()
         with tempfile.TemporaryDirectory() as folder:

@@ -1,7 +1,7 @@
 """Authenticated LAN web console for a self-hosted Wire server."""
 from __future__ import annotations
 
-import base64, hashlib, html, json, os, secrets, threading, time
+import base64, hashlib, hmac, html, json, os, secrets, socket, struct, threading, time, zipfile
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,6 +12,8 @@ STATE = Path(os.environ.get("WIRE_STATE", "/data"))
 BACKUPS = Path(os.environ.get("WIRE_BACKUP_DIR", "/backups"))
 STARTED = time.time(); SESSION_TTL = 12 * 60 * 60
 SESSIONS: dict[str, tuple[str, float]] = {}; ATTEMPTS: dict[str, list[float]] = {}; LOCK = threading.Lock()
+TURN_PROBE_HOST = os.environ.get("WIRE_TURN_PROBE_HOST", "").strip()
+TURN_PROBE_PORT = int(os.environ.get("WIRE_TURN_PROBE_PORT", "3478"))
 
 def load(name, fallback):
     try:
@@ -21,8 +23,50 @@ def load(name, fallback):
 
 def esc(value): return html.escape(str(value))
 
+def verify_latest_backup():
+    """Return the newest backup's age and integrity without extracting it."""
+    archives = sorted(BACKUPS.glob("wire-state-*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not archives: return {"count": 0, "ok": False, "age": None, "name": None}
+    latest = archives[0]
+    try:
+        with zipfile.ZipFile(latest) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            hashes = manifest.get("files") if manifest.get("format") == 1 else None
+            if not isinstance(hashes, dict) or not hashes: raise ValueError("invalid manifest")
+            for name, expected in hashes.items():
+                if not isinstance(name, str) or not isinstance(expected, str): raise ValueError("invalid checksum")
+                actual = hashlib.sha256(archive.read(f"state/{name}")).hexdigest()
+                if not hmac.compare_digest(actual, expected): raise ValueError("checksum mismatch")
+        ok = True
+    except (OSError, KeyError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
+        ok = False
+    return {"count": len(archives), "ok": ok, "age": max(0, int(time.time() - latest.stat().st_mtime)), "name": latest.name}
+
+def turn_reachable(host=None, port=None, timeout=0.6):
+    """Probe the configured local Coturn listener with a STUN binding request."""
+    host, port = host or TURN_PROBE_HOST, port or TURN_PROBE_PORT
+    if not host: return None
+    transaction = os.urandom(12)
+    request = struct.pack("!HHI12s", 1, 0, 0x2112A442, transaction)
+    connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    connection.settimeout(timeout)
+    try:
+        connection.sendto(request, (host, int(port)))
+        response, _ = connection.recvfrom(2048)
+        return len(response) >= 20 and response[:2] == b"\x01\x01" and response[8:20] == transaction
+    except (OSError, ValueError):
+        return False
+    finally:
+        connection.close()
+
+def server_security_status():
+    backup = verify_latest_backup()
+    required = ("server-signing-key", "server-certificate.pem", "server-tls-key.pem")
+    identity_ok = all((STATE / name).is_file() and (STATE / name).stat().st_size > 0 for name in required)
+    return {"identity": identity_ok, "turn": turn_reachable(), "backup": backup}
+
 STYLE = """
-:root{--bg:#07090d;--card:#11161e;--line:#242c38;--text:#f5f7fb;--muted:#8995a7;--mint:#6ee7c8;--danger:#ff8e9a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 70% -20%,#173a3b,transparent 38%),var(--bg);color:var(--text);font:15px Inter,Segoe UI,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:245px 1fr;min-height:100vh}aside{border-right:1px solid var(--line);padding:28px 18px;background:#090c11dd}.brand{font-size:22px;font-weight:900;letter-spacing:.18em;margin:0 10px 40px}.brand i{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--mint);box-shadow:0 0 22px var(--mint);margin-right:11px}nav a{display:block;color:var(--muted);padding:12px 14px;margin:5px 0;border-radius:11px;text-decoration:none}nav a.on{background:var(--mint);color:#07110f;font-weight:800}main{padding:42px;max-width:1200px;width:100%;margin:auto}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:32px;margin:0 0 6px}.muted,small{color:var(--muted)}.live{border:1px solid #31574e;background:#10221e;color:var(--mint);padding:8px 13px;border-radius:999px;font-weight:700}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:linear-gradient(145deg,#121820,#0d1117);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 18px 50px #0005}.num{font-size:34px;font-weight:850;margin-top:8px}.wide{grid-column:span 2}h2{font-size:17px;margin:0 0 17px}.person{display:flex;align-items:center;gap:13px;padding:11px 3px;border-bottom:1px solid #1d2430}.person:last-child{border:0}.person i{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#1b2c31;color:var(--mint);font-style:normal;font-weight:800}.person span{display:flex;flex-direction:column;gap:3px}.note{color:#b5bfcc;line-height:1.65}.login{width:min(420px,calc(100% - 32px));margin:12vh auto;padding:34px}label{display:block;color:var(--muted);margin:18px 0 7px}input{width:100%;border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:#090d12;color:var(--text);font:inherit;outline:none}input:focus{border-color:var(--mint)}button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:11px;background:var(--mint);color:#07110f;font-weight:850;font:inherit;cursor:pointer}.error{color:var(--danger);margin-top:16px}@media(max-width:720px){.shell{display:block}aside{display:none}main{padding:24px 16px}.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
+:root{--bg:#07090d;--card:#11161e;--line:#242c38;--text:#f5f7fb;--muted:#8995a7;--mint:#6ee7c8;--danger:#ff8e9a}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 70% -20%,#173a3b,transparent 38%),var(--bg);color:var(--text);font:15px Inter,Segoe UI,system-ui,sans-serif;min-height:100vh}.shell{display:grid;grid-template-columns:245px 1fr;min-height:100vh}aside{border-right:1px solid var(--line);padding:28px 18px;background:#090c11dd}.brand{font-size:22px;font-weight:900;letter-spacing:.18em;margin:0 10px 40px}.brand i{display:inline-block;width:11px;height:11px;border-radius:50%;background:var(--mint);box-shadow:0 0 22px var(--mint);margin-right:11px}nav a{display:block;color:var(--muted);padding:12px 14px;margin:5px 0;border-radius:11px;text-decoration:none}nav a.on{background:var(--mint);color:#07110f;font-weight:800}main{padding:42px;max-width:1200px;width:100%;margin:auto}header{display:flex;justify-content:space-between;align-items:end;margin-bottom:28px}h1{font-size:32px;margin:0 0 6px}.muted,small{color:var(--muted)}.live{border:1px solid #31574e;background:#10221e;color:var(--mint);padding:8px 13px;border-radius:999px;font-weight:700}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.card{background:linear-gradient(145deg,#121820,#0d1117);border:1px solid var(--line);border-radius:18px;padding:22px;box-shadow:0 18px 50px #0005}.num{font-size:34px;font-weight:850;margin-top:8px}.wide{grid-column:span 2}h2{font-size:17px;margin:0 0 17px}.person{display:flex;align-items:center;gap:13px;padding:11px 3px;border-bottom:1px solid #1d2430}.person:last-child{border:0}.person i{display:grid;place-items:center;width:38px;height:38px;border-radius:12px;background:#1b2c31;color:var(--mint);font-style:normal;font-weight:800}.person span{display:flex;flex-direction:column;gap:3px}.note{color:#b5bfcc;line-height:1.65}.login{width:min(420px,calc(100% - 32px));margin:12vh auto;padding:34px}label{display:block;color:var(--muted);margin:18px 0 7px}input{width:100%;border:1px solid var(--line);border-radius:11px;padding:13px 14px;background:#090d12;color:var(--text);font:inherit;outline:none}input:focus{border-color:var(--mint)}button{width:100%;margin-top:22px;padding:13px;border:0;border-radius:11px;background:var(--mint);color:#07110f;font-weight:850;font:inherit;cursor:pointer}.error{color:var(--danger);margin-top:16px}.ok{color:var(--mint)}.bad{color:var(--danger)}@media(max-width:720px){.shell{display:block}aside{display:none}main{padding:24px 16px}.grid{grid-template-columns:1fr}.wide{grid-column:auto}}
 """
 
 def shell(content, title="Wire"):
@@ -56,8 +100,13 @@ def dashboard(username):
     friends = [x for x in record.get("friends", []) if isinstance(x, str) and x in users]
     rows = "".join(f'<div class="person"><i>{esc(users[k].get("name", k)[:1].upper())}</i><span><b>{esc(users[k].get("name", k))}</b><small>Friend</small></span></div>' for k in friends) or '<p class="muted">No friends yet.</p>'
     group_count = sum(username in g.get("members", []) for g in groups.values())
-    backup_count = len(list(BACKUPS.glob("wire-state-*.zip")))
-    return shell(f'<div class="shell"><aside><div class="brand"><i></i>WIRE</div><nav><a class="on" href="/">Overview</a><a href="#people">Friends</a><a href="#server">Server</a><a href="/logout">Sign out</a></nav></aside><main><header><div><h1>Hello, {esc(record.get("name", username))}</h1><div class="muted">Private home service</div></div><div class="live">● Online</div></header><div class="grid"><section class="card"><span class="muted">Friends</span><div class="num">{len(friends)}</div></section><section class="card"><span class="muted">Your groups</span><div class="num">{group_count}</div></section><section class="card"><span class="muted">Backups</span><div class="num">{backup_count}</div></section><section class="card wide" id="people"><h2>Your friends</h2>{rows}</section><section class="card" id="server"><h2>Server</h2><p class="note">Directory, encrypted relay, TURN, and automatic backups are configured.</p><p class="muted">Web uptime: {int(time.time()-STARTED)} seconds</p></section></div></main></div>')
+    security = server_security_status(); backup = security["backup"]
+    turn_text = "reachable" if security["turn"] is True else "not configured" if security["turn"] is None else "unreachable"
+    backup_text = "verified" if backup["ok"] else "missing or damaged"
+    age_text = "none" if backup["age"] is None else f'{backup["age"] // 3600}h old'
+    identity_text = "protected" if security["identity"] else "incomplete"
+    status_class = lambda value: "ok" if value else "bad"
+    return shell(f'<div class="shell"><aside><div class="brand"><i></i>WIRE</div><nav><a class="on" href="/">Overview</a><a href="#people">Friends</a><a href="#server">Server</a><a href="/logout">Sign out</a></nav></aside><main><header><div><h1>Hello, {esc(record.get("name", username))}</h1><div class="muted">Private home service</div></div><div class="live">● Online</div></header><div class="grid"><section class="card"><span class="muted">Friends</span><div class="num">{len(friends)}</div></section><section class="card"><span class="muted">Your groups</span><div class="num">{group_count}</div></section><section class="card"><span class="muted">Verified backups</span><div class="num">{backup["count"]}</div><small>{esc(age_text)}</small></section><section class="card wide" id="people"><h2>Your friends</h2>{rows}</section><section class="card" id="server"><h2>Server security</h2><p class="note">Identity: <b class="{status_class(security["identity"])}">{identity_text}</b><br>TURN listener: <b class="{status_class(security["turn"] is True)}">{turn_text}</b><br>Latest backup: <b class="{status_class(backup["ok"])}">{backup_text}</b></p><p class="muted">Web uptime: {int(time.time()-STARTED)} seconds</p></section></div></main></div>')
 
 class Handler(BaseHTTPRequestHandler):
     def session_user(self):

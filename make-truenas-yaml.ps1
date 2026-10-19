@@ -37,6 +37,8 @@ services:
     environment:
       WIRE_STATE: /data
       WIRE_BACKUP_DIR: /backups
+      WIRE_TURN_PROBE_HOST: 192.168.1.199
+      WIRE_TURN_PROBE_PORT: 3478
     ports:
       - "8097:8097/tcp"
     volumes:
