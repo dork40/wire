@@ -18,6 +18,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Read current signed client manifest
+        shell: bash
+        run: git show origin/main:release-manifest.json > current-release-manifest.json
+
       - name: Verify version and prepare release details
         id: details
         shell: python
@@ -54,7 +58,11 @@ jobs:
               version = tag.removeprefix("v")
               with Path("pyproject.toml").open("rb") as source:
                   actual = tomllib.load(source)["project"]["version"]
-              manifest = json.loads(Path("release-manifest.json").read_text(encoding="utf-8"))
+              # Client tags point at the exact source commit authorized by the
+              # manifest.  The signed manifest is committed immediately after
+              # that source commit, so read it from current main rather than
+              # the necessarily older file stored inside the tag.
+              manifest = json.loads(Path("current-release-manifest.json").read_text(encoding="utf-8"))
               if manifest.get("version") != version:
                   raise SystemExit(f"release manifest is {manifest.get('version')!r}, expected {version!r}")
               if str(manifest.get("commit", "")).lower() != tag_commit:
