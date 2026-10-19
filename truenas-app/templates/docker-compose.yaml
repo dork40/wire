@@ -35,6 +35,7 @@
 
 {% if values.turn.enabled %}
   {% do turn.set_network_mode("host") %}
+  {% do turn.healthcheck.set_test("tcp", {"port": 3478}) %}
   {% do turn.set_command([
     "--fingerprint",
     "--use-auth-secret",
