@@ -1,4 +1,4 @@
-app_version: 1.4.31
+app_version: 1.4.32
 capabilities: []
 categories:
   - communication
@@ -30,4 +30,4 @@ sources:
   - https://github.com/dork40/wire
 title: Wire Private Server
 train: community
-version: 1.4.31
+version: 1.4.32
