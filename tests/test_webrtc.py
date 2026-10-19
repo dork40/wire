@@ -1,4 +1,6 @@
 import asyncio
+import queue
+import threading
 import unittest
 from unittest import mock
 
@@ -6,7 +8,7 @@ from av import VideoFrame
 
 import numpy as np
 
-from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats, SystemAudioTrack, configure_turn, ice_configuration
+from wire_webrtc import LatestFrameCapture, ScreenTrack, ShareStats, SystemAudioTrack, _wgc_capture_process, configure_turn, ice_configuration
 
 
 class _Capture:
@@ -59,7 +61,7 @@ class ScreenTrackTests(unittest.TestCase):
 
     def test_application_window_uses_windows_graphics_capture_backend(self):
         class NativeFrame:
-            frame_buffer = np.zeros((16, 16, 4), dtype=np.uint8)
+            frame_buffer = np.full((16, 16, 4), 127, dtype=np.uint8)
         class FakeCapture:
             last_kwargs = None
             def __init__(self, **kwargs):
@@ -69,21 +71,49 @@ class ScreenTrackTests(unittest.TestCase):
             def event(self, callback):
                 self.handlers[callback.__name__] = callback
                 return callback
-            def start_free_threaded(self):
+            def start(self):
                 class Control:
                     def stop(self): pass
-                    def wait(self): pass
                 self.handlers["on_frame_arrived"](NativeFrame(), Control())
-                capture.stop.set()
-                return Control()
-        capture = LatestFrameCapture(16, 16, 60, ShareStats(), window_name="Calculator")
-        with mock.patch("wire_webrtc.WindowsCapture", FakeCapture):
-            capture._run_wgc()
-        self.assertEqual(capture.backend, "windows-graphics-capture")
-        self.assertEqual(capture.latest()[0].width, 16)
+        class Value:
+            def __init__(self, value=0): self.value, self.lock = value, threading.Lock()
+            def get_lock(self): return self.lock
+        class Memory:
+            def __init__(self): self.buf = bytearray(16 * 16 * 4)
+            def close(self): pass
+        memory, sequence, status, stop, errors = Memory(), Value(), Value(), threading.Event(), queue.Queue()
+        with mock.patch("wire_webrtc.WindowsCapture", FakeCapture), \
+             mock.patch("wire_webrtc.shared_memory.SharedMemory", return_value=memory), \
+             mock.patch("wire_webrtc.ctypes.windll.ole32.CoInitializeEx", return_value=0), \
+             mock.patch("wire_webrtc.ctypes.windll.ole32.CoUninitialize"), \
+             mock.patch("wire_webrtc.ctypes.windll.combase.RoInitialize", return_value=0), \
+             mock.patch("wire_webrtc.ctypes.windll.combase.RoUninitialize"):
+            _wgc_capture_process(16, 16, 60, "Calculator", None, "test", sequence, status, stop, errors)
+        self.assertEqual(status.value, 1)
+        self.assertEqual(sequence.value, 1)
+        self.assertTrue(any(memory.buf))
         # Reserve time for scale/format conversion instead of adding a full
         # 17 ms WGC wait on top and unintentionally capping 60 FPS near 45.
         self.assertEqual(FakeCapture.last_kwargs["minimum_update_interval"], 7)
+
+    def test_window_capture_never_falls_back_to_full_monitor(self):
+        capture = LatestFrameCapture(640, 360, 60, ShareStats(), window_name="Calculator", window_hwnd=123)
+        with mock.patch.object(capture, "_run_wgc", side_effect=RuntimeError("WGC unavailable")), \
+             mock.patch.object(capture, "_run_dxcam", side_effect=lambda: capture.stop.set()) as dxgi, \
+             mock.patch("wire_webrtc.dxcam", object()):
+            capture._run()
+        dxgi.assert_called_once_with()
+        self.assertEqual(capture.backend, "dxgi-window")
+        self.assertIn("WGC unavailable", capture.backend_error)
+
+        no_handle = LatestFrameCapture(640, 360, 60, ShareStats(), window_name="Missing")
+        with mock.patch.object(no_handle, "_run_wgc", side_effect=RuntimeError("WGC unavailable")), \
+             mock.patch.object(no_handle, "_run_dxcam") as dxgi, \
+             mock.patch.object(no_handle, "_run_mss") as mss, \
+             mock.patch("wire_webrtc.dxcam", object()):
+            no_handle._run()
+        dxgi.assert_not_called(); mss.assert_not_called()
+        self.assertTrue(no_handle.stop.is_set())
 
 
 if __name__ == "__main__":

@@ -4,7 +4,8 @@ Windows uses Windows.Graphics.Capture for application windows, prefers DXGI for
 monitors, and falls back to MSS. Capture/encode/transport remain isolated so a
 future Linux PipeWire backend can replace only LatestFrameCapture.
 """
-import asyncio, ctypes, logging, os, queue, threading, time, warnings
+import asyncio, ctypes, logging, multiprocessing, os, queue, threading, time, warnings
+from multiprocessing import shared_memory
 from fractions import Fraction
 import av
 import mss
@@ -43,6 +44,66 @@ _H264_PROBE_COMPLETE = False
 _H264_HARDWARE_ENCODER = None
 _PREFER_H264_HARDWARE = True
 _DIRECTORY_TURN = None
+
+
+def _wgc_capture_process(width, height, fps, window_name, window_hwnd,
+                         memory_name, sequence, status, stop, errors):
+    """Own WGC in another process so its native wait cannot freeze Wire's GIL."""
+    memory = shared_memory.SharedMemory(name=memory_name)
+    destination = np.ndarray((height, width, 4), dtype=np.uint8, buffer=memory.buf)
+    reformatter = VideoReformatter()
+    com_initialized = False
+    winrt_initialized = False
+    try:
+        result = ctypes.windll.ole32.CoInitializeEx(None, 0)
+        # multiprocessing's Windows bootstrap may already initialize this
+        # process in a different COM apartment. RPC_E_CHANGED_MODE means COM
+        # is usable, but this worker must not balance the earlier owner's init.
+        if result & 0xffffffff == 0x80010106:
+            com_initialized = False
+        elif result not in (0, 1):
+            raise OSError(f"COM initialization failed: 0x{result & 0xffffffff:08x}")
+        else:
+            com_initialized = True
+        winrt_mode = 0 if result & 0xffffffff == 0x80010106 else 1
+        winrt_result = ctypes.windll.combase.RoInitialize(winrt_mode)
+        if winrt_result not in (0, 1):
+            raise OSError(f"WinRT initialization failed: 0x{winrt_result & 0xffffffff:08x}")
+        winrt_initialized = True
+        capture = WindowsCapture(cursor_capture=True, draw_border=False,
+                                 minimum_update_interval=max(1, round(1000 / fps) - 10),
+                                 window_name=None if window_hwnd else window_name,
+                                 window_hwnd=window_hwnd)
+
+        @capture.event
+        def on_frame_arrived(frame, capture_control):
+            if stop.is_set():
+                capture_control.stop()
+                return
+            converted = reformatter.reformat(VideoFrame.from_ndarray(frame.frame_buffer, format="bgra"),
+                                             width=width, height=height, format="bgra",
+                                             interpolation=Interpolation.FAST_BILINEAR)
+            with sequence.get_lock():
+                np.copyto(destination, converted.to_ndarray(format="bgra"))
+                sequence.value += 1
+                status.value = 1
+
+        @capture.event
+        def on_closed():
+            stop.set()
+
+        capture.start()
+    except Exception as exc:
+        status.value = -1
+        try: errors.put_nowait(str(exc))
+        except queue.Full: pass
+    finally:
+        stop.set()
+        if winrt_initialized:
+            ctypes.windll.combase.RoUninitialize()
+        if com_initialized:
+            ctypes.windll.ole32.CoUninitialize()
+        memory.close()
 
 
 def configure_turn(value):
@@ -204,10 +265,17 @@ class LatestFrameCapture:
         self.window_hwnd = window_hwnd
         self.frame = None; self.sequence = 0; self.lock = threading.Lock(); self.stop = threading.Event()
         self.paused = threading.Event()
+        self.ready = threading.Event()
         self.reformatter = VideoReformatter()
         self.backend = "mss"
+        self.backend_error = None
         self.thread = threading.Thread(target=self._run, daemon=True)
-    def start(self): self.thread.start()
+    def start(self):
+        self.thread.start()
+        if self.window_name or self.window_hwnd:
+            if not self.ready.wait(7) or self.frame is None:
+                self.close()
+                raise RuntimeError(self.backend_error or "application capture startup timed out")
     def _publish(self, raw, monitor, capture_cursor=True):
         began = time.monotonic()
         if capture_cursor:
@@ -227,39 +295,54 @@ class LatestFrameCapture:
         with self.lock:
             self.sequence += 1
             self.frame = (frame, self.sequence)
+            self.ready.set()
         self.stats.record_capture(time.monotonic() - began)
 
     def _run_wgc(self):
         """Capture one application through Windows.Graphics.Capture."""
         if WindowsCapture is None or not (self.window_name or self.window_hwnd):
             raise RuntimeError("Windows.Graphics.Capture is unavailable")
-        # windows-capture's minimum interval is applied in addition to callback
-        # processing.  Reserve a small conversion allowance here and let
-        # ScreenTrack perform the exact output pacing / stale-frame dropping.
-        # A full 17 ms wait plus a 3-5 ms scale step capped real 60 FPS shares
-        # around 45 FPS.
-        capture = WindowsCapture(cursor_capture=True, draw_border=False,
-                                 minimum_update_interval=max(1, round(1000 / self.fps) - 10),
-                                 window_name=None if self.window_hwnd else self.window_name,
-                                 window_hwnd=self.window_hwnd)
-
-        @capture.event
-        def on_frame_arrived(frame, capture_control):
-            if self.stop.is_set():
-                capture_control.stop()
-                return
-            if not self.paused.is_set():
-                self._publish(frame.frame_buffer, {"left": 0, "top": 0}, capture_cursor=False)
-
-        @capture.event
-        def on_closed():
-            self.stop.set()
-
         self.backend = "windows-graphics-capture"
-        control = capture.start_free_threaded()
-        self.stop.wait()
-        control.stop()
-        control.wait()
+        context = multiprocessing.get_context("spawn")
+        memory = shared_memory.SharedMemory(create=True, size=self.width * self.height * 4)
+        raw = np.ndarray((self.height, self.width, 4), dtype=np.uint8, buffer=memory.buf)
+        sequence = context.Value("Q", 0)
+        status = context.Value("i", 0)
+        worker_stop = context.Event()
+        errors = context.Queue(maxsize=1)
+        process = context.Process(target=_wgc_capture_process,
+                                  args=(self.width, self.height, self.fps, self.window_name,
+                                        self.window_hwnd, memory.name, sequence, status, worker_stop, errors),
+                                  name="wire-wgc", daemon=True)
+        try:
+            process.start()
+            last_sequence = 0
+            deadline = time.monotonic() + 4
+            while not self.stop.is_set():
+                if status.value < 0 or not process.is_alive():
+                    try: detail = errors.get_nowait()
+                    except queue.Empty: detail = "capture worker exited"
+                    raise RuntimeError(f"Windows.Graphics.Capture failed: {detail}")
+                with sequence.get_lock():
+                    current = sequence.value
+                    if current != last_sequence and not self.paused.is_set():
+                        self._publish(raw, {"left": 0, "top": 0}, capture_cursor=False)
+                        last_sequence = current
+                if current:
+                    deadline = float("inf")
+                elif time.monotonic() > deadline:
+                    raise RuntimeError("Windows.Graphics.Capture startup timed out")
+                time.sleep(0.001)
+        finally:
+            worker_stop.set()
+            if process.pid:
+                process.join(timeout=3)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=1)
+            memory.close()
+            memory.unlink()
+            errors.close()
 
     def _run_dxcam(self):
         # DXcam uses Windows Desktop Duplication. It is much faster than a GDI
@@ -267,10 +350,35 @@ class LatestFrameCapture:
         # drivers / remote desktop sessions, where MSS remains the fallback.
         with mss.mss() as cap:
             monitors = cap.monitors
-            mon = monitors[min(max(1, self.monitor_index), len(monitors) - 1)]
-        camera = dxcam.create(output_idx=max(0, self.monitor_index - 1), output_color="BGRA", max_buffer_len=2)
+            monitor_index = min(max(1, self.monitor_index), len(monitors) - 1)
+            region = None
+            if self.window_hwnd:
+                class Rect(ctypes.Structure):
+                    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+                rect = Rect()
+                if not ctypes.windll.user32.GetWindowRect(self.window_hwnd, ctypes.byref(rect)):
+                    raise RuntimeError("selected application window is unavailable")
+                center_x, center_y = (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
+                for index, candidate in enumerate(monitors[1:], 1):
+                    if (candidate["left"] <= center_x < candidate["left"] + candidate["width"]
+                            and candidate["top"] <= center_y < candidate["top"] + candidate["height"]):
+                        monitor_index = index
+                        break
+                mon = monitors[monitor_index]
+                left = max(0, rect.left - mon["left"]); top = max(0, rect.top - mon["top"])
+                right = min(mon["width"], rect.right - mon["left"])
+                bottom = min(mon["height"], rect.bottom - mon["top"])
+                if right - left < 2 or bottom - top < 2:
+                    raise RuntimeError("selected application window is outside the captured display")
+                region = (left, top, right, bottom)
+                publish_area = {"left": mon["left"] + left, "top": mon["top"] + top}
+            else:
+                mon = monitors[monitor_index]
+                publish_area = mon
+        camera = dxcam.create(output_idx=max(0, monitor_index - 1), output_color="BGRA", max_buffer_len=2)
         try:
-            camera.start(target_fps=min(self.fps, 120), video_mode=False)
+            camera.start(region=region, target_fps=min(self.fps, 120), video_mode=False)
             timestamp = None
             last_frame_available = time.monotonic()
             while not self.stop.is_set():
@@ -294,7 +402,7 @@ class LatestFrameCapture:
                     time.sleep(0.001)
                     continue
                 timestamp = next_timestamp
-                self._publish(raw, mon)
+                self._publish(raw, publish_area)
         finally:
             try:
                 camera.stop()
@@ -323,18 +431,30 @@ class LatestFrameCapture:
             try:
                 self._run_wgc()
                 return
-            except Exception:
-                # If a remembered window was closed, fall back to the selected
-                # monitor so /share still works instead of crashing.
-                self.backend = "mss"
+            except Exception as exc:
+                self.backend_error = str(exc)
+                # A full-monitor fallback would violate the user's explicit
+                # window selection. DXGI may capture occlusion, but crops to
+                # the selected HWND and never exposes the rest of the desktop.
+                if dxcam is not None and self.window_hwnd:
+                    try:
+                        self.backend = "dxgi-window"
+                        self._run_dxcam()
+                        return
+                    except Exception as fallback_exc:
+                        self.backend_error += f"; DXGI window fallback failed: {fallback_exc}"
+                self.stop.set()
+                self.ready.set()
+                return
         if os.name == "nt" and dxcam is not None:
             try:
                 self.backend = "dxgi"
                 self._run_dxcam()
                 return
-            except Exception:
+            except Exception as exc:
                 # A capture backend must never prevent sharing on a low-end
                 # PC, virtual machine, RDP session, or unsupported adapter.
+                self.backend_error = str(exc)
                 self.backend = "mss"
         self._run_mss()
     def latest(self):

@@ -63,6 +63,15 @@ New installs automatically connect to the Wire username directory at
   capabilities, no-new-privileges, bounded temporary storage, and graceful
   shutdown periods.
 
+## What's new in Wire 1.4.69
+
+- Isolates Windows.Graphics.Capture in a bounded shared-memory worker so a
+  native WinRT wait cannot freeze chat or settings.
+- Falls back to a DXGI crop of the selected application window when WGC is
+  unavailable, never to a full-monitor capture.
+- Preserves cursor position in the DXGI window fallback and reports backend
+  startup failures instead of leaving a black share running.
+
 ## Private self-hosted server
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with
@@ -137,7 +146,8 @@ then falls back to software x264. DXGI capture automatically falls back to MSS
 if desktop duplication stops producing frames.
 
 `/setting` can share either a monitor or one visible application window. Window
-capture uses Windows.Graphics.Capture, including the native cursor. The System
+capture prefers isolated Windows.Graphics.Capture and safely falls back to a
+DXGI crop of that window; neither path silently exposes the full monitor. The System
 audio setting captures the selected default Windows output through WASAPI
 loopback and sends 48 kHz stereo audio in the same DTLS-SRTP WebRTC session.
 On Windows, the separate viewer process presents frames through an accelerated
