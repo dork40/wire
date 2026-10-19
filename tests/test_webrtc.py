@@ -84,10 +84,9 @@ class ScreenTrackTests(unittest.TestCase):
         memory, sequence, status, stop, errors = Memory(), Value(), Value(), threading.Event(), queue.Queue()
         with mock.patch("wire_webrtc.WindowsCapture", FakeCapture), \
              mock.patch("wire_webrtc.shared_memory.SharedMemory", return_value=memory), \
-             mock.patch("wire_webrtc.ctypes.windll.ole32.CoInitializeEx", return_value=0), \
-             mock.patch("wire_webrtc.ctypes.windll.ole32.CoUninitialize"), \
-             mock.patch("wire_webrtc.ctypes.windll.combase.RoInitialize", return_value=0), \
-             mock.patch("wire_webrtc.ctypes.windll.combase.RoUninitialize"):
+             mock.patch("wire_webrtc.ctypes.windll", create=True) as windll:
+            windll.ole32.CoInitializeEx.return_value = 0
+            windll.combase.RoInitialize.return_value = 0
             _wgc_capture_process(16, 16, 60, "Calculator", None, "test", sequence, status, stop, errors)
         self.assertEqual(status.value, 1)
         self.assertEqual(sequence.value, 1)
@@ -100,7 +99,7 @@ class ScreenTrackTests(unittest.TestCase):
         capture = LatestFrameCapture(640, 360, 60, ShareStats(), window_name="Calculator", window_hwnd=123)
         with mock.patch.object(capture, "_run_wgc", side_effect=RuntimeError("WGC unavailable")), \
              mock.patch.object(capture, "_run_dxcam", side_effect=lambda: capture.stop.set()) as dxgi, \
-             mock.patch("wire_webrtc.dxcam", object()):
+             mock.patch("wire_webrtc.dxcam", object()), mock.patch("wire_webrtc.os.name", "nt"):
             capture._run()
         dxgi.assert_called_once_with()
         self.assertEqual(capture.backend, "dxgi-window")
@@ -110,7 +109,7 @@ class ScreenTrackTests(unittest.TestCase):
         with mock.patch.object(no_handle, "_run_wgc", side_effect=RuntimeError("WGC unavailable")), \
              mock.patch.object(no_handle, "_run_dxcam") as dxgi, \
              mock.patch.object(no_handle, "_run_mss") as mss, \
-             mock.patch("wire_webrtc.dxcam", object()):
+             mock.patch("wire_webrtc.dxcam", object()), mock.patch("wire_webrtc.os.name", "nt"):
             no_handle._run()
         dxgi.assert_not_called(); mss.assert_not_called()
         self.assertTrue(no_handle.stop.is_set())
