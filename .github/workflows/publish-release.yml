@@ -1,0 +1,91 @@
+name: Publish version notes
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "server-v*"
+      - "truenas-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify version and prepare release details
+        id: details
+        shell: python
+        env:
+          TAG: ${{ github.ref_name }}
+          TAG_COMMIT: ${{ github.sha }}
+        run: |
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          tag_commit = os.environ["TAG_COMMIT"].lower()
+          title = ""
+          instructions = ""
+
+          if tag.startswith("server-v"):
+              version = tag.removeprefix("server-v")
+              source = Path("wire-server.py").read_text(encoding="utf-8")
+              match = re.search(r'^SERVER_VERSION = "([^"]+)"$', source, re.M)
+              actual = match.group(1) if match else ""
+              title = f"Wire Server v{version}"
+              instructions = "Redeploy the Wire TrueNAS app or pull the matching ghcr.io/dork40/wire-server image. Preserve the existing data volume."
+          elif tag.startswith("truenas-v"):
+              version = tag.removeprefix("truenas-v")
+              source = Path("truenas-app/app.yaml").read_text(encoding="utf-8")
+              match = re.search(r"^version: ([^\s]+)$", source, re.M)
+              actual = match.group(1) if match else ""
+              title = f"Wire TrueNAS App v{version}"
+              instructions = "Refresh the TrueNAS app catalog and use Update for Wire. Existing state and backup volumes are preserved."
+          elif tag.startswith("v"):
+              version = tag.removeprefix("v")
+              with Path("pyproject.toml").open("rb") as source:
+                  actual = tomllib.load(source)["project"]["version"]
+              manifest = json.loads(Path("release-manifest.json").read_text(encoding="utf-8"))
+              if manifest.get("version") != version:
+                  raise SystemExit(f"release manifest is {manifest.get('version')!r}, expected {version!r}")
+              if str(manifest.get("commit", "")).lower() != tag_commit:
+                  raise SystemExit("client tag does not point to the commit authorized by the signed release manifest")
+              title = f"Wire v{version}"
+              instructions = "Run /update inside Wire. The client verifies the signed release manifest and installs the exact authorized commit."
+          else:
+              raise SystemExit(f"unsupported release tag: {tag}")
+
+          if actual != version:
+              raise SystemExit(f"{tag} does not match the source version {actual!r}")
+
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as stream:
+              stream.write(f"title={title}\n")
+              stream.write("instructions<<WIRE_RELEASE_EOF\n")
+              stream.write(instructions + "\n")
+              stream.write("WIRE_RELEASE_EOF\n")
+
+      - name: Publish GitHub release and generated change list
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.details.outputs.title }}
+          INSTRUCTIONS: ${{ steps.details.outputs.instructions }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving its curated notes unchanged."
+            exit 0
+          fi
+          notes=$(mktemp)
+          printf '## Updating\n\n%s\n\n## What changed\n\n' "$INSTRUCTIONS" > "$notes"
+          gh release create "$TAG" --verify-tag --title "$TITLE" --generate-notes --notes-file "$notes"

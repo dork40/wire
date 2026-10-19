@@ -67,6 +67,12 @@ directory is only started for development when `WIRE_LOCAL_DIRECTORY=1` is set.
 It checks for a newer release in the background at startup; use `/update` to
 show the result manually.
 
+Every version tag publishes a GitHub release automatically. Client tags use
+`vX.Y.Z`, directory-server tags use `server-vX.Y.Z`, and TrueNAS package tags
+use `truenas-vX.Y.Z`. The release job refuses tags that do not match the
+version stored in the corresponding source, and each release includes update
+instructions plus a generated list of changes.
+
 Wire v1.4.66 requires directory server v1.4.22 or newer for authenticated TLS;
 server v1.4.29 is recommended for encrypted multi-device sync, server status,
 and automatic verified state backups. The authenticated web dashboard verifies
