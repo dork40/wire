@@ -73,7 +73,7 @@ use `truenas-vX.Y.Z`. The release job refuses tags that do not match the
 version stored in the corresponding source, and each release includes update
 instructions plus a generated list of changes.
 
-Wire v1.4.66 requires directory server v1.4.22 or newer for authenticated TLS;
+Wire v1.4.67 requires directory server v1.4.22 or newer for authenticated TLS;
 server v1.4.29 is recommended for encrypted multi-device sync, server status,
 and automatic verified state backups. The authenticated web dashboard verifies
 the newest backup checksum and probes the local TURN listener instead of merely

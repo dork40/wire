@@ -61,8 +61,10 @@ class ScreenTrackTests(unittest.TestCase):
         class NativeFrame:
             frame_buffer = np.zeros((16, 16, 4), dtype=np.uint8)
         class FakeCapture:
+            last_kwargs = None
             def __init__(self, **kwargs):
                 self.kwargs = kwargs
+                FakeCapture.last_kwargs = kwargs
                 self.handlers = {}
             def event(self, callback):
                 self.handlers[callback.__name__] = callback
@@ -74,11 +76,14 @@ class ScreenTrackTests(unittest.TestCase):
                 self.handlers["on_frame_arrived"](NativeFrame(), Control())
                 capture.stop.set()
                 return Control()
-        capture = LatestFrameCapture(16, 16, 30, ShareStats(), window_name="Calculator")
+        capture = LatestFrameCapture(16, 16, 60, ShareStats(), window_name="Calculator")
         with mock.patch("wire_webrtc.WindowsCapture", FakeCapture):
             capture._run_wgc()
         self.assertEqual(capture.backend, "windows-graphics-capture")
         self.assertEqual(capture.latest()[0].width, 16)
+        # Reserve time for scale/format conversion instead of adding a full
+        # 17 ms WGC wait on top and unintentionally capping 60 FPS near 45.
+        self.assertEqual(FakeCapture.last_kwargs["minimum_update_interval"], 7)
 
 
 if __name__ == "__main__":

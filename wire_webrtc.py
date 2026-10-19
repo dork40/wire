@@ -233,8 +233,13 @@ class LatestFrameCapture:
         """Capture one application through Windows.Graphics.Capture."""
         if WindowsCapture is None or not (self.window_name or self.window_hwnd):
             raise RuntimeError("Windows.Graphics.Capture is unavailable")
+        # windows-capture's minimum interval is applied in addition to callback
+        # processing.  Reserve a small conversion allowance here and let
+        # ScreenTrack perform the exact output pacing / stale-frame dropping.
+        # A full 17 ms wait plus a 3-5 ms scale step capped real 60 FPS shares
+        # around 45 FPS.
         capture = WindowsCapture(cursor_capture=True, draw_border=False,
-                                 minimum_update_interval=max(1, round(1000 / self.fps)),
+                                 minimum_update_interval=max(1, round(1000 / self.fps) - 10),
                                  window_name=None if self.window_hwnd else self.window_name,
                                  window_hwnd=self.window_hwnd)
 
