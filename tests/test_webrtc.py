@@ -134,8 +134,10 @@ class ScreenTrackTests(unittest.TestCase):
             pointer._obj.left, pointer._obj.top = 100, 100
             pointer._obj.right, pointer._obj.bottom = 740, 580
             return True
+        fake_dxcam = mock.Mock()
+        fake_dxcam.create.return_value = camera
         with mock.patch("wire_webrtc.mss.mss", return_value=Desktop()), \
-             mock.patch("wire_webrtc.dxcam.create", return_value=camera), \
+             mock.patch("wire_webrtc.dxcam", fake_dxcam), \
              mock.patch("wire_webrtc.ctypes.windll", create=True) as windll:
             windll.user32.GetWindowRect.side_effect = window_rect
             capture._run_dxcam()
