@@ -31,13 +31,23 @@ from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Callable, Optional
 
-from cryptography import x509
-from cryptography.exceptions import InvalidTag
-from cryptography.fernet import Fernet, InvalidToken
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+try:
+    from cryptography import x509
+    from cryptography.exceptions import InvalidTag
+    from cryptography.fernet import Fernet, InvalidToken
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    CRYPTO_BACKEND = "cryptography"
+except ImportError:
+    # `cryptography`'s modern releases need a Rust toolchain to cross-compile,
+    # which python-for-android's Android build does not provide. wire_crypto_android
+    # re-implements this exact surface on pycryptodome (pure C, no Rust), checked
+    # byte-for-byte against `cryptography` in tests/test_crypto_backend_compat.py.
+    from wire_crypto_android import (x509, InvalidTag, Fernet, InvalidToken, hashes, serialization,
+                                      ed25519, x25519, AESGCM, HKDF, scrypt as _android_scrypt)
+    CRYPTO_BACKEND = "pycryptodome"
 from PIL import Image, ImageSequence
 try:
     import tkinter as tk
@@ -231,6 +241,11 @@ def derive(password: str, salt: bytes, parameters: Optional[dict] = None) -> byt
     n, r, p = int(params.get("n", 2**14)), int(params.get("r", 8)), int(params.get("p", 1))
     if n not in (2**14, 2**15, 2**16, 2**17) or r != 8 or not 1 <= p <= 5:
         raise ValueError("unsupported password protection parameters")
+    if CRYPTO_BACKEND == "pycryptodome":
+        # Some Android Python builds link OpenSSL without scrypt support;
+        # pycryptodome implements scrypt itself, so skip hashlib entirely
+        # rather than risk an AttributeError this far into login/signup.
+        return _android_scrypt(password.encode("utf-8"), salt, n=n, r=r, p=p, dklen=32)
     return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
 
 
