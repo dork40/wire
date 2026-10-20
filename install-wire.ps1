@@ -14,5 +14,5 @@ if ($servers) {
 }
 py -m pip install --user --upgrade pipx
 py -m pipx ensurepath
-py -m pipx install --force $Source
+py -m pipx install --force "wire-messenger[media] @ $Source"
 Write-Host 'Wire installed. Open a new terminal and run: wire'

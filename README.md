@@ -22,11 +22,23 @@ On Linux (Ubuntu, Fedora, or Arch), use:
 curl -fsSL https://raw.githubusercontent.com/dork40/wire/main/install-wire.sh | sh
 ```
 
+On Android, install [Termux](https://termux.dev) from F-Droid (not the stale
+Play Store build) and run the same command inside it. The installer detects
+Termux automatically and installs the plain chat path instead of the generic
+Linux branch, since Termux has no `sudo` and cannot build the native
+voice/screen-share stack.
+
 The installer adds Wire as the `wire` terminal command and installs its normal
 chat/voice/file dependencies. Chat, encrypted file transfers, groups, friends,
-and encrypted identity recovery are supported on Linux. X11 screen capture may
-work through MSS; Wayland screen capture is deliberately unavailable until a
-PipeWire/XDG Desktop Portal backend is implemented and tested.
+and encrypted identity recovery are supported on Linux, including Termux on
+Android — log in with the same username and password you use on desktop; your
+account, friends, and history carry over through encrypted identity recovery.
+X11 screen capture may work through MSS; Wayland screen capture is
+deliberately unavailable until a PipeWire/XDG Desktop Portal backend is
+implemented and tested. Voice calls and screen sharing need native WebRTC/media
+packages (`aiortc`, PyAV, portaudio) that are not installable on Termux; `/call`
+and `/share` report this clearly there instead of crashing, and texting, files,
+friends, and do-not-disturb are unaffected.
 
 `wire` is a command-line encrypted chat with usernames and rooms.
 New installs automatically connect to the Wire username directory at

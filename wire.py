@@ -48,10 +48,22 @@ except ImportError:
     tk = None
     ImageTk = None
 Image.MAX_IMAGE_PIXELS = 50_000_000
-import numpy as np
-from pywebrtc_audio import AudioProcessor
-import mss
-from wire_webrtc import WebRTCShare, configure_turn, network_diagnostics, probe_h264_hardware
+try:
+    import numpy as np
+    from pywebrtc_audio import AudioProcessor
+    import mss
+    from wire_webrtc import WebRTCShare, configure_turn, network_diagnostics, probe_h264_hardware
+except ImportError:
+    # Voice calls and screen sharing depend on native WebRTC/media packages
+    # (aiortc, PyAV, libportaudio-backed audio processing) that have no
+    # prebuilt wheel on every platform, notably Termux on Android. Chat,
+    # friends, encrypted file transfer, and identity recovery must still work
+    # as a plain phone terminal app even when that stack is entirely absent.
+    np = None
+    AudioProcessor = None
+    mss = None
+    WebRTCShare = configure_turn = network_diagnostics = probe_h264_hardware = None
+MEDIA_AVAILABLE = WebRTCShare is not None
 
 try:
     from prompt_toolkit import PromptSession
@@ -951,8 +963,8 @@ class Peer:
 class VoiceCall:
     """One encrypted, push-to-talk audio stream. Hold F12 to transmit."""
     def __init__(self, peer: Peer, settings: dict) -> None:
-        if sd is None or keyboard is None:
-            raise ValueError("voice support is not installed; restart Wire after updating")
+        if sd is None or keyboard is None or np is None or AudioProcessor is None:
+            raise ValueError("voice calls need extra packages that are not installed on this device; chat and files are fully supported")
         self.peer = peer
         self.settings = settings
         self.processor_lock = threading.Lock()
@@ -1256,7 +1268,9 @@ class Wire:
         say(f"data: {DATA}; diagnostics: {DIAGNOSTIC_LOG}")
         if self.webrtc_shares:
             self.show_share_stats()
-        if network:
+        if network and network_diagnostics is None:
+            say("network test unavailable: WebRTC/media packages are not installed on this device")
+        elif network:
             say("testing ICE/STUN/TURN; this can take several seconds...")
             try:
                 result = network_diagnostics()
@@ -2293,6 +2307,8 @@ class Wire:
         say(f"playing the first 5 seconds of {path.name}")
 
     def start_share(self, peer: Peer) -> None:
+        if WebRTCShare is None:
+            raise ValueError("screen sharing needs extra packages that are not installed on this device; chat and files are fully supported")
         if os.name != "nt" and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
             raise ValueError("Linux Wayland screen sharing needs the future PipeWire portal backend; chat and files are supported now")
         if self.webrtc_shares:
@@ -2349,6 +2365,9 @@ class Wire:
             raise ValueError("no pending screen share with that code")
         share_id = matches[0]
         state = self.pending_shares.pop(share_id)
+        if accept and WebRTCShare is None:
+            self.pending_shares[share_id] = state
+            raise ValueError("viewing a screen share needs extra packages that are not installed on this device")
         if not accept:
             peer = self.peers.get(str(state["from"]).lower())
             if peer:
@@ -2933,7 +2952,7 @@ class Wire:
             reply = recv_frame(sock)
             if reply.get("type") != "ready":
                 raise ConnectionError(reply.get("message", "directory rejected login"))
-            self.turn_configured = configure_turn(reply.get("turn"))
+            self.turn_configured = configure_turn(reply.get("turn")) if configure_turn else False
             sock.settimeout(None)
             self.server = sock
             # New directories advertise their wire-byte relay allowance. Keep
