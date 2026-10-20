@@ -1,4 +1,6 @@
 import os
+import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -150,6 +152,74 @@ class HeadlessFrontendTests(unittest.TestCase):
         app.send_message = lambda target, text: sent.append((target.name, text))
         self.assertTrue(wire.handle_input(app, "hello there"))
         self.assertEqual(sent, [("alice", "hello there")])
+
+
+class AndroidDownloadsDirTests(unittest.TestCase):
+    """DOWNLOADS_DIR must never crash computing itself, and on Android must
+    prefer the file-manager-visible external storage over the private
+    sandbox Path.home() resolves to there (see _android_downloads_dir's own
+    docstring for why that distinction matters for received files).
+    """
+
+    def setUp(self):
+        self._had_android_argument = "ANDROID_ARGUMENT" in os.environ
+        self._old_android_argument = os.environ.get("ANDROID_ARGUMENT")
+        self._old_jnius = sys.modules.get("jnius")
+
+    def tearDown(self):
+        if self._had_android_argument:
+            os.environ["ANDROID_ARGUMENT"] = self._old_android_argument
+        else:
+            os.environ.pop("ANDROID_ARGUMENT", None)
+        if self._old_jnius is not None:
+            sys.modules["jnius"] = self._old_jnius
+        else:
+            sys.modules.pop("jnius", None)
+
+    def test_desktop_without_android_argument_returns_none(self):
+        os.environ.pop("ANDROID_ARGUMENT", None)
+        self.assertIsNone(wire._android_downloads_dir())
+
+    def test_android_without_jnius_falls_back_safely(self):
+        os.environ["ANDROID_ARGUMENT"] = "1"
+        sys.modules.pop("jnius", None)  # not installed outside an Android build
+        self.assertIsNone(wire._android_downloads_dir())
+
+    def test_android_with_jnius_uses_external_files_dir(self):
+        os.environ["ANDROID_ARGUMENT"] = "1"
+
+        class FakeFile:
+            def getAbsolutePath(self):
+                return "/storage/emulated/0/Android/data/net.dork40.wire/files/Download"
+
+        class FakeActivity:
+            def getExternalFilesDir(self, kind):
+                assert kind == "DOWNLOAD_TYPE"
+                return FakeFile()
+
+        class FakePythonActivity:
+            mActivity = FakeActivity()
+
+        class FakeEnvironment:
+            DIRECTORY_DOWNLOADS = "DOWNLOAD_TYPE"
+
+        def fake_autoclass(name):
+            return {"org.kivy.android.PythonActivity": FakePythonActivity,
+                    "android.os.Environment": FakeEnvironment}[name]
+
+        fake_jnius = types.ModuleType("jnius")
+        fake_jnius.autoclass = fake_autoclass
+        sys.modules["jnius"] = fake_jnius
+
+        result = wire._android_downloads_dir()
+        self.assertEqual(result, Path("/storage/emulated/0/Android/data/net.dork40.wire/files/Download"))
+
+    def test_android_with_broken_jnius_falls_back_safely(self):
+        os.environ["ANDROID_ARGUMENT"] = "1"
+        fake_jnius = types.ModuleType("jnius")
+        fake_jnius.autoclass = lambda name: (_ for _ in ()).throw(RuntimeError("no activity yet"))
+        sys.modules["jnius"] = fake_jnius
+        self.assertIsNone(wire._android_downloads_dir())
 
 
 if __name__ == "__main__":

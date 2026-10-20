@@ -118,7 +118,34 @@ HISTORY_DIR = DATA / "history"
 CONTACTS_DIR = DATA / "contacts"
 SETTINGS_FILE = DATA / "settings.json"
 DIRECTORY_KEYS_FILE = DATA / "directory-keys.json"
-DOWNLOADS_DIR = Path.home() / "Downloads" / "Wire"
+
+
+def _android_downloads_dir() -> Optional[Path]:
+    """The file-manager-visible location for received files on Android.
+
+    `Path.home()` there resolves to the app's private sandbox (correct for
+    DATA above - it holds encrypted identity keys - but a received photo or
+    document saved only there is undiscoverable without root). Uses the
+    standard python-for-android pattern (Context.getExternalFilesDir) rather
+    than the MediaStore API: no WRITE_EXTERNAL_STORAGE/scoped-storage
+    permission dance, works unmodified across API levels, and lands at
+    Android/data/<package>/files/Download, reachable from a capable file
+    manager (Android 11+ hides that path from some stock file-manager UIs,
+    though every app can still reach its own).
+    """
+    if "ANDROID_ARGUMENT" not in os.environ:
+        return None
+    try:
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        environment = autoclass("android.os.Environment")
+        external = activity.getExternalFilesDir(environment.DIRECTORY_DOWNLOADS)
+        return Path(external.getAbsolutePath()) if external is not None else None
+    except Exception:
+        return None
+
+
+DOWNLOADS_DIR = _android_downloads_dir() or (Path.home() / "Downloads" / "Wire")
 DIAGNOSTIC_LOG = DATA / "wire-diagnostics.log"
 
 
