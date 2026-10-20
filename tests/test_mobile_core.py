@@ -84,5 +84,73 @@ class MobileCoreTests(unittest.TestCase):
         self.assertIn('python -m pipx install --force "$SOURCE"', linux_sh)
 
 
+class HeadlessFrontendTests(unittest.TestCase):
+    """A non-terminal frontend (the Android app) drives signup/login and
+    commands without getpass or prompt_toolkit's REPL loop.
+    """
+
+    def test_signup_accepts_a_password_argument_without_getpass(self):
+        app = wire.Wire()
+        old_load, old_save = wire.load_users, wire.save_users
+        saved = {}
+        wire.load_users = lambda: {}
+        wire.save_users = lambda users: saved.update(users)
+        old_getpass = wire.getpass.getpass
+        wire.getpass.getpass = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not prompt"))
+        try:
+            app.signup("mobiletester", password="correct horse battery staple")
+        finally:
+            wire.load_users, wire.save_users = old_load, old_save
+            wire.getpass.getpass = old_getpass
+        self.assertIn("mobiletester", saved)
+
+    def test_login_accepts_a_password_argument_without_getpass(self):
+        app = wire.Wire()
+        real = wire.Wire()
+        old_load, old_save = wire.load_users, wire.save_users
+        saved = {}
+        wire.load_users = lambda: {}
+        wire.save_users = lambda users: saved.update(users)
+        try:
+            real.signup("mobilelogin", password="correct horse battery staple")
+        finally:
+            wire.load_users, wire.save_users = old_load, old_save
+        account = saved["mobilelogin"]
+        wire.load_users = lambda: {"mobilelogin": account}
+        app.connect_server = lambda *a, **k: None
+        old_getpass = wire.getpass.getpass
+        wire.getpass.getpass = lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not prompt"))
+        try:
+            app.login("mobilelogin", password="correct horse battery staple")
+        finally:
+            wire.load_users = old_load
+            wire.getpass.getpass = old_getpass
+        self.assertEqual(app.name, "mobilelogin")
+
+    def test_run_command_quit_and_settings_delete_stop_the_session(self):
+        app = wire.Wire()
+        wire.say = lambda _line: None
+        self.assertFalse(wire.run_command(app, "quit", ""))
+        app.delete_account = lambda: None
+        self.assertFalse(wire.run_command(app, "settings", "delete"))
+
+    def test_run_command_server_stats_does_not_raise(self):
+        app = wire.Wire()
+        sent = []
+        app.server_send = sent.append
+        self.assertTrue(wire.run_command(app, "server", "stats"))
+        self.assertEqual(sent, [{"type": "server_stats"}])
+
+    def test_handle_input_routes_plain_text_to_the_open_room(self):
+        app = wire.Wire()
+        peer = wire.Peer("alice", None, os.urandom(32), os.urandom(32))
+        app.peers["alice"] = peer
+        app.room = "alice"
+        sent = []
+        app.send_message = lambda target, text: sent.append((target.name, text))
+        self.assertTrue(wire.handle_input(app, "hello there"))
+        self.assertEqual(sent, [("alice", "hello there")])
+
+
 if __name__ == "__main__":
     unittest.main()

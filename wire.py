@@ -1113,18 +1113,23 @@ class Wire:
         worker.start()
         return worker
 
-    def signup(self, name: str) -> None:
+    def signup(self, name: str, password: Optional[str] = None) -> None:
         if not name.isalnum() or not 3 <= len(name) <= 24:
             raise ValueError("username must be 3-24 letters/numbers")
         users = load_users()
         if name.lower() in users:
             raise ValueError("that username already exists on this PC")
-        first = getpass.getpass("password: ")
-        second = getpass.getpass("again: ")
-        if first != second:
-            raise ValueError("passwords do not match")
+        if password is None:
+            # No real tty/stdin exists in a frontend such as the Android app;
+            # it collects and confirms the password itself, then passes it
+            # here directly instead of going through getpass.
+            first = getpass.getpass("password: ")
+            second = getpass.getpass("again: ")
+            if first != second:
+                raise ValueError("passwords do not match")
+            password = first
         salt = os.urandom(16)
-        secret = derive(first, salt, CURRENT_KDF)
+        secret = derive(password, salt, CURRENT_KDF)
         private = x25519.X25519PrivateKey.generate()
         sign_private = ed25519.Ed25519PrivateKey.generate()
         raw_private = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
@@ -1139,10 +1144,11 @@ class Wire:
         save_users(users)
         say(f"made user {name}")
 
-    def login(self, name: str) -> None:
+    def login(self, name: str, password: Optional[str] = None) -> None:
         users = load_users()
         account = users.get(name.lower())
-        password = getpass.getpass("password: ")
+        if password is None:
+            password = getpass.getpass("password: ")
         if not account:
             account = self.restore_identity(name, password)
             users = load_users()
@@ -3483,6 +3489,333 @@ SETTINGS AND UTILITIES
 Typing indicators clear automatically five seconds after typing stops."""
 
 
+def run_command(app: "Wire", command: str, argument: str) -> bool:
+    """Execute one parsed slash command against `app`.
+
+    Returns False when the session should end (/quit, /update,
+    /settings delete). Pulled out of main()'s terminal REPL loop so any
+    frontend - the terminal prompt below, or the Android app's own input box
+    - drives identical command behavior through print()/say(), which each
+    frontend redirects itself (sys.stdout, wire.say) instead of needing a
+    real tty.
+    """
+    try:
+        if command == "help":
+            print(HELP)
+        elif command == "settings":
+            pieces = argument.split()
+            if not pieces:
+                app.settings_menu()
+            elif pieces == ["delete"]:
+                app.delete_account()
+                return False
+            else:
+                raise ValueError("use: /settings (use the arrow-key menu); /settings delete deletes your local account")
+        elif command == "signup":
+            app.signup(argument or input("username: ").strip())
+        elif command == "login":
+            app.login(argument or input("username: ").strip())
+        elif command == "private":
+            if not argument:
+                configured = load_directory_config()
+                if configured["mode"] == "private":
+                    print(f"private server: {configured['host']}:{configured['port']}")
+                else:
+                    raise ValueError("use: /private <server-ip-or-name>[:port]")
+            else:
+                host, port = parse_directory_endpoint(argument)
+                app.switch_directory("private", host, port)
+        elif command == "public":
+            app.switch_directory("public", DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT)
+        elif command == "discover":
+            app.server_send({"type": "discover", "query": argument})
+        elif command == "friends":
+            app.show_friends()
+        elif command == "friend":
+            friend_parts = argument.split(maxsplit=1)
+            if len(friend_parts) != 2:
+                raise ValueError("use: /friend add|accept|decline|remove <username>")
+            action, username = friend_parts
+            if action == "add":
+                app.server_send({"type": "friend_request", "to": username})
+            elif action in ("accept", "decline"):
+                app.server_send({"type": f"friend_{action}", "from": username})
+            elif action == "remove":
+                app.server_send({"type": "friend_remove", "name": username})
+            else:
+                raise ValueError("use: /friend add|accept|decline|remove <username>")
+        elif command == "block":
+            app.edit_contact("blocked", argument, add=True)
+            print(f"blocked: {argument}")
+        elif command == "unblock":
+            app.edit_contact("blocked", argument, add=False)
+            print(f"unblocked: {argument}")
+        elif command == "blocked":
+            print("\n".join(app.contacts()["blocked"]) or "no blocked users")
+        elif command == "history":
+            if not argument:
+                raise ValueError("use: history <username>")
+            pieces = argument.split()
+            if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
+                raise ValueError("use: /history <username> [ids]")
+            app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "search":
+            app.search_history(argument)
+        elif command == "group":
+            pieces = argument.split()
+            if not pieces or pieces[0] == "list":
+                app.groups.clear()
+                app.server_send({"type": "group_list"})
+            elif pieces[0] == "create" and len(pieces) >= 2:
+                app.server_send({"type": "group_create", "name": pieces[1], "members": pieces[2:]})
+            elif pieces[0] == "open" and len(pieces) == 2:
+                group = app.groups.get(pieces[1].lower())
+                if not group:
+                    app.server_send({"type": "group_list"})
+                    raise ValueError("groups refreshed; run /group open <name> again")
+                app.group_room = group["name"].lower()
+                app.room = None
+                print(f"group open: {group['name']} (type normally; /group leave {group['name']} to leave)")
+                app.show_group_members(group)
+                app.show_history(f"group-{group['name']}")
+            elif pieces[0] == "members" and len(pieces) == 2:
+                group = app.groups.get(pieces[1].lower())
+                if not group:
+                    raise ValueError("unknown group; use /group list first")
+                app.show_group_members(group)
+            elif pieces[0] in ("add", "invite") and len(pieces) == 3:
+                app.server_send({"type": "group_invite", "group": pieces[1], "member": pieces[2]})
+            elif pieces[0] == "accept" and len(pieces) == 2:
+                app.server_send({"type": "group_accept_invite", "group": pieces[1]})
+            elif pieces[0] == "kick" and len(pieces) == 3:
+                app.server_send({"type": "group_kick", "group": pieces[1], "member": pieces[2]})
+            elif pieces[0] in ("admin", "member") and len(pieces) == 3:
+                app.server_send({"type": "group_admin", "group": pieces[1], "member": pieces[2], "enabled": pieces[0] == "admin"})
+            elif pieces[0] in ("pin", "unpin") and len(pieces) == 3:
+                app.group_pin(pieces[1], pieces[2], remove=pieces[0] == "unpin")
+            elif pieces[0] == "pins" and len(pieces) == 2:
+                app.show_group_pins(pieces[1])
+            elif pieces[0] == "jump" and len(pieces) == 3:
+                app.jump_group_message(pieces[1], pieces[2])
+            elif pieces[0] == "leave" and len(pieces) == 2:
+                app.server_send({"type": "group_leave", "group": pieces[1]})
+            else:
+                raise ValueError("use: /group create <name> <people...> | list | open|members <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | jump <name> <message-code> | leave <name>")
+        elif command == "send":
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("open a room before sending a file")
+            if not argument:
+                raise ValueError("use: /send <file, image, video, or folder path>")
+            app.send_attachment(room_peer, argument)
+        elif command == "sendfile":
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("open a room before sending a file")
+            if not argument:
+                raise ValueError("use: /sendfile <file path>")
+            app.send_attachment(room_peer, argument)
+        elif command in ("reply", "react", "edit", "delete"):
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("open a room first")
+            pieces = argument.split(maxsplit=1)
+            if not pieces:
+                raise ValueError(f"use: /{command} <message-code>" + (" <text>" if command != "delete" else ""))
+            if command == "delete":
+                app.delete_message(room_peer, pieces[0])
+            elif len(pieces) != 2:
+                raise ValueError(f"use: /{command} <message-code> <text>")
+            elif command == "reply":
+                app.reply_message(room_peer, pieces[0], pieces[1])
+            elif command == "react":
+                app.react_message(room_peer, pieces[0], pieces[1])
+            else:
+                app.edit_message(room_peer, pieces[0], pieces[1])
+        elif command == "file":
+            pieces = argument.split(maxsplit=1)
+            if len(pieces) != 2 or pieces[0] not in ("accept", "decline", "resume"):
+                raise ValueError("use: /file accept|decline|resume <code>")
+            if pieces[0] == "resume":
+                app.resume_file(pieces[1])
+            else:
+                app.answer_file_offer(pieces[1], accept=pieces[0] == "accept")
+        elif command == "preview":
+            if not argument:
+                raise ValueError("use: /preview <video path>")
+            app.preview_video(argument)
+        elif command == "share":
+            pieces = argument.split(maxsplit=1)
+            if not pieces:
+                room_peer = app.peers.get(app.room or "")
+                if not room_peer:
+                    raise ValueError("open a room before sharing your screen")
+                app.start_share(room_peer)
+            elif len(pieces) == 2 and pieces[0] in ("accept", "decline"):
+                app.answer_share_offer(pieces[1], accept=pieces[0] == "accept")
+            elif pieces in (["stop"], ["close"]):
+                app.stop_screen_share()
+            elif pieces == ["stats"]:
+                app.show_share_stats()
+            elif pieces == ["pause"]:
+                app.pause_screen_share(True)
+            elif pieces == ["resume"]:
+                app.pause_screen_share(False)
+            else:
+                raise ValueError("use: /share | /share accept|decline <code> | /share pause|resume|stop|stats")
+        elif command == "ping":
+            ping_id = uuid.uuid4().hex
+            app.pending_pings[ping_id] = time.monotonic()
+            app.server_send({"type": "ping", "id": ping_id})
+        elif command == "diagnose":
+            if argument not in ("", "network"):
+                raise ValueError("use: /diagnose or /diagnose network")
+            app.diagnose(network=argument == "network")
+        elif command == "update":
+            print("Wire will close, then install the newest version in a separate window.")
+            start_update_after_exit()
+            return False
+        elif command == "checkupdate":
+            check_for_update()
+        elif command == "testnotify":
+            toast("Wire notifications are working.")
+            print("sent Windows notification test")
+        elif command == "image":
+            room_peer = app.peers.get(app.room or "")
+            pieces = argument.split(maxsplit=1)
+            if not room_peer or len(pieces) != 2 or pieces[0] not in ("accept", "decline"):
+                raise ValueError("use: /image accept <code> or /image decline <code>")
+            app.answer_image_offer(room_peer, pieces[1], accept=pieces[0] == "accept")
+        elif command == "call" and argument.strip().lower() == "stats":
+            app.show_call_stats()
+        elif command == "call":
+            if argument:
+                raise ValueError("use: /call or /call stats")
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("open a room before calling")
+            app.request_call(room_peer)
+        elif command == "acceptcall":
+            peer = app.peers.get(argument.lower())
+            if not peer:
+                raise ValueError("that person is not in a room")
+            app.accept_call(peer)
+        elif command == "declinecall":
+            peer = app.peers.get(argument.lower())
+            if not peer:
+                raise ValueError("that person is not in a room")
+            app.call_requests.discard(peer.name.lower())
+            peer.send_voice_frame({"kind": "end"})
+            print("voice call declined")
+        elif command == "hangup":
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("no active room")
+            app.end_call(room_peer)
+        elif command == "server":
+            pieces = argument.split()
+            if pieces == ["stats"]:
+                app.server_send({"type": "server_stats"})
+                return True
+            raise ValueError("use /private <server-ip-or-name> or /public; /server stats shows health")
+        elif command == "open":
+            if not argument:
+                raise ValueError("use: open <username>")
+            if app.is_blocked(argument):
+                raise ValueError("unblock that user before opening a room")
+            app.server_send({"type": "open", "to": argument})
+        elif command == "accept":
+            if app.is_blocked(argument):
+                raise ValueError("unblock that user before accepting")
+            public = app.requests.get(argument.lower())
+            if not public:
+                raise ValueError("no pending request from that user")
+            app.server_send({"type": "accept", "from": argument})
+        elif command == "listen":
+            app.listen(int(argument or PORT))
+        elif command == "connect":
+            pieces = argument.split()
+            if len(pieces) not in (2, 3):
+                raise ValueError("use: connect <username> <ip-or-host> [port]")
+            app.connect(pieces[0], pieces[1], int(pieces[2]) if len(pieces) == 3 else PORT)
+        elif command == "msg":
+            user, text = argument.split(maxsplit=1)
+            peer = app.peers.get(user.lower())
+            if not peer:
+                raise ValueError(f"not connected to {user}")
+            app.send_message(peer, text)
+        elif command == "peers":
+            print("\n".join(peer.name for peer in app.peers.values()) or "no peers")
+        elif command == "room":
+            peer = app.peers.get(argument.lower())
+            if not peer:
+                raise ValueError("not connected to that user")
+            app.room = peer.name.lower()
+            app.group_room = None
+            print(f"room open: {peer.name}")
+        elif command == "leave":
+            if app.group_room:
+                app.group_room = None
+                print("group closed")
+            else:
+                app.room = None
+                print("room closed")
+        elif command == "identity":
+            app.require_login()
+            print(fingerprint(app.public))
+        elif command == "fingerprint":
+            peer = app.peers.get(argument.lower())
+            if not peer:
+                raise ValueError("not connected to that user")
+            print(fingerprint(peer.public_key))
+        elif command == "exit":
+            app.close_active_chat()
+        elif command == "quit":
+            return False
+        else:
+            print("unknown command; open a chat to send messages, or type help")
+    except (ValueError, OSError, ConnectionError) as exc:
+        print(f"error: {exc}")
+    return True
+
+
+def handle_input(app: "Wire", line: str) -> bool:
+    """Process one line of raw input exactly as the terminal REPL does.
+
+    Returns False when the session should end. Shared by main()'s terminal
+    loop and any other frontend (the Android app) so both drive identical
+    command behavior without each reimplementing the room/group routing
+    below.
+    """
+    line = line.strip()
+    if not line:
+        return True
+    room_peer = app.peers.get(app.room or "")
+    # A room is normal chat: plain text goes straight to the active person.
+    # Prefix commands with / while inside a room, for example /leave.
+    if app.group_room and not line.startswith("/"):
+        try:
+            app.send_group_message(app.group_room, line)
+        except (OSError, ConnectionError, ValueError) as exc:
+            print(f"error: {exc}")
+        return True
+    if room_peer and not line.startswith("/"):
+        try:
+            app.send_message(room_peer, line)
+        except (OSError, ConnectionError, ValueError) as exc:
+            print(f"error: {exc}")
+        return True
+    if line.startswith("/"):
+        line = line[1:]
+    # An asynchronous status update can coincide with a bare slash.
+    # Do not let that turn into an empty command and crash Wire.
+    if not line.strip():
+        return True
+    command, *rest = line.split(maxsplit=1)
+    argument = rest[0] if rest else ""
+    return run_command(app, command, argument)
+
+
 def main() -> None:
     enable_terminal_color()
     if local_directory_requested():
@@ -3543,306 +3876,8 @@ def main() -> None:
                 break
             if not line:
                 continue
-            # A room is normal chat: plain text goes straight to the active person.
-            # Prefix commands with / while inside a room, for example /leave.
-            room_peer = app.peers.get(app.room or "")
-            if app.group_room and not line.startswith("/"):
-                try:
-                    app.send_group_message(app.group_room, line)
-                except (OSError, ConnectionError, ValueError) as exc:
-                    print(f"error: {exc}")
-                continue
-            if room_peer and not line.startswith("/"):
-                try:
-                    app.send_message(room_peer, line)
-                except (OSError, ConnectionError, ValueError) as exc:
-                    print(f"error: {exc}")
-                continue
-            if line.startswith("/"):
-                line = line[1:]
-            # An asynchronous status update can coincide with a bare slash.
-            # Do not let that turn into an empty command and crash Wire.
-            if not line.strip():
-                continue
-            command, *rest = line.split(maxsplit=1)
-            argument = rest[0] if rest else ""
-            try:
-                if command == "help":
-                    print(HELP)
-                elif command == "settings":
-                    pieces = argument.split()
-                    if not pieces:
-                        app.settings_menu()
-                    elif pieces == ["delete"]:
-                        app.delete_account()
-                        break
-                    else:
-                        raise ValueError("use: /settings (use the arrow-key menu); /settings delete deletes your local account")
-                elif command == "signup":
-                    app.signup(argument or input("username: ").strip())
-                elif command == "login":
-                    app.login(argument or input("username: ").strip())
-                elif command == "private":
-                    if not argument:
-                        configured = load_directory_config()
-                        if configured["mode"] == "private":
-                            print(f"private server: {configured['host']}:{configured['port']}")
-                        else:
-                            raise ValueError("use: /private <server-ip-or-name>[:port]")
-                    else:
-                        host, port = parse_directory_endpoint(argument)
-                        app.switch_directory("private", host, port)
-                elif command == "public":
-                    app.switch_directory("public", DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT)
-                elif command == "discover":
-                    app.server_send({"type": "discover", "query": argument})
-                elif command == "friends":
-                    app.show_friends()
-                elif command == "friend":
-                    friend_parts = argument.split(maxsplit=1)
-                    if len(friend_parts) != 2:
-                        raise ValueError("use: /friend add|accept|decline|remove <username>")
-                    action, username = friend_parts
-                    if action == "add":
-                        app.server_send({"type": "friend_request", "to": username})
-                    elif action in ("accept", "decline"):
-                        app.server_send({"type": f"friend_{action}", "from": username})
-                    elif action == "remove":
-                        app.server_send({"type": "friend_remove", "name": username})
-                    else:
-                        raise ValueError("use: /friend add|accept|decline|remove <username>")
-                elif command == "block":
-                    app.edit_contact("blocked", argument, add=True)
-                    print(f"blocked: {argument}")
-                elif command == "unblock":
-                    app.edit_contact("blocked", argument, add=False)
-                    print(f"unblocked: {argument}")
-                elif command == "blocked":
-                    print("\n".join(app.contacts()["blocked"]) or "no blocked users")
-                elif command == "history":
-                    if not argument:
-                        raise ValueError("use: history <username>")
-                    pieces = argument.split()
-                    if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
-                        raise ValueError("use: /history <username> [ids]")
-                    app.show_history(pieces[0], show_ids=len(pieces) == 2)
-                elif command == "search":
-                    app.search_history(argument)
-                elif command == "group":
-                    pieces = argument.split()
-                    if not pieces or pieces[0] == "list":
-                        app.groups.clear()
-                        app.server_send({"type": "group_list"})
-                    elif pieces[0] == "create" and len(pieces) >= 2:
-                        app.server_send({"type": "group_create", "name": pieces[1], "members": pieces[2:]})
-                    elif pieces[0] == "open" and len(pieces) == 2:
-                        group = app.groups.get(pieces[1].lower())
-                        if not group:
-                            app.server_send({"type": "group_list"})
-                            raise ValueError("groups refreshed; run /group open <name> again")
-                        app.group_room = group["name"].lower()
-                        app.room = None
-                        print(f"group open: {group['name']} (type normally; /group leave {group['name']} to leave)")
-                        app.show_group_members(group)
-                        app.show_history(f"group-{group['name']}")
-                    elif pieces[0] == "members" and len(pieces) == 2:
-                        group = app.groups.get(pieces[1].lower())
-                        if not group:
-                            raise ValueError("unknown group; use /group list first")
-                        app.show_group_members(group)
-                    elif pieces[0] in ("add", "invite") and len(pieces) == 3:
-                        app.server_send({"type": "group_invite", "group": pieces[1], "member": pieces[2]})
-                    elif pieces[0] == "accept" and len(pieces) == 2:
-                        app.server_send({"type": "group_accept_invite", "group": pieces[1]})
-                    elif pieces[0] == "kick" and len(pieces) == 3:
-                        app.server_send({"type": "group_kick", "group": pieces[1], "member": pieces[2]})
-                    elif pieces[0] in ("admin", "member") and len(pieces) == 3:
-                        app.server_send({"type": "group_admin", "group": pieces[1], "member": pieces[2], "enabled": pieces[0] == "admin"})
-                    elif pieces[0] in ("pin", "unpin") and len(pieces) == 3:
-                        app.group_pin(pieces[1], pieces[2], remove=pieces[0] == "unpin")
-                    elif pieces[0] == "pins" and len(pieces) == 2:
-                        app.show_group_pins(pieces[1])
-                    elif pieces[0] == "jump" and len(pieces) == 3:
-                        app.jump_group_message(pieces[1], pieces[2])
-                    elif pieces[0] == "leave" and len(pieces) == 2:
-                        app.server_send({"type": "group_leave", "group": pieces[1]})
-                    else:
-                        raise ValueError("use: /group create <name> <people...> | list | open|members <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | jump <name> <message-code> | leave <name>")
-                elif command == "send":
-                    room_peer = app.peers.get(app.room or "")
-                    if not room_peer:
-                        raise ValueError("open a room before sending a file")
-                    if not argument:
-                        raise ValueError("use: /send <file, image, video, or folder path>")
-                    app.send_attachment(room_peer, argument)
-                elif command == "sendfile":
-                    room_peer = app.peers.get(app.room or "")
-                    if not room_peer:
-                        raise ValueError("open a room before sending a file")
-                    if not argument:
-                        raise ValueError("use: /sendfile <file path>")
-                    app.send_attachment(room_peer, argument)
-                elif command in ("reply", "react", "edit", "delete"):
-                    room_peer = app.peers.get(app.room or "")
-                    if not room_peer:
-                        raise ValueError("open a room first")
-                    pieces = argument.split(maxsplit=1)
-                    if not pieces:
-                        raise ValueError(f"use: /{command} <message-code>" + (" <text>" if command != "delete" else ""))
-                    if command == "delete":
-                        app.delete_message(room_peer, pieces[0])
-                    elif len(pieces) != 2:
-                        raise ValueError(f"use: /{command} <message-code> <text>")
-                    elif command == "reply":
-                        app.reply_message(room_peer, pieces[0], pieces[1])
-                    elif command == "react":
-                        app.react_message(room_peer, pieces[0], pieces[1])
-                    else:
-                        app.edit_message(room_peer, pieces[0], pieces[1])
-                elif command == "file":
-                    pieces = argument.split(maxsplit=1)
-                    if len(pieces) != 2 or pieces[0] not in ("accept", "decline", "resume"):
-                        raise ValueError("use: /file accept|decline|resume <code>")
-                    if pieces[0] == "resume":
-                        app.resume_file(pieces[1])
-                    else:
-                        app.answer_file_offer(pieces[1], accept=pieces[0] == "accept")
-                elif command == "preview":
-                    if not argument:
-                        raise ValueError("use: /preview <video path>")
-                    app.preview_video(argument)
-                elif command == "share":
-                    pieces = argument.split(maxsplit=1)
-                    if not pieces:
-                        room_peer = app.peers.get(app.room or "")
-                        if not room_peer:
-                            raise ValueError("open a room before sharing your screen")
-                        app.start_share(room_peer)
-                    elif len(pieces) == 2 and pieces[0] in ("accept", "decline"):
-                        app.answer_share_offer(pieces[1], accept=pieces[0] == "accept")
-                    elif pieces in (["stop"], ["close"]):
-                        app.stop_screen_share()
-                    elif pieces == ["stats"]:
-                        app.show_share_stats()
-                    elif pieces == ["pause"]:
-                        app.pause_screen_share(True)
-                    elif pieces == ["resume"]:
-                        app.pause_screen_share(False)
-                    else:
-                        raise ValueError("use: /share | /share accept|decline <code> | /share pause|resume|stop|stats")
-                elif command == "ping":
-                    ping_id = uuid.uuid4().hex
-                    app.pending_pings[ping_id] = time.monotonic()
-                    app.server_send({"type": "ping", "id": ping_id})
-                elif command == "diagnose":
-                    if argument not in ("", "network"):
-                        raise ValueError("use: /diagnose or /diagnose network")
-                    app.diagnose(network=argument == "network")
-                elif command == "update":
-                    print("Wire will close, then install the newest version in a separate window.")
-                    start_update_after_exit()
-                    break
-                elif command == "checkupdate":
-                    check_for_update()
-                elif command == "testnotify":
-                    toast("Wire notifications are working.")
-                    print("sent Windows notification test")
-                elif command == "image":
-                    room_peer = app.peers.get(app.room or "")
-                    pieces = argument.split(maxsplit=1)
-                    if not room_peer or len(pieces) != 2 or pieces[0] not in ("accept", "decline"):
-                        raise ValueError("use: /image accept <code> or /image decline <code>")
-                    app.answer_image_offer(room_peer, pieces[1], accept=pieces[0] == "accept")
-                elif command == "call" and argument.strip().lower() == "stats":
-                    app.show_call_stats()
-                elif command == "call":
-                    if argument:
-                        raise ValueError("use: /call or /call stats")
-                    room_peer = app.peers.get(app.room or "")
-                    if not room_peer:
-                        raise ValueError("open a room before calling")
-                    app.request_call(room_peer)
-                elif command == "acceptcall":
-                    peer = app.peers.get(argument.lower())
-                    if not peer:
-                        raise ValueError("that person is not in a room")
-                    app.accept_call(peer)
-                elif command == "declinecall":
-                    peer = app.peers.get(argument.lower())
-                    if not peer:
-                        raise ValueError("that person is not in a room")
-                    app.call_requests.discard(peer.name.lower())
-                    peer.send_voice_frame({"kind": "end"})
-                    print("voice call declined")
-                elif command == "hangup":
-                    room_peer = app.peers.get(app.room or "")
-                    if not room_peer:
-                        raise ValueError("no active room")
-                    app.end_call(room_peer)
-                elif command == "server":
-                    pieces = argument.split()
-                    if pieces == ["stats"]:
-                        app.server_send({"type": "server_stats"})
-                        continue
-                    raise ValueError("use /private <server-ip-or-name> or /public; /server stats shows health")
-                elif command == "open":
-                    if not argument:
-                        raise ValueError("use: open <username>")
-                    if app.is_blocked(argument):
-                        raise ValueError("unblock that user before opening a room")
-                    app.server_send({"type": "open", "to": argument})
-                elif command == "accept":
-                    if app.is_blocked(argument):
-                        raise ValueError("unblock that user before accepting")
-                    public = app.requests.get(argument.lower())
-                    if not public:
-                        raise ValueError("no pending request from that user")
-                    app.server_send({"type": "accept", "from": argument})
-                elif command == "listen":
-                    app.listen(int(argument or PORT))
-                elif command == "connect":
-                    pieces = argument.split()
-                    if len(pieces) not in (2, 3):
-                        raise ValueError("use: connect <username> <ip-or-host> [port]")
-                    app.connect(pieces[0], pieces[1], int(pieces[2]) if len(pieces) == 3 else PORT)
-                elif command == "msg":
-                    user, text = argument.split(maxsplit=1)
-                    peer = app.peers.get(user.lower())
-                    if not peer:
-                        raise ValueError(f"not connected to {user}")
-                    app.send_message(peer, text)
-                elif command == "peers":
-                    print("\n".join(peer.name for peer in app.peers.values()) or "no peers")
-                elif command == "room":
-                    peer = app.peers.get(argument.lower())
-                    if not peer:
-                        raise ValueError("not connected to that user")
-                    app.room = peer.name.lower()
-                    app.group_room = None
-                    print(f"room open: {peer.name}")
-                elif command == "leave":
-                    if app.group_room:
-                        app.group_room = None
-                        print("group closed")
-                    else:
-                        app.room = None
-                        print("room closed")
-                elif command == "identity":
-                    app.require_login()
-                    print(fingerprint(app.public))
-                elif command == "fingerprint":
-                    peer = app.peers.get(argument.lower())
-                    if not peer:
-                        raise ValueError("not connected to that user")
-                    print(fingerprint(peer.public_key))
-                elif command == "exit":
-                    app.close_active_chat()
-                elif command == "quit":
-                    break
-                else:
-                    print("unknown command; open a chat to send messages, or type help")
-            except (ValueError, OSError, ConnectionError) as exc:
-                print(f"error: {exc}")
+            if not handle_input(app, line):
+                break
     finally:
         with PROMPT_REFRESH_LOCK:
             if PROMPT_REFRESH_TIMER is not None:
