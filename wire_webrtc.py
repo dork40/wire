@@ -378,7 +378,13 @@ class LatestFrameCapture:
                 publish_area = mon
         camera = dxcam.create(output_idx=max(0, monitor_index - 1), output_color="BGRA", max_buffer_len=2)
         try:
-            camera.start(region=region, target_fps=min(self.fps, 120), video_mode=False)
+            # A selected application may be completely static when sharing
+            # starts. DXcam's change-only mode then returns no first frame and
+            # makes a valid window look unavailable. Window sharing needs a
+            # paced current frame; monitor sharing remains change-driven to
+            # avoid wasting encode work on an idle desktop.
+            camera.start(region=region, target_fps=min(self.fps, 120),
+                         video_mode=bool(self.window_hwnd))
             timestamp = None
             last_frame_available = time.monotonic()
             while not self.stop.is_set():

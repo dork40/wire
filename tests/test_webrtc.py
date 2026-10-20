@@ -114,6 +114,35 @@ class ScreenTrackTests(unittest.TestCase):
         dxgi.assert_not_called(); mss.assert_not_called()
         self.assertTrue(no_handle.stop.is_set())
 
+    def test_dxgi_window_capture_produces_a_first_frame_when_static(self):
+        class Desktop:
+            monitors = [{}, {"left": 0, "top": 0, "width": 1920, "height": 1080}]
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+        class Camera:
+            def __init__(self): self.start_kwargs = None; self.capture = None
+            def start(self, **kwargs): self.start_kwargs = kwargs
+            def get_latest_frame(self, **_):
+                self.capture.stop.set()
+                return np.zeros((480, 640, 4), dtype=np.uint8), 1
+            def stop(self): pass
+            def release(self): pass
+        camera = Camera()
+        capture = LatestFrameCapture(640, 360, 60, ShareStats(), window_name="Settings", window_hwnd=123)
+        camera.capture = capture
+        def window_rect(_hwnd, pointer):
+            pointer._obj.left, pointer._obj.top = 100, 100
+            pointer._obj.right, pointer._obj.bottom = 740, 580
+            return True
+        with mock.patch("wire_webrtc.mss.mss", return_value=Desktop()), \
+             mock.patch("wire_webrtc.dxcam.create", return_value=camera), \
+             mock.patch("wire_webrtc.ctypes.windll", create=True) as windll:
+            windll.user32.GetWindowRect.side_effect = window_rect
+            capture._run_dxcam()
+        self.assertTrue(camera.start_kwargs["video_mode"])
+        self.assertEqual(camera.start_kwargs["region"], (100, 100, 740, 580))
+        self.assertIsNotNone(capture.latest())
+
 
 if __name__ == "__main__":
     unittest.main()

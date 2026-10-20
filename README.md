@@ -80,6 +80,15 @@ New installs automatically connect to the Wire username directory at
 - Preserves cursor position in the DXGI window fallback and reports backend
   startup failures instead of leaving a black share running.
 
+## What's new in Wire 1.4.70
+
+- Fixes application-window sharing when the selected window is static at
+  startup by requesting a paced first frame from the DXGI fallback.
+- Keeps full-monitor capture change-driven, avoiding needless capture and
+  encoding work when the desktop is idle.
+- Verifies system audio and video together through a real local DTLS-SRTP
+  WebRTC session, including clean shutdown of every media thread.
+
 ## Private self-hosted server
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with
@@ -121,7 +130,7 @@ use `truenas-vX.Y.Z`. The release job refuses tags that do not match the
 version stored in the corresponding source, and each release includes update
 instructions plus a generated list of changes.
 
-Wire v1.4.69 requires directory server v1.4.22 or newer for authenticated TLS;
+Wire v1.4.70 requires directory server v1.4.22 or newer for authenticated TLS;
 server v1.4.35 is recommended for encrypted multi-device sync, server status,
 automatic verified state backups, and the hardened TrueNAS containers. The
 authenticated web dashboard verifies the newest backup checksum and probes the
