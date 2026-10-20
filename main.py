@@ -35,6 +35,7 @@ KV = """
 <RoundField@TextInput>:
     multiline: False
     write_tab: False
+    font_name: "RobotoMono-Regular.ttf"
     background_normal: ""
     background_active: ""
     background_color: 0, 0, 0, 0
@@ -110,6 +111,7 @@ KV = """
                         size: self.size
             Label:
                 text: "WIRE"
+                font_name: "RobotoMono-Regular.ttf"
                 font_size: "34sp"
                 bold: True
                 color: 0.93, 0.98, 0.96, 1
@@ -205,14 +207,15 @@ KV = """
                 id: output
                 markup: True
                 text: root.log_text
+                font_name: "RobotoMono-Regular.ttf"
                 size_hint_y: None
                 height: self.texture_size[1] + dp(16)
                 text_size: self.width - dp(24), None
                 halign: "left"
                 valign: "top"
                 color: 0.91, 0.93, 0.96, 1
-                font_size: "14.5sp"
-                line_height: 1.25
+                font_size: "13.5sp"
+                line_height: 1.3
                 padding: dp(12), dp(12)
         BoxLayout:
             size_hint_y: None
