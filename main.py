@@ -148,7 +148,13 @@ class LoginScreen(Screen):
                 else:
                     app_state.login(username, password=password)
             except Exception as exc:  # noqa: BLE001 - shown to the person, not swallowed
-                Clock.schedule_once(lambda _dt: self._fail(str(exc)))
+                # `except ... as exc` implicitly deletes `exc` once this block
+                # exits (CPython does this to avoid traceback reference
+                # cycles). A lambda that reads `exc` lazily, after Clock
+                # actually runs it later, raises NameError instead - capture
+                # the message now, not the exception object.
+                message = str(exc)
+                Clock.schedule_once(lambda _dt: self._fail(message))
                 return
             Clock.schedule_once(lambda _dt: self._succeed(username))
 
