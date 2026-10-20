@@ -196,11 +196,16 @@ class _LineBufferedWriter:
     equivalent of that capture, applied once for the whole process.
     """
 
-    def __init__(self, append) -> None:
+    def __init__(self, append, also) -> None:
         self._append = append
+        self._also = also  # the real stdout/stderr, still reaching `adb logcat`
         self._buffer = ""
 
     def write(self, text: str) -> int:
+        try:
+            self._also.write(text)
+        except Exception:
+            pass
         self._buffer += text
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
@@ -224,8 +229,8 @@ class WireApp(App):
     def on_start(self) -> None:
         chat = self.manager.get_screen("chat")
         wire.say = lambda text: chat.append(text)
-        sys.stdout = _LineBufferedWriter(chat.append)
-        sys.stderr = _LineBufferedWriter(chat.append)
+        sys.stdout = _LineBufferedWriter(chat.append, sys.stdout)
+        sys.stderr = _LineBufferedWriter(chat.append, sys.stderr)
 
         # Without this, an uncaught exception on a background thread (login,
         # sending a message, anything in wire.py's worker threads) prints to

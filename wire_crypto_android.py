@@ -25,12 +25,12 @@ import time
 from typing import Optional
 
 from Crypto.Cipher import AES
-from Crypto.Protocol.DH import import_x25519_private_key, import_x25519_public_key
 from Crypto.Protocol.KDF import HKDF as _pycryptodome_hkdf
 from Crypto.Protocol.KDF import scrypt as _pycryptodome_scrypt
 from Crypto.Hash import SHA256 as _pycryptodome_sha256
 
 import wire_ed25519_pure
+import wire_x25519_pure
 
 
 class InvalidTag(Exception):
@@ -73,7 +73,6 @@ class X25519PrivateKey:
         if len(raw) != 32:
             raise ValueError("an X25519 private key is 32 bytes")
         self._raw = bytes(raw)
-        self._key = import_x25519_private_key(self._raw)
 
     @classmethod
     def generate(cls) -> "X25519PrivateKey":
@@ -88,12 +87,16 @@ class X25519PrivateKey:
         return self._raw
 
     def public_key(self) -> X25519PublicKey:
-        return X25519PublicKey(self._key.pointQ.x.to_bytes(32, "little"))
+        return X25519PublicKey(wire_x25519_pure.public_from_private(self._raw))
 
     def exchange(self, peer_public_key: X25519PublicKey) -> bytes:
-        peer = import_x25519_public_key(peer_public_key.public_bytes_raw())
-        shared_point = peer.pointQ * self._key.d
-        return shared_point.x.to_bytes(32, "little")
+        # Pure Python, not pycryptodome's compiled curve25519 code: its
+        # sibling Ed25519 module crashed the whole process on a real Android
+        # device (see Ed25519PrivateKey below), and this build's second
+        # crash - right where X25519 runs next in wire.py's login flow, no
+        # traceback either time - matches that same failure shape closely
+        # enough not to trust the X25519 native code either.
+        return wire_x25519_pure.exchange(self._raw, peer_public_key.public_bytes_raw())
 
 
 # --- Ed25519 (RFC 8032) ---------------------------------------------------
