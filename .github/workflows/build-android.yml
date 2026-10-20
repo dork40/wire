@@ -1,0 +1,41 @@
+name: Build Wire Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wire.py"
+      - "wire_crypto_android.py"
+      - "main.py"
+      - "buildozer.spec"
+      - ".github/workflows/build-android.yml"
+  pull_request:
+    paths:
+      - "wire.py"
+      - "wire_crypto_android.py"
+      - "main.py"
+      - "buildozer.spec"
+      - ".github/workflows/build-android.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    # python-for-android's Android SDK/NDK toolchain targets this specific
+    # Ubuntu base; newer default runners are not guaranteed compatible.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build debug APK with Buildozer
+        id: buildozer
+        uses: ArtemSBulgakov/buildozer-action@v1
+        with:
+          command: buildozer android debug
+          buildozer_version: stable
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wire-android-debug
+          path: ${{ steps.buildozer.outputs.filename }}
+          if-no-files-found: error
