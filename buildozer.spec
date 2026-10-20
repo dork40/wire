@@ -23,7 +23,11 @@ fullscreen = 0
 android.permissions = INTERNET
 android.api = 34
 android.minapi = 24
-android.ndk = 25b
+# python-for-android (develop) recommends NDK 28c as of this writing; NDK 25b's
+# older clang directory layout (lib/clang/<ver>/lib/linux/<arch>) doesn't match
+# what the libthorvg recipe (a Kivy 2.3.1 dependency) globs for, failing the
+# build with an IndexError looking for libomp.so.
+android.ndk = 28c
 android.archs = arm64-v8a
 android.allow_backup = True
 android.accept_sdk_license = True
