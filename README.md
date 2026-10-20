@@ -44,6 +44,48 @@ friends, and do-not-disturb are unaffected.
 New installs automatically connect to the Wire username directory at
 `wirecmd.ddns.net`; no IP address or server command is needed for normal use.
 
+## Android app
+
+`main.py` and `buildozer.spec` build Wire as a real Android app (not a
+terminal) — a small touch UI around the exact same `wire.py` login/chat
+logic, with the same mint/dark look as the rest of this project. Log in with
+your existing username and password; your account, friends, and history
+carry over the same way they do on Termux.
+
+It is not on an app store yet, so there is no one-line install. Each push to
+this repo's Android app files builds a debug APK via
+[`build-android.yml`](.github/workflows/build-android.yml) — grab the
+`wire-android-debug` artifact from the latest successful
+[Actions run](https://github.com/dork40/wire/actions/workflows/build-android.yml),
+copy it to the phone, and install it directly (Android will warn it is from
+an unrecognized source, since it is sideloaded rather than from a store;
+that warning is expected for a debug build you built yourself).
+
+The message box isn't just for chat — it accepts every `/command` the
+desktop terminal does (`/friend`, `/group`, `/history`, `/search`, `/reply`,
+`/react`, `/edit`, `/delete`, `/settings` including do-not-disturb, `/send`
+for files, `/block`, `/identity`, `/discover`, `/diagnose`, and so on): the
+app sends each line through `wire.handle_input()`, the exact same dispatcher
+the terminal client uses, not a smaller reimplementation. Type `/help` once
+signed in for the full list. The two real gaps are `/call` and `/share`
+(need the native WebRTC/media stack this build does not include, same as
+Termux) and a native file picker for `/send` (works today, but only by
+typing a real file path - there is no "browse files" button yet).
+
+`cryptography`'s modern releases need a Rust toolchain that does not
+cross-compile reliably for Android, so this build uses
+[`wire_crypto_android.py`](wire_crypto_android.py) instead — a
+pycryptodome-based drop-in, checked byte-for-byte against `cryptography`'s
+real output in
+[`tests/test_crypto_backend_compat.py`](tests/test_crypto_backend_compat.py).
+pycryptodome's own compiled Ed25519/X25519 code proved unreliable on-device
+on at least one real phone during testing (a silent process crash with no
+Python exception to catch), so those two primitives specifically run as
+pure-Python fallbacks
+([`wire_ed25519_pure.py`](wire_ed25519_pure.py),
+[`wire_x25519_pure.py`](wire_x25519_pure.py)) instead of pycryptodome's
+native modules; AES-GCM and scrypt stay on pycryptodome.
+
 ## What's new in server 1.4.32
 
 - Added an Account page to the TrueNAS Web UI with identity-backup status,
