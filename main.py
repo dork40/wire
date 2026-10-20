@@ -9,6 +9,7 @@ into the scrollback here instead of a terminal, matching how any other
 frontend (Termux, the desktop prompt) already captures them.
 """
 import sys
+import traceback
 import threading
 
 from kivy.app import App
@@ -225,6 +226,19 @@ class WireApp(App):
         wire.say = lambda text: chat.append(text)
         sys.stdout = _LineBufferedWriter(chat.append)
         sys.stderr = _LineBufferedWriter(chat.append)
+
+        # Without this, an uncaught exception on a background thread (login,
+        # sending a message, anything in wire.py's worker threads) prints to
+        # a stderr nobody on a phone can see and the thread just dies
+        # silently. Route it into the same visible scrollback instead. This
+        # cannot catch a native/non-Python crash (the Ed25519 segfault this
+        # was added after was exactly that kind, fixed separately in
+        # wire_crypto_android.py) - only genuine Python-level exceptions.
+        def report_thread_exception(args: threading.ExceptHookArgs) -> None:
+            text = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            Clock.schedule_once(lambda _dt: chat.append(f"[internal error]\n{text}"))
+
+        threading.excepthook = report_thread_exception
 
     def show_chat(self, username: str) -> None:
         chat = self.manager.get_screen("chat")

@@ -29,7 +29,8 @@ from Crypto.Protocol.DH import import_x25519_private_key, import_x25519_public_k
 from Crypto.Protocol.KDF import HKDF as _pycryptodome_hkdf
 from Crypto.Protocol.KDF import scrypt as _pycryptodome_scrypt
 from Crypto.Hash import SHA256 as _pycryptodome_sha256
-from Crypto.Signature import eddsa
+
+import wire_ed25519_pure
 
 
 class InvalidTag(Exception):
@@ -102,7 +103,6 @@ class Ed25519PublicKey:
         if len(raw) != 32:
             raise ValueError("an Ed25519 public key is 32 bytes")
         self._raw = bytes(raw)
-        self._key = eddsa.import_public_key(self._raw)
 
     @classmethod
     def from_public_bytes(cls, data: bytes) -> "Ed25519PublicKey":
@@ -115,8 +115,13 @@ class Ed25519PublicKey:
         return self._raw
 
     def verify(self, signature: bytes, data: bytes) -> None:
+        # Pure Python, not pycryptodome's compiled _ed25519.abi3.so: that
+        # native module crashes the whole process (no catchable exception,
+        # no tombstone) within milliseconds of first use on at least one
+        # real Android device. X25519 from the same pycryptodome build is
+        # unaffected and stays as-is; only Ed25519 needed this fallback.
         try:
-            eddsa.new(self._key, "rfc8032").verify(data, signature)
+            wire_ed25519_pure.verify(signature, data, self._raw)
         except ValueError as exc:
             raise InvalidSignature(str(exc)) from exc
 
@@ -126,7 +131,7 @@ class Ed25519PrivateKey:
         if len(raw) != 32:
             raise ValueError("an Ed25519 private key is 32 bytes")
         self._raw = bytes(raw)
-        self._key = eddsa.import_private_key(self._raw)
+        self._public = wire_ed25519_pure.public_from_seed(self._raw)
 
     @classmethod
     def generate(cls) -> "Ed25519PrivateKey":
@@ -141,10 +146,10 @@ class Ed25519PrivateKey:
         return self._raw
 
     def public_key(self) -> Ed25519PublicKey:
-        return Ed25519PublicKey(self._key.public_key().export_key(format="raw"))
+        return Ed25519PublicKey(self._public)
 
     def sign(self, data: bytes) -> bytes:
-        return eddsa.new(self._key, "rfc8032").sign(data)
+        return wire_ed25519_pure.sign(data, self._raw, self._public)
 
 
 class x25519:  # noqa: N801 - matches the `x25519` module name wire.py imports
