@@ -24,6 +24,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The Android SDK/NDK download and every recipe's cross-compile (Kivy,
+      # Pillow, pycryptodome, ...) otherwise redo from scratch on every run -
+      # 15+ minutes before the build even reaches our own app code.
+      - name: Cache buildozer/python-for-android state
+        uses: actions/cache@v4
+        with:
+          path: .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
       # The third-party ArtemSBulgakov/buildozer-action wraps this same image
       # with extra setup (installing a Java PPA) that broke against current
       # Ubuntu releases. Running the official image directly skips that

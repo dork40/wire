@@ -29,14 +29,16 @@ android.allow_backup = True
 android.accept_sdk_license = True
 
 p4a.bootstrap = sdl2
-# Pinned instead of floating on master: the unpinned toolchain's pure-Python
-# dependency install step (p4a auto-adds certifi/chardet/filetype/idna/
-# requests/six/urllib3 regardless of our own requirements) dropped the
-# --platform/--python-version flags on its real (non-dry-run) pip install,
-# so pip's own tag check correctly refused the android-tagged wheel it had
-# just resolved. Pinning to the latest tagged release instead of a moving
-# branch is also just more reproducible regardless of this specific bug.
-p4a.branch = v2026.05.09
+# python-for-android's auto-added pure-Python dependency install step
+# (certifi/chardet/filetype/idna/requests/six/urllib3 - not anything this
+# app requested) dropped the --platform/--python-version flags on its real
+# (non-dry-run) pip install inside a throwaway venv, so pip correctly
+# refused the android-tagged wheel it had just resolved. Fixed upstream by
+# kivy/python-for-android#3366 ("Remove venv creation for python package
+# install stage", merged 2026-08-24) - not in any tagged release yet, so
+# pin to develop instead of the last release (v2026.05.09, which predates
+# the fix and still fails) until one ships.
+p4a.branch = develop
 
 [buildozer]
 log_level = 2
