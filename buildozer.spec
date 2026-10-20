@@ -29,6 +29,14 @@ android.allow_backup = True
 android.accept_sdk_license = True
 
 p4a.bootstrap = sdl2
+# Pinned instead of floating on master: the unpinned toolchain's pure-Python
+# dependency install step (p4a auto-adds certifi/chardet/filetype/idna/
+# requests/six/urllib3 regardless of our own requirements) dropped the
+# --platform/--python-version flags on its real (non-dry-run) pip install,
+# so pip's own tag check correctly refused the android-tagged wheel it had
+# just resolved. Pinning to the latest tagged release instead of a moving
+# branch is also just more reproducible regardless of this specific bug.
+p4a.branch = v2026.05.09
 
 [buildozer]
 log_level = 2
