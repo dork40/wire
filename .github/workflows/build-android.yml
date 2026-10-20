@@ -20,22 +20,21 @@ on:
 
 jobs:
   build:
-    # python-for-android's Android SDK/NDK toolchain targets this specific
-    # Ubuntu base; newer default runners are not guaranteed compatible.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Build debug APK with Buildozer
-        id: buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
+      # The third-party ArtemSBulgakov/buildozer-action wraps this same image
+      # with extra setup (installing a Java PPA) that broke against current
+      # Ubuntu releases. Running the official image directly skips that
+      # unmaintained wrapper entirely.
+      - name: Build debug APK with the official Buildozer Docker image
+        run: |
+          docker run --rm -v "$PWD":/home/user/hostcwd ghcr.io/kivy/buildozer:latest android debug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: wire-android-debug
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
           if-no-files-found: error
