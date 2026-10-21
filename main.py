@@ -279,6 +279,12 @@ class LoginScreen(Screen):
                 # actually runs it later, raises NameError instead - capture
                 # the message now, not the exception object.
                 message = str(exc)
+                # The UI only ever shows a short message (restore_identity
+                # deliberately collapses every real cause into one generic
+                # string so a failed login can't be used to tell "wrong
+                # password" from "no such account"). Print the full chain so
+                # `adb logcat` can actually show what happened underneath.
+                traceback.print_exc()
                 Clock.schedule_once(lambda _dt: self._fail(message))
                 return
             Clock.schedule_once(lambda _dt: self._succeed(username))
