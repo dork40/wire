@@ -222,5 +222,73 @@ class AndroidDownloadsDirTests(unittest.TestCase):
         self.assertIsNone(wire._android_downloads_dir())
 
 
+class AndroidDataDirTests(unittest.TestCase):
+    """DATA (identity keys, directory-keys.json, settings, history) must
+    resolve to the app's actual writable sandbox on Android, not
+    Path.home() - confirmed on a real device that it returns '/data', a
+    privileged directory no regular app can write to. Every local write,
+    starting with pinning the directory's TLS key on the very first
+    connection, failed with PermissionError until this was fixed; both
+    test accounts could reach the server and decrypt their recovered
+    identity correctly but still failed login identically because of it.
+    """
+
+    def setUp(self):
+        self._had_android_argument = "ANDROID_ARGUMENT" in os.environ
+        self._old_android_argument = os.environ.get("ANDROID_ARGUMENT")
+        self._old_jnius = sys.modules.get("jnius")
+
+    def tearDown(self):
+        if self._had_android_argument:
+            os.environ["ANDROID_ARGUMENT"] = self._old_android_argument
+        else:
+            os.environ.pop("ANDROID_ARGUMENT", None)
+        if self._old_jnius is not None:
+            sys.modules["jnius"] = self._old_jnius
+        else:
+            sys.modules.pop("jnius", None)
+
+    def test_desktop_without_android_argument_returns_none(self):
+        os.environ.pop("ANDROID_ARGUMENT", None)
+        self.assertIsNone(wire._android_data_dir())
+
+    def test_android_without_jnius_falls_back_safely(self):
+        os.environ["ANDROID_ARGUMENT"] = "1"
+        sys.modules.pop("jnius", None)
+        self.assertIsNone(wire._android_data_dir())
+
+    def test_android_with_jnius_uses_get_files_dir(self):
+        os.environ["ANDROID_ARGUMENT"] = "1"
+
+        class FakeFile:
+            def getAbsolutePath(self):
+                return "/data/user/0/net.dork40.wire/files"
+
+        class FakeActivity:
+            def getFilesDir(self):
+                return FakeFile()
+
+        class FakePythonActivity:
+            mActivity = FakeActivity()
+
+        def fake_autoclass(name):
+            assert name == "org.kivy.android.PythonActivity"
+            return FakePythonActivity
+
+        fake_jnius = types.ModuleType("jnius")
+        fake_jnius.autoclass = fake_autoclass
+        sys.modules["jnius"] = fake_jnius
+
+        result = wire._android_data_dir()
+        self.assertEqual(result, Path("/data/user/0/net.dork40.wire/files"))
+
+    def test_android_with_broken_jnius_falls_back_safely(self):
+        os.environ["ANDROID_ARGUMENT"] = "1"
+        fake_jnius = types.ModuleType("jnius")
+        fake_jnius.autoclass = lambda name: (_ for _ in ()).throw(RuntimeError("no activity yet"))
+        sys.modules["jnius"] = fake_jnius
+        self.assertIsNone(wire._android_data_dir())
+
+
 if __name__ == "__main__":
     unittest.main()

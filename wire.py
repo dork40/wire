@@ -106,10 +106,36 @@ DEFAULT_DIRECTORY_HOST = "wirecmd.ddns.net"
 DEFAULT_DIRECTORY_PORT = 47666
 RELEASE_MANIFEST_URL = "https://api.github.com/repos/dork40/wire/contents/release-manifest.json?ref=main"
 RELEASE_SIGNING_PUBLIC_KEY = "BRO0YhoJwdmaB3ezYutx7VVbaSI205xR2x0pjS+H53M="
+def _android_data_dir() -> Optional[Path]:
+    """The app's private, writable storage root on Android.
+
+    `Path.home()` does not resolve to anything writable there (confirmed on
+    a real device: it returns '/data', a privileged system directory a
+    regular app has no permission to create files under - every local
+    write, starting with pinning the directory's TLS key on first connect,
+    failed with PermissionError). Context.getFilesDir() is the standard
+    python-for-android pattern for an app's own private storage, e.g.
+    /data/user/0/<package>/files - the same place Python's own interpreter
+    files already live, so it is known-writable.
+    """
+    if "ANDROID_ARGUMENT" not in os.environ:
+        return None
+    try:
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        files_dir = activity.getFilesDir()
+        return Path(files_dir.getAbsolutePath()) if files_dir is not None else None
+    except Exception:
+        return None
+
+
 # Account data must never live beside a versioned package/executable.  Updates,
 # pipx environments and portable builds can be replaced without losing users.
+_ANDROID_DATA_ROOT = _android_data_dir()
 if os.name == "nt":
     DATA = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Wire"
+elif _ANDROID_DATA_ROOT is not None:
+    DATA = _ANDROID_DATA_ROOT / "wire"
 else:
     DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "wire"
 USERS = DATA / "users.json"
