@@ -153,6 +153,13 @@ def verify(signature: bytes, message: bytes, public_key: bytes) -> None:
     R = _decodepoint(signature[: _b // 8])
     A = _decodepoint(public_key)
     S = _decodeint(signature[_b // 8: _b // 4])
+    if S >= _l:
+        # RFC 8032 requires 0 <= S < L. Without this, S + k*L verifies
+        # identically for any k, letting an attacker mutate a valid
+        # signature into other "valid" signatures for the same message -
+        # caught by a real on-device review (Codex) testing this exact
+        # case against cryptography's own Ed25519, which rejects it.
+        raise ValueError("signature S value is not canonical (S >= L)")
     h = _hint(_encodepoint(R) + public_key + message)
     left = _scalarmult(_BASE, S)
     right = _edwards(R, _scalarmult(A, h))

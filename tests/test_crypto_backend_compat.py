@@ -73,6 +73,29 @@ class CryptoBackendCompatTests(unittest.TestCase):
         with self.assertRaises(shim.InvalidSignature):
             shim.Ed25519PublicKey.from_public_bytes(real_pub_bytes).verify(real_sig, b"tampered")
 
+    def test_ed25519_rejects_non_canonical_s_like_real_cryptography(self):
+        """RFC 8032 requires 0 <= S < L; S + L verifies identically under
+        the naive equation, letting an attacker mutate a valid signature
+        into another "valid" one for the same message (malleability).
+        Caught by an independent review (Codex) that proved the shim
+        originally accepted this while real `cryptography` rejects it.
+        """
+        import wire_ed25519_pure
+
+        raw = os.urandom(32)
+        message = b"wire-v1 canonical S check"
+        real_priv = ed25519.Ed25519PrivateKey.from_private_bytes(raw)
+        real_pub_bytes = real_priv.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        sig = real_priv.sign(message)
+
+        r_half, s_half = sig[:32], int.from_bytes(sig[32:], "little")
+        tampered = r_half + (s_half + wire_ed25519_pure._l).to_bytes(32, "little")
+
+        with self.assertRaises(Exception):
+            ed25519.Ed25519PublicKey.from_public_bytes(real_pub_bytes).verify(tampered, message)
+        with self.assertRaises(shim.InvalidSignature):
+            shim.Ed25519PublicKey.from_public_bytes(real_pub_bytes).verify(tampered, message)
+
     def test_aes_gcm_ciphertext_and_decrypt_match(self):
         key, nonce, aad = os.urandom(32), os.urandom(12), b"wire-v1-message"
         plaintext = b"same ciphertext from either backend, please"
