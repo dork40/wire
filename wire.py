@@ -250,6 +250,11 @@ STREAM_PROFILES = ("auto", "low-resource", "balanced", "smooth", "gaming", "ultr
 TRANSFER_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # OWASP-equivalent scrypt work factor with modest RAM use for older laptops.
 CURRENT_KDF = {"name": "scrypt", "n": 2**14, "r": 8, "p": 5}
+# Anyone can request an account's recovery challenge, so a short password
+# is only protected by server-side rate limits. New passwords must be longer.
+MIN_PASSWORD_CHARS = 8
+# The directory drops a connection after 500 commands in 10 seconds.
+RESYNC_COMMANDS_PER_SECOND = 25
 PRINT_LOCK = threading.Lock()
 ACTIVE_PROMPT = "wire"
 SAFE_PROMPT_ACTIVE = False
@@ -312,6 +317,23 @@ def safe_terminal_text(value: object) -> str:
     """Remove terminal commands while preserving ordinary Unicode and newlines."""
     text = str(value)
     return "".join(char for char in text if char in "\n\t" or (ord(char) >= 32 and not 127 <= ord(char) <= 159 and char not in BIDI_CONTROLS))
+
+
+CHAT_KEY_RE = re.compile(r"(?:group-)?[A-Za-z0-9_-]{3,40}")
+
+
+def chat_key(value: str) -> str:
+    """Normalise "bob", "group crew" or "group-crew" to a history/mute key.
+
+    The same key names the local history file, so anything outside this
+    pattern (e.g. "../x" from a hostile directory) is refused outright.
+    """
+    key = value.strip().lower()
+    if key.startswith("group ") or key.startswith("#"):
+        key = "group-" + key.split(maxsplit=1)[-1].lstrip("#") if " " in key else "group-" + key[1:]
+    if not CHAT_KEY_RE.fullmatch(key):
+        raise ValueError("use a username, or group <name>")
+    return key
 
 
 def safe_filename(value: object, fallback: str = "file") -> str:
@@ -463,9 +485,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
     except Exception:
-        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "muted": [], "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
 
 
 def save_settings(settings: dict) -> None:
@@ -1224,6 +1246,8 @@ class Wire:
             if first != second:
                 raise ValueError("passwords do not match")
             password = first
+        if len(password) < MIN_PASSWORD_CHARS:
+            raise ValueError(f"use a password of at least {MIN_PASSWORD_CHARS} characters")
         salt = os.urandom(16)
         secret = derive(password, salt, CURRENT_KDF)
         private = x25519.X25519PrivateKey.generate()
@@ -1269,6 +1293,8 @@ class Wire:
         self.history_key = base64.urlsafe_b64encode(secret)
         self.account_secret = secret
         say(f"signed in as {self.name}")
+        if len(password) < MIN_PASSWORD_CHARS:
+            say(f"warning: your password is shorter than {MIN_PASSWORD_CHARS} characters and could be guessed; use /password to change it")
         try:
             self.connect_server()
         except (OSError, ConnectionError, ValueError) as exc:
@@ -1307,6 +1333,77 @@ class Wire:
             return account
         except Exception as exc:
             raise ValueError("no local user with that name; encrypted restore was unavailable") from exc
+
+    def change_password(self, current: Optional[str] = None, new: Optional[str] = None) -> None:
+        """Re-key the account: identity keys, local history and contacts, the
+        server backup, and synced copies all move to the new password.
+
+        Everything is decrypted and re-encrypted in memory first, then written,
+        so a wrong current password or an unreadable file changes nothing.
+        """
+        self.require_login()
+        if current is None:
+            current = getpass.getpass("current password: ")
+        if new is None:
+            new = getpass.getpass("new password: ")
+            if getpass.getpass("new password again: ") != new:
+                raise ValueError("new passwords do not match")
+        if len(new) < MIN_PASSWORD_CHARS:
+            raise ValueError(f"use a password of at least {MIN_PASSWORD_CHARS} characters")
+        if new == current:
+            raise ValueError("the new password is the same as the current one")
+        users = load_users()
+        account = users.get(self.name.lower())
+        if not isinstance(account, dict) or not self.account_secret:
+            raise ValueError("no local identity for this account")
+        old_secret = derive(current, unb64(account["salt"]), account.get("kdf"))
+        if not hmac.compare_digest(old_secret, self.account_secret):
+            raise ValueError("current password is wrong")
+        old_fernet = Fernet(base64.urlsafe_b64encode(old_secret))
+        salt = os.urandom(16)
+        new_secret = derive(new, salt, CURRENT_KDF)
+        new_fernet = Fernet(base64.urlsafe_b64encode(new_secret))
+        updated = dict(account, salt=b64(salt), kdf=dict(CURRENT_KDF),
+                       private=new_fernet.encrypt(old_fernet.decrypt(account["private"].encode("ascii"))).decode("ascii"),
+                       sign_private=new_fernet.encrypt(old_fernet.decrypt(account["sign_private"].encode("ascii"))).decode("ascii"))
+        with self.history_lock:
+            owned = list(HISTORY_DIR.glob(f"{self.name.lower()}--*.wire")) if HISTORY_DIR.exists() else []
+            if self.contacts_path().exists():
+                owned.append(self.contacts_path())
+            rewritten = {}
+            for path in owned:
+                try:
+                    rewritten[path] = new_fernet.encrypt(old_fernet.decrypt(path.read_bytes()))
+                except InvalidToken:
+                    continue  # already unreadable with this password; leave untouched
+            users[self.name.lower()] = updated
+            save_users(users)
+            for path, data in rewritten.items():
+                replace_private_bytes(path, data)
+            self.account_secret = new_secret
+            self.history_key = base64.urlsafe_b64encode(new_secret)
+        say(f"password changed; re-encrypted {len(rewritten)} local chat files")
+        if self.server:
+            self.backup_identity()
+            self.sync_settings()
+            self.start_worker(self.resync_history)
+            say("uploading the new encrypted backup and re-syncing history in the background")
+        else:
+            say("directory offline: sign in again while online so the server backup uses the new password")
+        say("on your other devices: /settings delete, then sign in with the new password")
+
+    def resync_history(self) -> None:
+        """Re-upload synced history under the current key, paced below the
+        directory's command rate limit."""
+        prefix = f"{self.name.lower()}--"
+        for path in sorted(HISTORY_DIR.glob(f"{prefix}*.wire")) if HISTORY_DIR.exists() else []:
+            peer_name = path.stem[len(prefix):]
+            for record in self.read_history(peer_name):
+                if self.closing.is_set() or not self.server:
+                    return
+                if isinstance(record, dict):
+                    self.sync_record(peer_name, record)
+                    time.sleep(1 / RESYNC_COMMANDS_PER_SECOND)
 
     def backup_identity(self) -> None:
         if not self.name or not self.account_secret: return
@@ -1451,6 +1548,8 @@ class Wire:
 
     def history_path(self, peer_name: str) -> Path:
         self.require_login()
+        if not CHAT_KEY_RE.fullmatch(peer_name):
+            raise ValueError("invalid chat name")
         return HISTORY_DIR / f"{self.name.lower()}--{peer_name.lower()}.wire"
 
     def contacts_path(self) -> Path:
@@ -1534,6 +1633,9 @@ class Wire:
         say(f"notifications: {'on' if self.settings['notifications'] else 'off'}")
         say(f"do not disturb: {'on' if self.settings['do_not_disturb'] else 'off'}")
         say(f"allow group invites: {'on' if self.settings['allow_group_invites'] else 'off'}")
+        say(f"chats from friends only: {'on' if self.settings['friends_only_rooms'] else 'off'}")
+        if self.settings["muted"]:
+            say(f"muted: {', '.join(self.settings['muted'])}")
         say(f"voice activation: {'always on' if self.settings['voice_mode'] == 'open' else 'hold F12 to talk'}")
         say(f"echo cancellation: {'on' if self.settings['voice_echo'] else 'off'}")
         say(f"noise removal: {('off', 'light', 'normal', 'strong')[self.settings['voice_noise']]}")
@@ -1549,10 +1651,11 @@ class Wire:
         say("images: ask before download")
 
     def sync_preferences(self) -> None:
-        """Tell the authenticated directory only the two server-enforced preferences."""
+        """Tell the authenticated directory only the server-enforced preferences."""
         if self.server:
             self.server_send({"type": "preferences", "dnd": self.settings["do_not_disturb"],
-                              "allow_group_invites": self.settings["allow_group_invites"]})
+                              "allow_group_invites": self.settings["allow_group_invites"],
+                              "friends_only_rooms": self.settings["friends_only_rooms"]})
 
     def sync_settings(self) -> None:
         if not self.server or not self.history_key:
@@ -1621,7 +1724,10 @@ class Wire:
             except (ValueError, TypeError, KeyError, InvalidTag, InvalidToken, json.JSONDecodeError):
                 continue
 
-    def notifications_allowed(self) -> bool:
+    def notifications_allowed(self, source: Optional[str] = None) -> bool:
+        """`source` is a person's name or "group-<name>"; muted ones stay silent."""
+        if source is not None and source.lower() in self.settings.get("muted", []):
+            return False
         return bool(self.settings["notifications"] and not self.settings["do_not_disturb"])
 
     def apply_voice_settings(self) -> None:
@@ -1678,6 +1784,7 @@ class Wire:
                 ("Notifications", "On" if self.settings["notifications"] else "Off"),
                 ("Do Not Disturb", "On" if self.settings["do_not_disturb"] else "Off"),
                 ("Allow group invites", "On" if self.settings["allow_group_invites"] else "Off"),
+                ("Chats from friends only", "On" if self.settings["friends_only_rooms"] else "Off"),
                 ("Voice activation", "Always on" if self.settings["voice_mode"] == "open" else "Push-to-talk (F12)"),
                 ("Echo cancellation", "On" if self.settings["voice_echo"] else "Off"),
                 ("Noise removal", ("Off", "Light", "Normal", "Strong")[self.settings["voice_noise"]]),
@@ -1701,6 +1808,7 @@ class Wire:
                 "Windows notifications appear only while Wire is not the active window.",
                 "Suppresses Wire notifications and tells the directory you are unavailable.",
                 "When off, the directory rejects new group invitations for you.",
+                "When on, the directory only lets friends open a chat with you.",
                 "Always on sends audio continuously; push-to-talk uses F12.",
                 "Applies to your next and current voice calls.",
                 "Higher noise removal can use more CPU.",
@@ -1741,54 +1849,56 @@ class Wire:
                     elif selected == 2:
                         self.settings["allow_group_invites"] = not self.settings["allow_group_invites"]
                     elif selected == 3:
-                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
+                        self.settings["friends_only_rooms"] = not self.settings["friends_only_rooms"]
                     elif selected == 4:
-                        self.settings["voice_echo"] = not self.settings["voice_echo"]
+                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
                     elif selected == 5:
-                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                        self.settings["voice_echo"] = not self.settings["voice_echo"]
                     elif selected == 6:
+                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                    elif selected == 7:
                         self.settings["voice_gain"] = not self.settings["voice_gain"]
-                    elif selected in (7, 8):
-                        choices = inputs if selected == 7 else outputs
-                        setting = "voice_input" if selected == 7 else "voice_output"
+                    elif selected in (8, 9):
+                        choices = inputs if selected == 8 else outputs
+                        setting = "voice_input" if selected == 8 else "voice_output"
                         if choices:
                             current = self.settings.get(setting)
                             position = next((i for i, (device_id, _) in enumerate(choices) if device_id == current), -1)
                             self.settings[setting] = choices[(position + direction) % len(choices)][0]
-                    elif selected == 9:
-                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
                     elif selected == 10:
+                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
+                    elif selected == 11:
                         if windows:
                             current = self.settings.get("stream_window", "")
                             position = windows.index(current) if current in windows else -1
                             self.settings["stream_window"] = windows[(position + direction) % len(windows)]
                             self.settings["stream_source"] = "window"
-                    elif selected == 11:
-                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 12:
-                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
+                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 13:
-                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 14:
-                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
                     elif selected == 15:
+                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                    elif selected == 16:
                         options = list(STREAM_PROFILES)
                         self.settings["stream_profile"] = options[(options.index(self.settings["stream_profile"]) + direction) % len(options)]
                         apply_stream_profile(self.settings)
-                    elif selected == 16:
+                    elif selected == 17:
                         options = ["auto", "H264", "VP8", "VP9", "AV1", "HEVC"]
                         self.settings["stream_codec"] = options[(options.index(self.settings["stream_codec"]) + direction) % len(options)]
-                    elif selected == 17:
-                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 18:
-                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 19:
+                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                    elif selected == 20:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
                     self.sync_settings()
                     self.apply_voice_settings()
                     self.sync_preferences()
-            elif key in ("enter", "escape") and selected == 20:
+            elif key in ("enter", "escape") and selected == 21:
                 print()
                 return
             elif key == "escape":
@@ -1873,7 +1983,7 @@ class Wire:
         self.close()
 
     def read_history(self, peer_name: str) -> list[dict]:
-        if not self.history_key:
+        if not self.history_key or not CHAT_KEY_RE.fullmatch(peer_name):
             return []
         path = self.history_path(peer_name)
         if not path.exists():
@@ -1940,6 +2050,37 @@ class Wire:
         for record in records[-30:]:
             say(self.render_record(record, show_id=show_ids))
         say("-- end earlier messages --")
+
+    def set_muted(self, target: str, muted: bool) -> None:
+        key = chat_key(target)
+        current = set(self.settings.get("muted", []))
+        (current.add if muted else current.discard)(key)
+        self.settings["muted"] = sorted(current)
+        save_settings(self.settings)
+        self.sync_settings()
+        label = key.replace("group-", "group ", 1)
+        say(f"{'muted' if muted else 'unmuted'} {label}" + (" (messages still arrive, just no pop-ups)" if muted else ""))
+
+    def export_history(self, target: str) -> Path:
+        """Write one chat's locally saved history to a readable text file.
+
+        Deliberately plaintext - that's the point of an export - so it goes to
+        the Downloads folder the person chose to use, not Wire's private data.
+        """
+        self.require_login()
+        key = chat_key(target)
+        records = self.read_history(key)
+        if not records:
+            raise ValueError("no saved messages for that chat on this device")
+        folder = DOWNLOADS_DIR / "Wire exports"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{key}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        lines = [f"Wire chat export: {key.replace('group-', 'group ', 1)}",
+                 f"Exported {time.strftime('%Y-%m-%d %H:%M')} by {self.name}. Only messages saved on this device are included.", ""]
+        lines += [f"[{safe_terminal_text(record.get('at', '?'))}] {self.render_record(record)}" for record in records if isinstance(record, dict)]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        say(f"exported {len(lines) - 3} messages to {path}")
+        return path
 
     def search_history(self, query: str) -> None:
         """Search locally decrypted history; this never contacts the directory."""
@@ -2280,7 +2421,8 @@ class Wire:
                 self.incoming_files.pop(file_id, None)
                 peer.send_control({"kind": "file_relay_complete", "id": file_id})
                 say(f"\nfile received and verified: {state['path']}")
-                toast(f"file received from {peer.name}: {state['path'].name}")
+                if self.notifications_allowed(peer.name):
+                    toast(f"file received from {peer.name}: {state['path'].name}")
                 if state["path"].suffix.lower() in VIDEO_EXTENSIONS:
                     say(f"video received. Type /preview \"{state['path']}\" to watch its first 5 seconds.")
                 restart_blank_prompt_after_background_output()
@@ -2383,7 +2525,8 @@ class Wire:
             temp.replace(target)
             self.paused_files.pop(file_id, None)
             say(f"\nfile received and verified: {target}")
-            toast(f"file received from {peer.name}: {name}")
+            if self.notifications_allowed(peer.name):
+                toast(f"file received from {peer.name}: {name}")
             if target.suffix.lower() in VIDEO_EXTENSIONS:
                 say(f"video received. Type /preview \"{target}\" to watch its first 5 seconds.")
             restart_blank_prompt_after_background_output()
@@ -2802,7 +2945,8 @@ class Wire:
             state["temp"].replace(state["path"])
             say(f"\nimage received: {state['path'].name}")
             self.preview_image(state["path"])
-            toast(f"image received from {peer.name}")
+            if self.notifications_allowed(peer.name):
+                toast(f"image received from {peer.name}")
 
     def stop_incoming_image(self, peer: Peer, image_id: str) -> None:
         state = self.incoming_images.get(image_id)
@@ -2990,7 +3134,7 @@ class Wire:
         peer.send_control({"kind": "message_read", "id": message_id})
         say(f"\n{self.render_record({'id': message_id, 'from': peer.name, 'text': text, 'reply_to': reply_to})}")
         redraw_prompt()
-        if self.notifications_allowed():
+        if self.notifications_allowed(peer.name):
             toast(f"new message from {peer.name}")
 
     def apply_message_control(self, peer: Peer, control: dict) -> None:
@@ -3200,6 +3344,8 @@ class Wire:
         group, sender, public, sign_public_value, identity_signature, encrypted = packet.get("group"), packet.get("from"), packet.get("public"), packet.get("sign_public"), packet.get("identity_signature"), packet.get("packet")
         if not isinstance(group, str) or not isinstance(sender, str) or not isinstance(public, str) or not isinstance(sign_public_value, str) or not isinstance(identity_signature, str) or not isinstance(encrypted, dict) or self.is_blocked(sender):
             return
+        if not CHAT_KEY_RE.fullmatch(f"group-{group}"):
+            return
         try:
             peer = self.relay_peer(sender, public, sign_public_value, identity_signature)
             if encrypted.get("type") != "msg":
@@ -3213,7 +3359,7 @@ class Wire:
         self.record_history(f"group-{group}", sender, text, message_id)
         say(f"\n[{safe_terminal_text(group)}] {safe_terminal_text(sender)} > {safe_terminal_text(text)}")
         redraw_prompt()
-        if self.notifications_allowed():
+        if self.notifications_allowed(f"group-{group}") and self.notifications_allowed(sender):
             toast(f"new group message in {group} from {sender}")
 
     def group_pin(self, group_name: str, prefix: str, remove: bool = False) -> None:
@@ -3563,6 +3709,9 @@ CHAT
   /history <name>                    Show saved messages without cluttering chat with IDs.
   /history <name> ids                Show saved messages with message codes for reply/edit/react.
   /search <words>                    Search your saved messages locally.
+  /mute <name> / /mute group <name>  Silence pop-ups from a person or group (/unmute to undo).
+  /export <name> / /export group <name>
+                                      Save that chat's history on this device to a text file.
   /reply <code> <text>               Reply to a saved message.
   /react <code> <emoji>              Add or replace your reaction.
   /edit <code> <text> / /delete <code>
@@ -3592,8 +3741,10 @@ GROUPS
 
 SETTINGS AND UTILITIES
   /settings                          Open the one arrow-key settings menu; changes save automatically.
-                                      Includes Do Not Disturb and Allow group invites.
+                                      Includes Do Not Disturb, Allow group invites, and
+                                      Chats from friends only.
   /settings delete                   Delete this PC's local account data.
+  /password                          Change your password (re-encrypts your keys and history).
   /identity / /fingerprint <name>    Show safety fingerprints.
   /ping / /testnotify / /diagnose   Connection, notification, and capability checks.
   /diagnose network                 Test real ICE, STUN, and TURN candidates.
@@ -3676,6 +3827,18 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
                 raise ValueError("use: /history <username> [ids]")
             app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "password":
+            app.change_password()
+        elif command in ("mute", "unmute"):
+            if argument.strip():
+                app.set_muted(argument, command == "mute")
+            else:
+                muted = [item.replace("group-", "group ", 1) for item in app.settings.get("muted", [])]
+                say("muted: " + (", ".join(muted) if muted else "nobody"))
+        elif command == "export":
+            if not argument.strip():
+                raise ValueError("use: /export <name> or /export group <name>")
+            app.export_history(argument)
         elif command == "search":
             app.search_history(argument)
         elif command == "group":

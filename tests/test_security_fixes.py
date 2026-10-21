@@ -110,6 +110,59 @@ class ForcedRoomServerTests(unittest.TestCase):
         self.assertEqual(crashes, [])
 
 
+class AbuseLimitTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.harness = ServerHarness()
+        self.server = self.harness.server
+
+    def tearDown(self) -> None:
+        self.harness.close()
+
+    def test_friends_only_blocks_strangers_but_not_friends(self):
+        alice = self.harness.login("alice")
+        friend = self.harness.login("friend")
+        stranger = self.harness.login("stranger")
+        users = self.server.load_users()
+        users["alice"]["friends"] = ["friend"]
+        self.server.save_users(users)
+        self.server.send(alice, {"type": "preferences", "friends_only_rooms": True, "allow_group_invites": True})
+        self.server.send(alice, {"type": "ping", "id": "sync"})
+        self.assertEqual(self.server.receive(alice)["type"], "pong")  # preferences applied
+        self.server.send(stranger, {"type": "open", "to": "alice"})
+        self.assertIn("only accepts chats from friends", self.server.receive(stranger)["message"])
+        self.server.send(friend, {"type": "open", "to": "alice"})
+        self.assertEqual(self.server.receive(alice)["type"], "request")
+        self.assertEqual(self.server.receive(friend)["type"], "waiting")
+
+    def test_password_guesses_are_capped_per_account_across_addresses(self):
+        allowed = [self.server.allow_recovery(f"10.0.0.{n}", "victim") for n in range(30)]
+        self.assertEqual(sum(allowed), self.server.MAX_ACCOUNT_RECOVERY_ATTEMPTS)
+        self.assertTrue(self.server.allow_recovery("10.0.0.99", "someoneelse"))
+
+    def test_new_accounts_are_capped_per_address_but_existing_logins_are_not(self):
+        self.server.MAX_NEW_ACCOUNTS_PER_IP = 2
+        self.harness.login("first")
+        self.harness.login("second")
+        with self.assertRaises(AssertionError):
+            self.harness.login("third")
+        self.assertNotIn("third", self.server.load_users())
+
+    def test_one_sender_cannot_fill_the_shared_offline_queue(self):
+        self.server.save_users({name: {"name": name} for name in ("spammer", "a", "b", "c", "other")})
+        self.server.MAX_OFFLINE_QUEUE_BYTES_PER_SENDER = 3000
+        packet = {"type": "relay", "from": "spammer", "packet": {"data": "x" * 900}}
+        results = [self.server.deliver_or_queue(target, packet) for target in ("a", "b", "c", "a", "b")]
+        self.assertEqual(results, [True, True, True, False, False])
+        self.assertTrue(self.server.deliver_or_queue("a", {"type": "relay", "from": "other", "packet": {"data": "y" * 900}}))
+
+    def test_rate_limit_tables_are_pruned(self):
+        self.server.MAX_TRACKED_KEYS = 10
+        for n in range(50):
+            self.server.RECOVERY_ATTEMPTS[f"stale-{n}"] = [0.0]
+        self.server.allow_recovery("fresh")
+        self.assertLessEqual(len(self.server.RECOVERY_ATTEMPTS), 2)
+
+
 class ForcedRoomClientTests(unittest.TestCase):
     def run_directory_packets(self, app: wire.Wire, packets: list[dict]) -> list[str]:
         attached: list[str] = []
