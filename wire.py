@@ -302,10 +302,33 @@ def derive(password: str, salt: bytes, parameters: Optional[dict] = None) -> byt
     return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
 
 
+# Bidirectional overrides/isolates make text render in a different order than
+# it is stored, e.g. "invoice_‮fdp.exe" displays as "invoice_exe.pdf".
+BIDI_CONTROLS = frozenset("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+WINDOWS_RESERVED_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))})
+
+
 def safe_terminal_text(value: object) -> str:
     """Remove terminal commands while preserving ordinary Unicode and newlines."""
     text = str(value)
-    return "".join(char for char in text if char in "\n\t" or (ord(char) >= 32 and not 127 <= ord(char) <= 159))
+    return "".join(char for char in text if char in "\n\t" or (ord(char) >= 32 and not 127 <= ord(char) <= 159 and char not in BIDI_CONTROLS))
+
+
+def safe_filename(value: object, fallback: str = "file") -> str:
+    """Turn a name chosen by another person into one safe to save and display.
+
+    Drops any folder part (either slash style, on every OS), terminal control
+    and bidi characters, characters Windows forbids (":" would otherwise write
+    an NTFS alternate data stream), trailing dots/spaces, and device names.
+    """
+    name = re.split(r"[\\/]", str(value))[-1]
+    name = "".join(char for char in name if ord(char) >= 32 and not 127 <= ord(char) <= 159 and char not in BIDI_CONTROLS)
+    name = re.sub(r'[<>:"|?*]', "_", name).rstrip(". ")[:200]
+    if not name or name in (".", ".."):
+        return fallback
+    if name.split(".", 1)[0].upper() in WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    return name
 
 
 def valid_transfer_id(value: object) -> bool:
@@ -1137,6 +1160,11 @@ class Wire:
         self.relay_next_send_at = 0.0
         self.relay_upload_bytes_per_second = RELAY_UPLOAD_BYTES_PER_SECOND
         self.requests: dict[str, str] = {}
+        # Room consent. Any directory user can make the server send us an
+        # "accepted" for an arbitrary name, so only attach a peer we either
+        # opened a room with or whose request we explicitly accepted.
+        self.outgoing_opens: set[str] = set()
+        self.accepted_requests: set[str] = set()
         self.incoming_images: dict[str, dict] = {}
         self.pending_images: dict[str, dict] = {}
         self.outgoing_images: dict[str, dict] = {}
@@ -2205,7 +2233,7 @@ class Wire:
             peer.send_control({"kind": "file_relay_decline", "id": file_id})
             say("file declined; nothing was downloaded")
             return
-        name, size, expected_hash = Path(str(offer.get("name", ""))).name, offer.get("size"), offer.get("sha256")
+        name, size, expected_hash = safe_filename(offer.get("name", "")), offer.get("size"), offer.get("sha256")
         if not name or not valid_transfer_id(file_id) or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid file offer")
         files_dir = DOWNLOADS_DIR / "Files"
@@ -2243,7 +2271,7 @@ class Wire:
                 state["hasher"].update(chunk)
                 state["written"] += len(chunk)
                 if time.monotonic() - state["last_status"] >= 0.5:
-                    self.transfer_status("downloading", offer["name"], state["written"], offer["size"], state["started"])
+                    self.transfer_status("downloading", state["path"].name, state["written"], offer["size"], state["started"])
                     state["last_status"] = time.monotonic()
             elif kind == "end":
                 if frame.get("size") != state["written"] or state["written"] != offer["size"] or not hmac.compare_digest(state["hasher"].hexdigest(), offer["sha256"]):
@@ -2252,7 +2280,7 @@ class Wire:
                 self.incoming_files.pop(file_id, None)
                 peer.send_control({"kind": "file_relay_complete", "id": file_id})
                 say(f"\nfile received and verified: {state['path']}")
-                toast(f"file received from {peer.name}: {offer['name']}")
+                toast(f"file received from {peer.name}: {state['path'].name}")
                 if state["path"].suffix.lower() in VIDEO_EXTENSIONS:
                     say(f"video received. Type /preview \"{state['path']}\" to watch its first 5 seconds.")
                 restart_blank_prompt_after_background_output()
@@ -2279,7 +2307,7 @@ class Wire:
         say("resuming encrypted file transfer...")
 
     def direct_receive_worker(self, peer: Peer, host: str, port: int, offer: dict, target_override: Optional[Path] = None) -> None:
-        name = Path(str(offer.get("name", "file"))).name
+        name = safe_filename(offer.get("name", "file"))
         size, file_id, token, expected_hash = offer.get("size"), offer.get("id"), offer.get("token"), offer.get("sha256")
         if not name or not isinstance(size, int) or not 0 <= size <= MAX_FILE_BYTES or not valid_transfer_id(file_id) or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token) or not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             say("file transfer rejected: invalid offer")
@@ -2722,7 +2750,7 @@ class Wire:
             return
         kind = frame.get("kind")
         if kind == "offer":
-            name = Path(str(frame.get("name", "image"))).name
+            name = safe_filename(frame.get("name", "image"), "image")
             size = frame.get("size")
             digest = frame.get("sha256")
             if (Path(name).suffix.lower() not in IMAGE_EXTENSIONS or not isinstance(size, int)
@@ -2740,7 +2768,7 @@ class Wire:
             offer = self.pending_images.pop(image_id, None)
             if not offer:
                 return
-            name = Path(str(frame.get("name", "image"))).name
+            name = safe_filename(frame.get("name", "image"), "image")
             size = frame.get("size")
             if name != offer["name"] or size != offer["size"] or frame.get("sha256") != offer["sha256"]:
                 return
@@ -3346,6 +3374,13 @@ class Wire:
                     say(f"online {packet.get('online', 0)}; accounts {packet.get('accounts', 0)}; groups {packet.get('groups', 0)}")
                     say(f"queued packets {packet.get('queued_packets', 0)}; TURN {'enabled' if packet.get('turn') else 'disabled'}")
                 elif kind == "accepted":
+                    name = packet.get("name")
+                    expected = name.lower() if isinstance(name, str) else ""
+                    if expected not in self.outgoing_opens and expected not in self.accepted_requests:
+                        continue
+                    self.outgoing_opens.discard(expected)
+                    self.accepted_requests.discard(expected)
+                    self.requests.pop(expected, None)
                     self.attach_relay_peer(packet["name"], packet["public"], packet["sign_public"], packet["identity_signature"])
                 elif kind == "relay":
                     sender = packet.get("from", "")
@@ -3805,6 +3840,7 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
                 raise ValueError("use: open <username>")
             if app.is_blocked(argument):
                 raise ValueError("unblock that user before opening a room")
+            app.outgoing_opens.add(argument.strip().lower())
             app.server_send({"type": "open", "to": argument})
         elif command == "accept":
             if app.is_blocked(argument):
@@ -3812,6 +3848,7 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             public = app.requests.get(argument.lower())
             if not public:
                 raise ValueError("no pending request from that user")
+            app.accepted_requests.add(argument.strip().lower())
             app.server_send({"type": "accept", "from": argument})
         elif command == "listen":
             app.listen(int(argument or PORT))

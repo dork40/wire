@@ -27,7 +27,7 @@ from cryptography.x509.oid import NameOID
 # restricted by the compose port mapping and firewall.
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")  # nosec B104
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.35"
+SERVER_VERSION = "1.4.36"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
@@ -42,6 +42,11 @@ BACKUP_INTERVAL_SECONDS = max(900, int(os.environ.get("WIRE_BACKUP_INTERVAL", "2
 BACKUP_RETAIN = max(2, min(365, int(os.environ.get("WIRE_BACKUP_RETAIN", "28"))))
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str, str]] = {}
+# target -> requesters with an outstanding room request. "accept" is only
+# honoured for a request that was actually made, so nobody can force a room
+# open on someone else's client.
+PENDING_OPENS: dict[str, set[str]] = {}
+MAX_PENDING_OPENS_PER_USER = 200
 # A client can be sent packets by its own handler and by any number of other
 # handlers (messages, file relay, group updates).  TCP is a byte stream, so
 # concurrent sendall() calls can splice two length-prefixed packets together.
@@ -237,7 +242,10 @@ def receive(sock: socket.socket) -> dict:
     size = struct.unpack("!I", receive_exact(sock, 4))[0]
     if size > MAX_CLIENT_FRAME_BYTES:
         raise ValueError("packet too large")
-    return json.loads(receive_exact(sock, size).decode("utf-8"))
+    packet = json.loads(receive_exact(sock, size).decode("utf-8"))
+    if not isinstance(packet, dict):
+        raise ValueError("packet must be a JSON object")
+    return packet
 
 
 def send(sock: socket.socket, packet: dict) -> None:
@@ -541,17 +549,28 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
         with LOCK:
             users = load_users()
             previous = users.get(key, {})
-            users[key] = {"name": name, "public": public, "sign_public": sign_public,
-                          "allow_group_invites": bool(previous.get("allow_group_invites", True)),
-                          "dnd": bool(previous.get("dnd", False)),
-                          "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
-                          "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
-            save_users(users)
-            ONLINE[key] = (name, sock, public, address[0], sign_public)
-            queues = load_queues()
-            queued_packets = queues.pop(key, [])
-            if queued_packets: save_queues(queues)
-        ready = {"type": "ready", "name": name, "version": SERVER_VERSION,
+            # Re-check under the same lock as the write: two different
+            # identities can both pass the first check for a brand-new name
+            # while their signatures are being verified.
+            taken = (previous.get("public") not in (None, public)
+                     or previous.get("sign_public") not in (None, sign_public)
+                     or key in ONLINE)
+            if not taken:
+                users[key] = {"name": name, "public": public, "sign_public": sign_public,
+                              "allow_group_invites": bool(previous.get("allow_group_invites", True)),
+                              "dnd": bool(previous.get("dnd", False)),
+                              "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
+                              "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
+                save_users(users)
+                ONLINE[key] = (name, sock, public, address[0], sign_public)
+                queues = load_queues()
+                queued_packets = queues.pop(key, [])
+                if queued_packets: save_queues(queues)
+        if taken:
+            key = None  # never registered here, so the cleanup below must not touch ONLINE
+            send(sock, {"type": "error", "message": "username belongs to another identity"})
+            return
+        ready ={"type": "ready", "name": name, "version": SERVER_VERSION,
                  "relay_rate": RELAY_RATE_BYTES_PER_SECOND}
         # Every signed-in Wire identity can use the relay. Security comes from
         # expiring credentials, quotas, and Coturn's private-network blocks,
@@ -583,8 +602,14 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "error", "message": "user is offline or does not exist"})
                 elif target == key:
                     send(sock, {"type": "error", "message": "cannot open a room with yourself"})
-                elif deliver(target, {"type": "request", "from": name, **signed_identity(name, public, sign_public)}):
-                    send(sock, {"type": "waiting", "to": target_info[0]})
+                else:
+                    with LOCK:
+                        pending = PENDING_OPENS.setdefault(target, set())
+                        if key not in pending and len(pending) >= MAX_PENDING_OPENS_PER_USER:
+                            pending.pop()
+                        pending.add(key)
+                    if deliver(target, {"type": "request", "from": name, **signed_identity(name, public, sign_public)}):
+                        send(sock, {"type": "waiting", "to": target_info[0]})
             elif kind == "discover":
                 query = packet.get("query", "").lower()
                 if not isinstance(query, str):
@@ -767,26 +792,6 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     users, groups = load_users(), load_groups()
                     details = [group_details(group, users, set(ONLINE)) for group in groups.values() if key in group.get("members", [])]
                 send(sock, {"type": "group_list", "groups": details})
-            elif kind == "group_add":
-                group_key, member = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower()
-                with LOCK:
-                    users, groups = load_users(), load_groups()
-                    group = groups.get(group_key)
-                    if not group or key not in group.get("admins", [group.get("owner")]):
-                        send(sock, {"type": "error", "message": "only group admins can add people"})
-                        continue
-                    if member not in users:
-                        send(sock, {"type": "error", "message": "that username does not exist"})
-                        continue
-                    if member not in group["members"] and len(group["members"]) >= MAX_GROUP_MEMBERS:
-                        send(sock, {"type": "error", "message": f"groups support up to {MAX_GROUP_MEMBERS} members"})
-                        continue
-                    if member not in group["members"]:
-                        group["members"].append(member)
-                        save_groups(groups)
-                    detail = group_details(group, users, set(ONLINE))
-                for member_key in group["members"]:
-                    deliver(member_key, {"type": "group_list", "groups": [detail]})
             elif kind == "group_invite":
                 group_key, member = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower()
                 with LOCK:
@@ -905,7 +910,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 source = packet.get("from", "").lower()
                 with LOCK:
                     source_info = ONLINE.get(source)
-                if not source_info:
+                    pending = PENDING_OPENS.get(key, set())
+                    requested = source in pending
+                    pending.discard(source)
+                if not requested:
+                    send(sock, {"type": "error", "message": "no pending room request from that person"})
+                elif not source_info:
                     send(sock, {"type": "error", "message": "requester is no longer online"})
                 else:
                     deliver(source, {"type": "accepted", **signed_identity(name, public, sign_public)})
@@ -928,11 +938,16 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 send(sock, {"type": "error", "message": "unknown request"})
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
         pass
+    except (AttributeError, KeyError, TypeError):
+        # A field of the wrong JSON type (e.g. "to": 5). Only this client's
+        # own connection is affected; drop it without a thread traceback.
+        pass
     finally:
         if key:
             with LOCK:
                 if ONLINE.get(key, (None, None, None))[1] is sock:
                     ONLINE.pop(key, None)
+                    PENDING_OPENS.pop(key, None)
             print(f"offline  {key}")
         try:
             sock.close()

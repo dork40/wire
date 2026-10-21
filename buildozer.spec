@@ -29,7 +29,7 @@ android.minapi = 24
 # build with an IndexError looking for libomp.so.
 android.ndk = 28c
 android.archs = arm64-v8a
-android.allow_backup = True
+android.allow_backup = False
 android.accept_sdk_license = True
 
 p4a.bootstrap = sdl2
