@@ -14,9 +14,12 @@ import threading
 
 from kivy.app import App
 from kivy.clock import Clock
+from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
 from kivy.lang import Builder
+from kivy.metrics import dp
 from kivy.properties import BooleanProperty, StringProperty
+from kivy.uix.label import Label
 from kivy.uix.screenmanager import Screen, ScreenManager
 from kivy.utils import escape_markup
 
@@ -213,20 +216,13 @@ KV = """
             id: scroller
             bar_width: dp(4)
             bar_color: 0.43, 0.9, 0.78, 0.4
-            Label:
-                id: output
-                markup: True
-                text: root.log_text
-                font_name: "RobotoMono-Regular.ttf"
+            BoxLayout:
+                id: log_box
+                orientation: "vertical"
                 size_hint_y: None
-                height: self.texture_size[1] + dp(16)
-                text_size: self.width - dp(24), None
-                halign: "left"
-                valign: "top"
-                color: 0.91, 0.93, 0.96, 1
-                font_size: "13.5sp"
-                line_height: 1.3
+                height: self.minimum_height
                 padding: dp(12), dp(12)
+                spacing: dp(2)
         BoxLayout:
             size_hint_y: None
             height: dp(64)
@@ -301,17 +297,99 @@ class LoginScreen(Screen):
         App.get_running_app().show_chat(username)
 
 
+class _LogLine(Label):
+    """One scrollback entry. Long-press copies its raw (unstyled) text to
+    the clipboard - phones have no mouse-drag text selection on a Label, so
+    this is the chat-app-standard way to grab a message (a link, a code, a
+    received password) without retyping it by hand.
+    """
+
+    LONG_PRESS_SECONDS = 0.45
+
+    def __init__(self, raw_text: str, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.raw_text = raw_text
+        self._press_event = None
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos):
+            touch.grab(self)
+            self._press_event = Clock.schedule_once(lambda _dt: self._copy(), self.LONG_PRESS_SECONDS)
+            return True
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self and self._press_event is not None:
+            self._press_event.cancel()
+            self._press_event = None
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)
+            if self._press_event is not None:
+                self._press_event.cancel()
+                self._press_event = None
+            return True
+        return super().on_touch_up(touch)
+
+    def _copy(self) -> None:
+        self._press_event = None
+        if not self.raw_text.strip():
+            return
+        Clipboard.copy(self.raw_text)
+        # Markup [color] tags override Label.color per-run, so flashing
+        # opacity (not color) is the one change that's visible on every line
+        # regardless of how it's styled.
+        self.opacity = 0.45
+        Clock.schedule_once(lambda _dt: setattr(self, "opacity", 1), 0.15)
+
+
 class ChatScreen(Screen):
-    log_text = StringProperty("")
     title_text = StringProperty("wire")
     connected = BooleanProperty(True)
 
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        # One resize listener for the whole log, not one per line - a
+        # per-line binding would never be unbound and would pile up for as
+        # long as the chat session runs.
+        self.ids.log_box.bind(width=self._resize_lines)
+
+    def _resize_lines(self, log_box, width) -> None:
+        for child in log_box.children:
+            child.text_size = (width - dp(24), None)
+
     def append(self, line: str) -> None:
-        styled = self._style_line(line)
-        self.log_text = f"{self.log_text}\n{styled}" if self.log_text else styled
+        log_box = self.ids.get("log_box")
+        if log_box is None:
+            return
+        # wire.say() sometimes passes a single call with embedded "\n"s
+        # (e.g. a leading blank line before a notification); give each
+        # resulting row its own widget so long-press-to-copy stays precise.
+        for raw in line.split("\n"):
+            log_box.add_widget(self._make_line(raw))
         scroller = self.ids.get("scroller")
         if scroller is not None:
             Clock.schedule_once(lambda _dt: setattr(scroller, "scroll_y", 0), 0)
+
+    def _make_line(self, raw: str) -> _LogLine:
+        log_box = self.ids.log_box
+        widget = _LogLine(
+            raw,
+            text=self._style_line(raw) or " ",
+            markup=True,
+            font_name="RobotoMono-Regular.ttf",
+            font_size="13.5sp",
+            line_height=1.3,
+            halign="left",
+            valign="top",
+            color=(0.91, 0.93, 0.96, 1),
+            size_hint_y=None,
+        )
+        widget.text_size = (log_box.width - dp(24), None)
+        widget.bind(texture_size=lambda inst, size: setattr(inst, "height", size[1]))
+        return widget
 
     @staticmethod
     def _style_line(line: str) -> str:
@@ -380,6 +458,11 @@ class _LineBufferedWriter:
 class WireApp(App):
     def build(self):
         Window.clearcolor = (0.02, 0.03, 0.04, 1)
+        # Default behaviour leaves the window where it is when the on-screen
+        # keyboard opens, so it covers the message field entirely and there
+        # is no way to see what's being typed. "below_target" pans the
+        # window up just enough to keep the focused field above the keyboard.
+        Window.softinput_mode = "below_target"
         self.wire_app = wire.Wire()
         Builder.load_string(KV)
         self.manager = ScreenManager()
