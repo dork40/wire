@@ -2,6 +2,7 @@ import base64
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -157,8 +158,11 @@ class AbuseLimitTests(unittest.TestCase):
 
     def test_rate_limit_tables_are_pruned(self):
         self.server.MAX_TRACKED_KEYS = 10
+        # time.monotonic() counts from boot on Linux, so "0" can be recent on
+        # a fresh CI machine - make the stale stamps unambiguously old.
+        long_ago = time.monotonic() - self.server.RECOVERY_WINDOW_SECONDS - 60
         for n in range(50):
-            self.server.RECOVERY_ATTEMPTS[f"stale-{n}"] = [0.0]
+            self.server.RECOVERY_ATTEMPTS[f"stale-{n}"] = [long_ago]
         self.server.allow_recovery("fresh")
         self.assertLessEqual(len(self.server.RECOVERY_ATTEMPTS), 2)
 
