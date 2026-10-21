@@ -20,6 +20,10 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libportaudio2
       - run: python -m pip install --upgrade pip
       - run: python -m pip install ".[media]"
+      # test_crypto_backend_compat.py imports wire_crypto_android.py (the
+      # Android build's pycryptodome-based crypto shim) unconditionally, to
+      # compare its output against the real `cryptography` package here.
+      - run: python -m pip install pycryptodome
       - run: python -m unittest discover -s tests -v
       - if: runner.os == 'Linux'
         name: Validate TrueNAS Community App package

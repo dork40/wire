@@ -2519,7 +2519,8 @@ class Wire:
                 say(f"GIF received: {path.name}")
                 # GIFs arrive through the normal /send image flow. Play one
                 # compact loop without asking the recipient for another
-                # command or opening an external image window.
+                # command or opening an external image window. preview_gif
+                # repaints the prompt itself once the loop actually finishes.
                 self.start_worker(self.preview_gif, str(path))
                 return
             # CMD's ANSI/color support is inconsistent and the old text card
@@ -2528,6 +2529,7 @@ class Wire:
             if os.name == "nt":
                 os.startfile(path)
                 say(f"opened image: {path.name}")
+                restart_blank_prompt_after_background_output()
                 return
             with Image.open(path) as image:
                 image = image.convert("RGB")
@@ -2549,8 +2551,10 @@ class Wire:
                         row.append(f"\x1b[38;2;{top[0]};{top[1]};{top[2]}m\x1b[48;2;{bottom[0]};{bottom[1]};{bottom[2]}m##")
                     say("  │" + "".join(row) + "\x1b[0m│")
                 say("  └" + "─" * card_width + "┘")
+                restart_blank_prompt_after_background_output()
         except Exception:
             say("[image preview unavailable]")
+            restart_blank_prompt_after_background_output()
 
     @staticmethod
     def gif_frame_text(image: Image.Image, name: str) -> tuple[str, int]:
@@ -2590,6 +2594,11 @@ class Wire:
                         time.sleep(min(0.15, max(0.04, frame.info.get("duration", 100) / 1000)))
                 finally:
                     print("\x1b[0m\x1b[?25h", flush=True)
+                    # Every frame above was a raw print(), not say() - none
+                    # of it went through patch_stdout, so prompt_toolkit's
+                    # cursor accounting is now stale. Force the same repaint
+                    # a real Enter keypress would trigger.
+                    restart_blank_prompt_after_background_output()
         except (OSError, ValueError) as exc:
             raise ValueError(f"could not play GIF: {exc}") from exc
 
@@ -2637,6 +2646,11 @@ class Wire:
                 output.append("-")
         output.append("\x1b\\")
         say("".join(output))
+        # The sixel bitmap occupies real terminal rows that prompt_toolkit's
+        # line-based cursor accounting never sees (no "\n" in this string),
+        # so its cached screen desyncs from the real one and stays stuck
+        # until something forces a full repaint - this is that repaint.
+        restart_blank_prompt_after_background_output()
 
     def send_image(self, peer: Peer, value: str) -> None:
         path = Path(value.strip().strip('"')).expanduser()
