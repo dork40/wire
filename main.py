@@ -128,10 +128,20 @@ KV = """
         RoundField:
             id: username
             hint_text: "username"
-        RoundField:
-            id: password
-            hint_text: "password"
-            password: True
+        BoxLayout:
+            size_hint_y: None
+            height: dp(52)
+            spacing: dp(8)
+            RoundField:
+                id: password
+                hint_text: "password"
+                password: not root.show_password
+            GhostButton:
+                text: "show" if not root.show_password else "hide"
+                size_hint_x: None
+                width: dp(72)
+                font_size: "13sp"
+                on_release: root.show_password = not root.show_password
         Widget:
             size_hint_y: None
             height: dp(6)
@@ -245,6 +255,7 @@ KV = """
 class LoginScreen(Screen):
     status = StringProperty("")
     busy = BooleanProperty(False)
+    show_password = BooleanProperty(False)
 
     def submit(self, username: str, password: str, signup: bool) -> None:
         username = username.strip()
