@@ -67,10 +67,21 @@ desktop terminal does (`/friend`, `/group`, `/history`, `/search`, `/reply`,
 for files, `/block`, `/identity`, `/discover`, `/diagnose`, and so on): the
 app sends each line through `wire.handle_input()`, the exact same dispatcher
 the terminal client uses, not a smaller reimplementation. Type `/help` once
-signed in for the full list. The two real gaps are `/call` and `/share`
-(need the native WebRTC/media stack this build does not include, same as
-Termux) and a native file picker for `/send` (works today, but only by
-typing a real file path - there is no "browse files" button yet).
+signed in for the full list.
+
+On top of typed commands there are tap-friendly controls: **+** opens
+Android's own file picker and sends the chosen file (no storage permission
+needed - Android grants access to just that one file), **Groups** lists your
+groups and pending invites and lets you create, join, open, and leave them,
+and each group's **Members & settings** page handles invites, removing
+people, and making admins (owner/admin-only buttons only appear for you if
+your role allows them). Long-press any chat line to copy it. Every button
+runs the same `/group` or `/send` command you could type, so behaviour and
+permission checks are identical to the terminal.
+
+The real remaining gap is `/call` and `/share`: they need the native
+WebRTC/media stack (`aiortc`, PyAV) that this build does not include, same
+as Termux.
 
 `cryptography`'s modern releases need a Rust toolchain that does not
 cross-compile reliably for Android, so this build uses

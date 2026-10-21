@@ -8,20 +8,30 @@ driven by taps instead of a real tty. wire.say() and print() are redirected
 into the scrollback here instead of a terminal, matching how any other
 frontend (Termux, the desktop prompt) already captures them.
 """
+import json
+import os
+import shutil
 import sys
+import time
 import traceback
 import threading
+import uuid
+from pathlib import Path
 
 from kivy.app import App
 from kivy.clock import Clock
 from kivy.core.clipboard import Clipboard
 from kivy.core.window import Window
+from kivy.factory import Factory
 from kivy.lang import Builder
 from kivy.metrics import dp
 from kivy.properties import BooleanProperty, StringProperty
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.filechooser import FileChooserListView
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.screenmanager import Screen, ScreenManager
-from kivy.utils import escape_markup
+from kivy.utils import escape_markup, platform
 
 import wire
 
@@ -82,6 +92,63 @@ KV = """
 <GhostButton@RoundButton>:
     fill: (0.1, 0.14, 0.18, 1)
     color: 0.86, 0.9, 0.94, 1
+
+<DangerButton@RoundButton>:
+    fill: (0.3, 0.1, 0.13, 1)
+    color: 1, 0.72, 0.76, 1
+
+<SmallButton@GhostButton>:
+    size_hint: None, None
+    width: dp(84)
+    height: dp(38)
+    font_size: "14sp"
+    pos_hint: {"center_y": 0.5}
+
+<Card@BoxLayout>:
+    orientation: "vertical"
+    size_hint_y: None
+    height: self.minimum_height
+    padding: dp(14)
+    spacing: dp(10)
+    canvas.before:
+        Color:
+            rgba: 0.06, 0.08, 0.11, 1
+        RoundedRectangle:
+            pos: self.pos
+            size: self.size
+            radius: [dp(14)]
+
+<SectionLabel@Label>:
+    size_hint_y: None
+    height: dp(28)
+    color: 0.56, 0.6, 0.67, 1
+    font_size: "13sp"
+    bold: True
+    text_size: self.width, None
+    halign: "left"
+
+<TopBar@BoxLayout>:
+    size_hint_y: None
+    height: dp(56)
+    padding: dp(12), 0
+    spacing: dp(10)
+    canvas.before:
+        Color:
+            rgba: 0.05, 0.07, 0.09, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+
+<StatusLine@Label>:
+    size_hint_y: None
+    height: dp(34) if self.text else 0
+    opacity: 1 if self.text else 0
+    font_size: "13sp"
+    text_size: self.width - dp(24), None
+    halign: "left"
+    shorten: True
+    shorten_from: "right"
+    markup: True
 
 <LoginScreen>:
     canvas.before:
@@ -212,6 +279,10 @@ KV = """
                 text_size: self.width, None
                 halign: "left"
                 valign: "middle"
+                shorten: True
+            SmallButton:
+                text: "Groups"
+                on_release: app.show_groups()
         ScrollView:
             id: scroller
             bar_width: dp(4)
@@ -234,6 +305,12 @@ KV = """
                 Rectangle:
                     pos: self.pos
                     size: self.size
+            GhostButton:
+                text: "+"
+                font_size: "24sp"
+                size_hint: None, None
+                size: dp(48), dp(48)
+                on_release: app.pick_attachment()
             RoundField:
                 id: entry
                 hint_text: "message or /command"
@@ -245,6 +322,139 @@ KV = """
                 width: dp(76)
                 height: dp(48)
                 on_release: root.send(entry.text)
+
+<GroupsScreen>:
+    canvas.before:
+        Color:
+            rgba: 0.02, 0.03, 0.04, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+    BoxLayout:
+        orientation: "vertical"
+        TopBar:
+            SmallButton:
+                text: "Back"
+                on_release: app.show_chat()
+            Label:
+                text: "Groups"
+                bold: True
+                font_size: "18sp"
+                color: 0.93, 0.98, 0.96, 1
+                text_size: self.width, None
+                halign: "left"
+            SmallButton:
+                text: "Refresh"
+                on_release: app.run_line("/group list", echo=False)
+        ScrollView:
+            BoxLayout:
+                orientation: "vertical"
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(14)
+                spacing: dp(12)
+                BoxLayout:
+                    id: list_box
+                    orientation: "vertical"
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(12)
+                SectionLabel:
+                    text: "NEW GROUP"
+                Card:
+                    RoundField:
+                        id: new_name
+                        hint_text: "group name (3-32 letters, numbers, - or _)"
+                    RoundField:
+                        id: new_members
+                        hint_text: "people to invite (space separated, optional)"
+                    RoundButton:
+                        text: "Create group"
+                        size_hint_y: None
+                        height: dp(48)
+                        on_release: root.create(new_name.text, new_members.text)
+        StatusLine:
+            text: app.last_line_markup
+
+<GroupScreen>:
+    canvas.before:
+        Color:
+            rgba: 0.02, 0.03, 0.04, 1
+        Rectangle:
+            pos: self.pos
+            size: self.size
+    BoxLayout:
+        orientation: "vertical"
+        TopBar:
+            SmallButton:
+                text: "Back"
+                on_release: app.show_groups()
+            Label:
+                text: root.group_name
+                bold: True
+                font_size: "18sp"
+                color: 0.93, 0.98, 0.96, 1
+                text_size: self.width, None
+                halign: "left"
+                shorten: True
+            Label:
+                text: root.my_role
+                size_hint_x: None
+                width: dp(70)
+                color: 0.43, 0.9, 0.78, 1
+                font_size: "13sp"
+        ScrollView:
+            BoxLayout:
+                orientation: "vertical"
+                size_hint_y: None
+                height: self.minimum_height
+                padding: dp(14)
+                spacing: dp(12)
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(48)
+                    spacing: dp(10)
+                    RoundButton:
+                        text: "Open chat"
+                        on_release: root.open_chat()
+                    GhostButton:
+                        text: "Pinned"
+                        on_release: root.show_pins()
+                SectionLabel:
+                    text: "INVITE SOMEONE" if root.is_admin else "ONLY ADMINS CAN INVITE"
+                BoxLayout:
+                    size_hint_y: None
+                    height: dp(52)
+                    spacing: dp(8)
+                    disabled: not root.is_admin
+                    opacity: 1 if root.is_admin else 0.4
+                    RoundField:
+                        id: invite_name
+                        hint_text: "username"
+                    RoundButton:
+                        text: "Invite"
+                        size_hint_x: None
+                        width: dp(90)
+                        on_release: root.invite(invite_name.text)
+                SectionLabel:
+                    text: root.members_heading
+                BoxLayout:
+                    id: members_box
+                    orientation: "vertical"
+                    size_hint_y: None
+                    height: self.minimum_height
+                    spacing: dp(8)
+                Widget:
+                    size_hint_y: None
+                    height: dp(8)
+                DangerButton:
+                    id: leave_button
+                    text: "Leave group"
+                    size_hint_y: None
+                    height: dp(48)
+                    on_release: root.leave(self)
+        StatusLine:
+            text: app.last_line_markup
 """
 
 
@@ -369,6 +579,8 @@ class ChatScreen(Screen):
         # resulting row its own widget so long-press-to-copy stays precise.
         for raw in line.split("\n"):
             log_box.add_widget(self._make_line(raw))
+            if raw.strip():
+                App.get_running_app().set_last_line(raw, self._style_line(raw))
         scroller = self.ids.get("scroller")
         if scroller is not None:
             Clock.schedule_once(lambda _dt: setattr(scroller, "scroll_y", 0), 0)
@@ -412,11 +624,19 @@ class ChatScreen(Screen):
         return f"[color={MUTED}ff]{escape_markup(line)}[/color]"
 
     def send(self, text: str) -> None:
+        if not text.strip():
+            return
+        self.ids.entry.text = ""
+        self.run_line(text)
+
+    def run_line(self, text: str, echo: bool = True) -> None:
+        """Run one line exactly as if it had been typed, without touching
+        whatever is in the message box (group buttons use this too)."""
         text = text.strip()
         if not text:
             return
-        self.ids.entry.text = ""
-        self.append(f"> {text}")
+        if echo:
+            self.append(f"> {text}")
 
         def worker() -> None:
             app_state: wire.Wire = App.get_running_app().wire_app
@@ -425,6 +645,297 @@ class ChatScreen(Screen):
                 Clock.schedule_once(lambda _dt: App.get_running_app().show_login())
 
         threading.Thread(target=worker, daemon=True).start()
+
+
+def _confirm_then(button, action, prompt: str = "Tap again") -> None:
+    """Two-tap confirmation for destructive buttons (leave, remove) - a stray
+    thumb on a phone shouldn't kick someone out of a group."""
+    if getattr(button, "_armed", False):
+        button._armed = False
+        button.text = button._original_text
+        action()
+        return
+    button._armed = True
+    button._original_text = button.text
+    button.text = prompt
+
+    def disarm(_dt) -> None:
+        if getattr(button, "_armed", False):
+            button._armed = False
+            button.text = button._original_text
+
+    Clock.schedule_once(disarm, 3)
+
+
+def _wire_snapshot(state: "wire.Wire") -> tuple[list[dict], list[str]] | None:
+    """Copy group state owned by wire.py's network thread. A dict changing
+    size mid-copy just means "try again next tick", not an error."""
+    try:
+        groups = [dict(group) for group in list(state.groups.values())]
+        invites = sorted(name for key, name in list(state.group_invites.items()) if key not in state.groups)
+    except RuntimeError:
+        return None
+    return groups, invites
+
+
+def _my_role(state: "wire.Wire", group: dict) -> str:
+    me = (state.name or "").lower()
+    for member in group.get("members", []):
+        if isinstance(member, dict) and str(member.get("name", "")).lower() == me:
+            return str(member.get("role", "member"))
+    return "member"
+
+
+def _text(text: str, color=(0.91, 0.93, 0.96, 1), bold: bool = False, size: str = "15sp") -> Label:
+    label = Label(text=text, color=color, bold=bold, font_size=size, halign="left", valign="middle", shorten=True)
+    label.bind(size=lambda inst, value: setattr(inst, "text_size", value))
+    return label
+
+
+class GroupsScreen(Screen):
+    def on_pre_enter(self, *_args) -> None:
+        self._snapshot = None
+        self._poll = Clock.schedule_interval(lambda _dt: self._rebuild(), 1)
+        self._rebuild()
+        App.get_running_app().run_line("/group list", echo=False)
+
+    def on_leave(self, *_args) -> None:
+        self._poll.cancel()
+
+    def create(self, name: str, members: str) -> None:
+        name = name.strip()
+        if not name:
+            App.get_running_app().set_last_line("error: enter a group name first")
+            return
+        App.get_running_app().run_line(f"/group create {name} {' '.join(members.split())}".strip())
+        self.ids.new_name.text = ""
+        self.ids.new_members.text = ""
+
+    def _rebuild(self) -> None:
+        app = App.get_running_app()
+        snapshot = _wire_snapshot(app.wire_app)
+        if snapshot is None:
+            return
+        key = json.dumps(snapshot, sort_keys=True, default=str)
+        if key == self._snapshot:
+            return
+        self._snapshot = key
+        groups, invites = snapshot
+        box = self.ids.list_box
+        box.clear_widgets()
+
+        if invites:
+            box.add_widget(Factory.SectionLabel(text="INVITES"))
+            for name in invites:
+                row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+                row.add_widget(_text(f"{name}", bold=True))
+                join = Factory.RoundButton(text="Join", size_hint_x=None, width=dp(90))
+                join.bind(on_release=lambda _b, name=name: app.run_line(f"/group accept {name}"))
+                row.add_widget(join)
+                card = Factory.Card()
+                card.add_widget(row)
+                box.add_widget(card)
+
+        box.add_widget(Factory.SectionLabel(text=f"YOUR GROUPS ({len(groups)})"))
+        if not groups:
+            box.add_widget(_text("No groups yet - create one below.", color=(0.56, 0.6, 0.67, 1), size="14sp"))
+        for group in sorted(groups, key=lambda item: str(item.get("name", "")).lower()):
+            name = str(group.get("name", "?"))
+            members = [item for item in group.get("members", []) if isinstance(item, dict)]
+            online = sum(1 for item in members if item.get("online"))
+            card = Factory.Card()
+            header = BoxLayout(size_hint_y=None, height=dp(26))
+            header.add_widget(_text(name, bold=True, size="16sp"))
+            header.add_widget(_text(f"{online}/{len(members)} online · {_my_role(app.wire_app, group)}",
+                                    color=(0.56, 0.6, 0.67, 1), size="13sp"))
+            card.add_widget(header)
+            buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
+            open_button = Factory.RoundButton(text="Open chat")
+            open_button.bind(on_release=lambda _b, name=name: app.open_group_chat(name))
+            manage = Factory.GhostButton(text="Members & settings")
+            manage.bind(on_release=lambda _b, name=name: app.show_group(name))
+            buttons.add_widget(open_button)
+            buttons.add_widget(manage)
+            card.add_widget(buttons)
+            box.add_widget(card)
+
+
+class GroupScreen(Screen):
+    group_name = StringProperty("")
+    my_role = StringProperty("")
+    is_admin = BooleanProperty(False)
+    members_heading = StringProperty("MEMBERS")
+
+    def on_pre_enter(self, *_args) -> None:
+        self._snapshot = None
+        self._misses = 0
+        self.ids.invite_name.text = ""
+        self._poll = Clock.schedule_interval(lambda _dt: self._rebuild(), 1)
+        self._rebuild()
+
+    def on_leave(self, *_args) -> None:
+        self._poll.cancel()
+
+    def open_chat(self) -> None:
+        App.get_running_app().open_group_chat(self.group_name)
+
+    def show_pins(self) -> None:
+        app = App.get_running_app()
+        app.run_line(f"/group pins {self.group_name}")
+        app.show_chat()
+
+    def invite(self, username: str) -> None:
+        username = username.strip()
+        if not username.isalnum():
+            App.get_running_app().set_last_line("error: usernames are letters and numbers only")
+            return
+        App.get_running_app().run_line(f"/group invite {self.group_name} {username}")
+        self.ids.invite_name.text = ""
+
+    def leave(self, button) -> None:
+        _confirm_then(button, lambda: App.get_running_app().run_line(f"/group leave {self.group_name}"),
+                      "Tap again to leave")
+
+    def _rebuild(self) -> None:
+        app = App.get_running_app()
+        snapshot = _wire_snapshot(app.wire_app)
+        if snapshot is None:
+            return
+        group = next((item for item in snapshot[0] if str(item.get("name", "")).lower() == self.group_name.lower()), None)
+        if group is None:
+            # "/group list" empties the list until the server's reply refills
+            # it, so one missing tick may just be a refresh in flight. Missing
+            # twice in a row means we left / were removed.
+            self._misses = getattr(self, "_misses", 0) + 1
+            if self._misses >= 2:
+                self._poll.cancel()
+                Clock.schedule_once(lambda _dt: app.show_groups())
+            return
+        self._misses = 0
+        key = json.dumps(group, sort_keys=True, default=str)
+        if key == self._snapshot:
+            return
+        self._snapshot = key
+        role = _my_role(app.wire_app, group)
+        self.my_role = role
+        self.is_admin = role in ("owner", "admin")
+        members = [item for item in group.get("members", []) if isinstance(item, dict)]
+        self.members_heading = f"MEMBERS ({len(members)})"
+        me = (app.wire_app.name or "").lower()
+        order = {"owner": 0, "admin": 1, "member": 2}
+        box = self.ids.members_box
+        box.clear_widgets()
+        for member in sorted(members, key=lambda item: (order.get(item.get("role"), 3), str(item.get("name", "")).lower())):
+            name = str(member.get("name", "?"))
+            member_role = str(member.get("role", "member"))
+            is_me = name.lower() == me
+            card = Factory.Card()
+            top = BoxLayout(size_hint_y=None, height=dp(26))
+            top.add_widget(_text(f"{name}{' (you)' if is_me else ''}", bold=True))
+            # Plain words, not a status dot: Kivy's bundled fonts have no
+            # circle glyphs and render them as empty boxes.
+            online = bool(member.get("online"))
+            top.add_widget(_text(f"{'online' if online else 'offline'} · {member_role}",
+                                 color=(0.43, 0.9, 0.78, 1) if online else (0.56, 0.6, 0.67, 1), size="13sp"))
+            card.add_widget(top)
+            actions = BoxLayout(size_hint_y=None, height=dp(40), spacing=dp(8))
+            if role == "owner" and not is_me:
+                promote = member_role != "admin"
+                toggle = Factory.GhostButton(text="Make admin" if promote else "Remove admin", font_size="14sp")
+                toggle.bind(on_release=lambda _b, name=name, promote=promote: app.run_line(
+                    f"/group {'admin' if promote else 'member'} {self.group_name} {name}"))
+                actions.add_widget(toggle)
+            if self.is_admin and not is_me and member_role != "owner":
+                remove = Factory.DangerButton(text="Remove", font_size="14sp")
+                remove.bind(on_release=lambda button, name=name: _confirm_then(
+                    button, lambda: app.run_line(f"/group kick {self.group_name} {name}")))
+                actions.add_widget(remove)
+            if actions.children:
+                card.add_widget(actions)
+            box.add_widget(card)
+
+
+ANDROID_PICK_REQUEST = 4127
+
+
+def _android_pick_file(on_ready, on_error) -> None:
+    """Open Android's own file picker (Storage Access Framework).
+
+    Needs no storage permission: the person picks one file, Android grants
+    access to just that file, and it's copied into the app's cache so
+    wire.py's normal /send can read it like any other path.
+    """
+    from android import activity  # provided by python-for-android
+    from jnius import autoclass
+
+    Intent = autoclass("android.content.Intent")
+    OpenableColumns = autoclass("android.provider.OpenableColumns")
+    python_activity = autoclass("org.kivy.android.PythonActivity").mActivity
+
+    def on_result(request_code, result_code, data) -> None:
+        if request_code != ANDROID_PICK_REQUEST:
+            return
+        activity.unbind(on_activity_result=on_result)
+        try:
+            if result_code != -1 or data is None or data.getData() is None:  # -1 is Activity.RESULT_OK
+                return
+            uri = data.getData()
+            resolver = python_activity.getContentResolver()
+            name = "attachment"
+            cursor = resolver.query(uri, None, None, None, None)
+            if cursor is not None:
+                try:
+                    if cursor.moveToFirst():
+                        index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                        if index >= 0 and cursor.getString(index):
+                            name = cursor.getString(index)
+                finally:
+                    cursor.close()
+            # Take ownership of a raw file descriptor here, on the thread
+            # Android called us on, so the (possibly huge) copy below can run
+            # on a plain Python thread that never touches Java - a Python
+            # thread that calls into Java must detach before exiting or
+            # Android kills the whole app.
+            descriptor = resolver.openFileDescriptor(uri, "r")
+            fd = descriptor.detachFd()
+            descriptor.close()
+            cache = Path(python_activity.getCacheDir().getAbsolutePath()) / "outgoing"
+        except Exception as exc:  # noqa: BLE001 - shown to the person
+            message = f"error: couldn't open that file ({exc}). Try saving it to your phone first."
+            Clock.schedule_once(lambda _dt: on_error(message))
+            return
+        threading.Thread(target=_copy_descriptor, args=(fd, cache, name, on_ready, on_error), daemon=True).start()
+
+    intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+    intent.addCategory(Intent.CATEGORY_OPENABLE)
+    intent.setType("*/*")
+    activity.bind(on_activity_result=on_result)
+    python_activity.startActivityForResult(intent, ANDROID_PICK_REQUEST)
+
+
+def _copy_descriptor(fd: int, cache: Path, name: str, on_ready, on_error) -> None:
+    try:
+        target_dir = cache / uuid.uuid4().hex
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / wire.safe_filename(name, "attachment")
+        with os.fdopen(fd, "rb") as source, target.open("wb") as destination:
+            shutil.copyfileobj(source, destination, 1024 * 1024)
+    except Exception as exc:  # noqa: BLE001 - shown to the person
+        message = f"error: couldn't copy that file ({exc})"
+        Clock.schedule_once(lambda _dt: on_error(message))
+        return
+    Clock.schedule_once(lambda _dt: on_ready(str(target)))
+
+
+def _clear_old_attachment_copies(cache: Path, max_age_seconds: int = 2 * 24 * 3600) -> None:
+    """Picked files are copied into the cache and must outlive the send
+    (the peer may accept minutes later), so tidy up on the next start."""
+    try:
+        for item in cache.iterdir():
+            if time.time() - item.stat().st_mtime > max_age_seconds:
+                shutil.rmtree(item, ignore_errors=True)
+    except OSError:
+        pass
 
 
 class _LineBufferedWriter:
@@ -456,6 +967,8 @@ class _LineBufferedWriter:
 
 
 class WireApp(App):
+    last_line_markup = StringProperty("")
+
     def build(self):
         Window.clearcolor = (0.02, 0.03, 0.04, 1)
         # Default behaviour leaves the window where it is when the on-screen
@@ -468,11 +981,23 @@ class WireApp(App):
         self.manager = ScreenManager()
         self.manager.add_widget(LoginScreen(name="login"))
         self.manager.add_widget(ChatScreen(name="chat"))
+        self.manager.add_widget(GroupsScreen(name="groups"))
+        self.manager.add_widget(GroupScreen(name="group"))
         return self.manager
 
     def on_start(self) -> None:
         chat = self.manager.get_screen("chat")
-        wire.say = lambda text: chat.append(text)
+        # wire.say() is called from wire.py's network threads, and the
+        # scrollback creates a widget per line - Kivy only allows that on its
+        # main thread, so hand every line over to it (Clock keeps the order).
+        wire.say = lambda text: Clock.schedule_once(lambda _dt: chat.append(text))
+        if platform == "android":
+            try:
+                from jnius import autoclass
+                cache = autoclass("org.kivy.android.PythonActivity").mActivity.getCacheDir().getAbsolutePath()
+                _clear_old_attachment_copies(Path(cache) / "outgoing")
+            except Exception:  # noqa: BLE001 - housekeeping only
+                pass
         sys.stdout = _LineBufferedWriter(chat.append, sys.stdout)
         sys.stderr = _LineBufferedWriter(chat.append, sys.stderr)
 
@@ -489,13 +1014,65 @@ class WireApp(App):
 
         threading.excepthook = report_thread_exception
 
-    def show_chat(self, username: str) -> None:
-        chat = self.manager.get_screen("chat")
-        chat.title_text = f"wire - {username}"
+    def show_chat(self, username: str | None = None) -> None:
+        if username:
+            self.manager.get_screen("chat").title_text = f"wire - {username}"
         self.manager.current = "chat"
 
     def show_login(self) -> None:
         self.manager.current = "login"
+
+    def show_groups(self) -> None:
+        self.manager.current = "groups"
+
+    def show_group(self, name: str) -> None:
+        self.manager.get_screen("group").group_name = name
+        self.manager.current = "group"
+
+    def open_group_chat(self, name: str) -> None:
+        self.run_line(f"/group open {name}")
+        self.show_chat()
+
+    def run_line(self, text: str, echo: bool = True) -> None:
+        self.manager.get_screen("chat").run_line(text, echo=echo)
+
+    def set_last_line(self, raw: str, markup: str | None = None) -> None:
+        """The newest scrollback line, mirrored onto the group screens so
+        replies like "that person does not allow group invites" are seen
+        without switching back to the chat."""
+        if markup is None:
+            markup = ChatScreen._style_line(raw)
+        self.last_line_markup = markup
+
+    def pick_attachment(self) -> None:
+        if platform == "android":
+            _android_pick_file(self._send_picked_file, self.set_last_line_and_log)
+            return
+        chooser = FileChooserListView(path=str(Path.home()))
+        layout = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
+        layout.add_widget(chooser)
+        buttons = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
+        popup = Popup(title="Send a file", content=layout, size_hint=(0.92, 0.9))
+        cancel = Factory.GhostButton(text="Cancel")
+        cancel.bind(on_release=lambda _b: popup.dismiss())
+        send = Factory.RoundButton(text="Send")
+
+        def choose(_button) -> None:
+            if chooser.selection:
+                popup.dismiss()
+                self._send_picked_file(chooser.selection[0])
+
+        send.bind(on_release=choose)
+        buttons.add_widget(cancel)
+        buttons.add_widget(send)
+        layout.add_widget(buttons)
+        popup.open()
+
+    def _send_picked_file(self, path: str) -> None:
+        self.run_line(f'/send "{path}"')
+
+    def set_last_line_and_log(self, message: str) -> None:
+        self.manager.get_screen("chat").append(message)
 
     def on_stop(self) -> None:
         try:
