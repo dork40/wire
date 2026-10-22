@@ -11,17 +11,26 @@ requires-python = ">=3.11"
 dependencies = [
   "cryptography==50.0.2",
   "Pillow==12.3.0",
+  "prompt_toolkit==3.0.52",
+  "psutil==7.2.2",
+]
+
+[project.optional-dependencies]
+# Voice calls and screen sharing. Deliberately separate from the core chat
+# dependencies above: this native WebRTC/media stack has no prebuilt wheel on
+# every platform (notably Termux on Android), and wire.py already runs as a
+# plain encrypted texting app with chat/friends/files/DND when it is absent.
+media = [
+  "numpy==2.3.4",
   "sounddevice==0.5.5",
   "soundcard==0.4.6; platform_system == 'Windows'",
   "pynput==1.8.1",
   "pywebrtc-audio==0.2.0",
-  "prompt_toolkit==3.0.52",
   "mss==10.1.0",
   "dxcam==0.3.0; platform_system == 'Windows'",
   "windows-capture==2.0.1; platform_system == 'Windows'",
   "pygame-ce==2.5.8; platform_system == 'Windows'",
   "aiortc==1.15.0",
-  "psutil==7.2.2",
 ]
 
 [project.scripts]

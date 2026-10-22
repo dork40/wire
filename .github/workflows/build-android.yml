@@ -1,0 +1,47 @@
+name: Build Wire Android APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wire.py"
+      - "wire_crypto_android.py"
+      - "main.py"
+      - "buildozer.spec"
+      - ".github/workflows/build-android.yml"
+  pull_request:
+    paths:
+      - "wire.py"
+      - "wire_crypto_android.py"
+      - "main.py"
+      - "buildozer.spec"
+      - ".github/workflows/build-android.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Tried caching .buildozer here; it broke the next build ("Requested
+      # API target 34 is not available") because the Android SDK/NDK the
+      # Docker image downloads lives outside the mounted project directory
+      # (in the container's own home, not under ./.buildozer), so the cache
+      # only ever captured partial state. Reliability over the ~15 minutes
+      # this would have saved - removed rather than keep guessing at it.
+
+      # The third-party ArtemSBulgakov/buildozer-action wraps this same image
+      # with extra setup (installing a Java PPA) that broke against current
+      # Ubuntu releases. Running the official image directly skips that
+      # unmaintained wrapper entirely.
+      - name: Build debug APK with the official Buildozer Docker image
+        run: |
+          docker run --rm -v "$PWD":/home/user/hostcwd ghcr.io/kivy/buildozer:latest android debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: wire-android-debug
+          path: bin/*.apk
+          if-no-files-found: error

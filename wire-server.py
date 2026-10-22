@@ -27,7 +27,7 @@ from cryptography.x509.oid import NameOID
 # restricted by the compose port mapping and firewall.
 HOST = os.environ.get("WIRE_HOST", "0.0.0.0")  # nosec B104
 PORT = int(os.environ.get("WIRE_PORT", "47666"))
-SERVER_VERSION = "1.4.35"
+SERVER_VERSION = "1.4.36"
 TURN_URLS = [item.strip() for item in os.environ.get("WIRE_TURN_URLS", "").split(",") if item.strip()]
 TURN_SECRET = os.environ.get("WIRE_TURN_SECRET", "")
 DEFAULT_STATE = (Path(sys.executable).parent / "wire-server-data") if getattr(sys, "frozen", False) else Path(__file__).with_name("wire-server-data")
@@ -37,11 +37,25 @@ GROUPS_FILE = STATE / "groups.json"
 BACKUPS_FILE = STATE / "identity-backups.json"
 QUEUES_FILE = STATE / "offline-queue.json"
 SYNC_FILE = STATE / "encrypted-sync.json"
+PREKEYS_FILE = STATE / "prekeys.json"
+MAX_ONE_TIME_PREKEYS = 100
 BACKUP_DIR = Path(os.environ["WIRE_BACKUP_DIR"]) if os.environ.get("WIRE_BACKUP_DIR") else None
 BACKUP_INTERVAL_SECONDS = max(900, int(os.environ.get("WIRE_BACKUP_INTERVAL", "21600")))
 BACKUP_RETAIN = max(2, min(365, int(os.environ.get("WIRE_BACKUP_RETAIN", "28"))))
 LOCK = threading.Lock()
 ONLINE: dict[str, tuple[str, socket.socket, str, str, str]] = {}
+# target -> requesters with an outstanding room request. "accept" is only
+# honoured for a request that was actually made, so nobody can force a room
+# open on someone else's client.
+PENDING_OPENS: dict[str, set[str]] = {}
+MAX_PENDING_OPENS_PER_USER = 200
+# Room-request spam: a repeat to the same person is ignored for a minute, and
+# nobody can fire off more than 20 new requests a minute.
+OPEN_REPEAT_SECONDS = 60
+OPEN_WINDOW_SECONDS = 60
+MAX_OPENS_PER_WINDOW = 20
+RECENT_OPENS: dict[str, list[float]] = {}
+LAST_OPEN: dict[tuple[str, str], float] = {}
 # A client can be sent packets by its own handler and by any number of other
 # handlers (messages, file relay, group updates).  TCP is a byte stream, so
 # concurrent sendall() calls can splice two length-prefixed packets together.
@@ -58,6 +72,7 @@ MAX_SYNC_BLOB_BYTES = 64 * 1024
 MAX_SYNC_BYTES_PER_USER = 16 * 1024 * 1024
 MAX_SYNC_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_GROUP_MEMBERS = 100
+MAX_STATUS_CHARS = 80
 RELAY_RATE_BYTES_PER_SECOND = 40 * 1024 * 1024
 RELAY_RATE_BURST_BYTES = 64 * 1024 * 1024
 RELAY_BUDGETS: dict[str, tuple[float, float]] = {}
@@ -69,6 +84,16 @@ IP_CONNECTIONS_LOCK = threading.Lock()
 RECOVERY_ATTEMPTS: dict[str, list[float]] = {}
 RECOVERY_WINDOW_SECONDS = 15 * 60
 MAX_RECOVERY_ATTEMPTS = 5
+# Per-IP limits alone don't stop a guesser spread across many addresses, and
+# short passwords exist in the wild - so each account also gets a budget.
+ACCOUNT_RECOVERY_ATTEMPTS: dict[str, list[float]] = {}
+MAX_ACCOUNT_RECOVERY_ATTEMPTS = 10
+NEW_ACCOUNTS: dict[str, list[float]] = {}
+NEW_ACCOUNT_WINDOW_SECONDS = 60 * 60
+MAX_NEW_ACCOUNTS_PER_IP = 10
+# One sender can't use up the shared offline queue for everyone else.
+MAX_OFFLINE_QUEUE_BYTES_PER_SENDER = 32 * 1024 * 1024
+MAX_TRACKED_KEYS = 4096
 SERVER_KEY_LOCK = threading.Lock()
 SERVER_SIGNING_KEY: ed25519.Ed25519PrivateKey | None = None
 STARTED_AT = time.time()
@@ -76,7 +101,7 @@ STARTED_AT = time.time()
 
 def state_file_names() -> tuple[str, ...]:
     return ("users.json", "groups.json", "identity-backups.json", "offline-queue.json",
-            "encrypted-sync.json", "server-signing-key", "server-certificate.pem", "server-tls-key.pem")
+            "encrypted-sync.json", "prekeys.json", "server-signing-key", "server-certificate.pem", "server-tls-key.pem")
 
 
 def create_state_backup() -> Path | None:
@@ -237,7 +262,10 @@ def receive(sock: socket.socket) -> dict:
     size = struct.unpack("!I", receive_exact(sock, 4))[0]
     if size > MAX_CLIENT_FRAME_BYTES:
         raise ValueError("packet too large")
-    return json.loads(receive_exact(sock, size).decode("utf-8"))
+    packet = json.loads(receive_exact(sock, size).decode("utf-8"))
+    if not isinstance(packet, dict):
+        raise ValueError("packet must be a JSON object")
+    return packet
 
 
 def send(sock: socket.socket, packet: dict) -> None:
@@ -307,8 +335,81 @@ def save_sync(value: dict) -> None:
     replace_private_json(SYNC_FILE, json.dumps(value, separators=(",", ":")))
 
 
+def load_prekeys() -> dict:
+    try:
+        value = json.loads(PREKEYS_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_prekeys(value: dict) -> None:
+    replace_private_json(PREKEYS_FILE, json.dumps(value, separators=(",", ":")))
+
+
+def prekey_signature_bytes(owner: str, key_id: str, public: bytes) -> bytes:
+    return b"wire-prekey-v1\0" + owner.lower().encode("utf-8") + b"\0" + key_id.encode("ascii") + b"\0" + public
+
+
+def valid_prekey(item: object, owner: str, sign_public: str) -> bool:
+    """A public prekey the owner really signed - only ever public halves."""
+    if not isinstance(item, dict) or set(item) != {"id", "public", "signature"}:
+        return False
+    key_id, public, signature = item["id"], item["public"], item["signature"]
+    if not isinstance(key_id, str) or len(key_id) != 16 or any(char not in "0123456789abcdef" for char in key_id):
+        return False
+    try:
+        public_raw = base64.b64decode(str(public).encode("ascii"), validate=True)
+        signature_raw = base64.b64decode(str(signature).encode("ascii"), validate=True)
+        if len(public_raw) != 32 or len(signature_raw) != 64:
+            return False
+        ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(sign_public.encode("ascii"), validate=True)).verify(
+            signature_raw, prekey_signature_bytes(owner, key_id, public_raw))
+    except Exception:
+        return False
+    return True
+
+
 def valid_sync_blob(value: object) -> bool:
     return isinstance(value, str) and 1 <= len(value.encode("ascii", errors="ignore")) <= MAX_SYNC_BLOB_BYTES
+
+
+def clean_status(value: object) -> str:
+    """Friends see this text, so only printable characters, one line, short."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if char.isprintable()).strip()[:MAX_STATUS_CHARS]
+
+
+MAX_SEARCH_RESULTS = 50
+
+
+def search_accounts(users: dict, online: set[str], searcher: str, query: str) -> dict:
+    """Rank exact > starts-with > contains. People who turned off "Show me in
+    search" only appear for an exact username (or to their friends), and
+    their online state is only shown to friends."""
+    me = users.get(searcher, {}) if isinstance(users.get(searcher), dict) else {}
+    friends = {item for item in me.get("friends", []) if isinstance(item, str)}
+    incoming = {item for item in me.get("friend_requests", []) if isinstance(item, str)}
+    ranked = []
+    for username, account in users.items():
+        if not isinstance(account, dict) or not isinstance(account.get("name"), str) or query not in username:
+            continue
+        exact, friend = username == query, username in friends
+        if not exact and not friend and not account.get("discoverable", True):
+            continue
+        ranked.append((0 if exact else 1 if username.startswith(query) else 2, username, account))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    results = []
+    for _, username, account in ranked[:MAX_SEARCH_RESULTS]:
+        friend = username in friends
+        visible = friend or username == searcher or account.get("discoverable", True)
+        requests = account.get("friend_requests", [])
+        results.append({"name": account["name"], "online": (username in online) if visible else None,
+                        "you": username == searcher, "friend": friend,
+                        "request_sent": isinstance(requests, list) and searcher in requests,
+                        "request_received": username in incoming})
+    return {"users": results, "more": len(ranked) > MAX_SEARCH_RESULTS}
 
 
 def valid_group_name(value: object) -> bool:
@@ -382,16 +483,36 @@ def valid_identity_backup(backup: object) -> bool:
             and valid_recovery and len(json.dumps(backup)) <= 20_000)
 
 
-def allow_recovery(address: str) -> bool:
-    """Bound expensive password-recovery guesses by source address."""
+def prune_attempts(table: dict[str, list[float]], window: float, now: float) -> None:
+    """Keep rate-limit tables from growing forever with one entry per address."""
+    if len(table) > MAX_TRACKED_KEYS:
+        for item in [item for item, stamps in table.items() if not stamps or now - stamps[-1] >= window]:
+            table.pop(item, None)
+
+
+def take_attempt(table: dict[str, list[float]], item: str, window: float, limit: int, now: float) -> bool:
+    """Record one attempt in a sliding window; False when the limit is spent. Caller holds LOCK."""
+    prune_attempts(table, window, now)
+    recent = [stamp for stamp in table.get(item, []) if now - stamp < window]
+    if len(recent) >= limit:
+        table[item] = recent
+        return False
+    recent.append(now)
+    table[item] = recent
+    return True
+
+
+def allow_recovery(address: str, account: str = "") -> bool:
+    """Bound password-recovery guesses by source address and by account."""
     now = time.monotonic()
     with LOCK:
-        recent = [stamp for stamp in RECOVERY_ATTEMPTS.get(address, []) if now - stamp < RECOVERY_WINDOW_SECONDS]
-        if len(recent) >= MAX_RECOVERY_ATTEMPTS:
-            RECOVERY_ATTEMPTS[address] = recent
+        recent = [stamp for stamp in ACCOUNT_RECOVERY_ATTEMPTS.get(account, []) if now - stamp < RECOVERY_WINDOW_SECONDS]
+        if account and len(recent) >= MAX_ACCOUNT_RECOVERY_ATTEMPTS:
             return False
-        recent.append(now)
-        RECOVERY_ATTEMPTS[address] = recent
+        if not take_attempt(RECOVERY_ATTEMPTS, address, RECOVERY_WINDOW_SECONDS, MAX_RECOVERY_ATTEMPTS, now):
+            return False
+        if account:
+            take_attempt(ACCOUNT_RECOVERY_ATTEMPTS, account, RECOVERY_WINDOW_SECONDS, MAX_ACCOUNT_RECOVERY_ATTEMPTS, now)
         return True
 
 
@@ -430,6 +551,29 @@ def allow_relay(sender: str, size: int) -> bool:
         return True
 
 
+def allow_open(requester: str, target: str) -> bool:
+    now = time.monotonic()
+    with LOCK:
+        if now - LAST_OPEN.get((requester, target), float("-inf")) < OPEN_REPEAT_SECONDS:
+            return False
+        if not take_attempt(RECENT_OPENS, requester, OPEN_WINDOW_SECONDS, MAX_OPENS_PER_WINDOW, now):
+            return False
+        if len(LAST_OPEN) > MAX_TRACKED_KEYS:
+            for pair in [pair for pair, stamp in LAST_OPEN.items() if now - stamp >= OPEN_REPEAT_SECONDS]:
+                LAST_OPEN.pop(pair, None)
+        LAST_OPEN[(requester, target)] = now
+        return True
+
+
+def friends_may_open(requester: str, target: str) -> bool:
+    """Honour a target's "chats from friends only" preference."""
+    with LOCK:
+        account = load_users().get(target, {})
+    if not isinstance(account, dict) or not account.get("friends_only_rooms"):
+        return True
+    return requester in account.get("friends", [])
+
+
 def deliver(username: str, packet: dict) -> bool:
     with LOCK:
         connection = ONLINE.get(username.lower())
@@ -442,6 +586,11 @@ def deliver(username: str, packet: dict) -> bool:
         return False
 
 
+def queued_sender(packet: dict) -> str:
+    sender = packet.get("from", packet.get("name", ""))
+    return sender.lower() if isinstance(sender, str) else ""
+
+
 def deliver_or_queue(username: str, packet: dict) -> bool:
     """The directory queues encrypted relay packets only; it cannot read them."""
     size = packet_size(packet)
@@ -450,12 +599,20 @@ def deliver_or_queue(username: str, packet: dict) -> bool:
     if deliver(username, packet):
         return True
     key = username.lower()
+    sender = queued_sender(packet)
     with LOCK:
         if key not in load_users():
             return False
         queues = load_queues(); pending = queues.setdefault(key, [])
-        total_queued = sum(packet_size(item) for items in queues.values() if isinstance(items, list) for item in items if isinstance(item, dict))
-        if total_queued + size > MAX_TOTAL_OFFLINE_QUEUE_BYTES:
+        total_queued = from_sender = 0
+        for items in queues.values():
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict):
+                    item_size = packet_size(item)
+                    total_queued += item_size
+                    if sender and queued_sender(item) == sender:
+                        from_sender += item_size
+        if total_queued + size > MAX_TOTAL_OFFLINE_QUEUE_BYTES or from_sender + size > MAX_OFFLINE_QUEUE_BYTES_PER_SENDER:
             return False
         if len(pending) >= MAX_OFFLINE_QUEUE_PACKETS or sum(packet_size(item) for item in pending if isinstance(item, dict)) + size > MAX_OFFLINE_QUEUE_BYTES:
             return False
@@ -475,7 +632,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
         if hello.get("type") == "identity_fetch":
             name = hello.get("name", "")
             recovery_key = name.lower() if isinstance(name, str) else ""
-            if not allow_recovery(address[0]):
+            if not allow_recovery(address[0], recovery_key):
                 send(sock, {"type": "error", "message": "identity recovery is temporarily unavailable"})
                 return
             with LOCK:
@@ -541,17 +698,39 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
         with LOCK:
             users = load_users()
             previous = users.get(key, {})
-            users[key] = {"name": name, "public": public, "sign_public": sign_public,
-                          "allow_group_invites": bool(previous.get("allow_group_invites", True)),
-                          "dnd": bool(previous.get("dnd", False)),
-                          "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
-                          "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
-            save_users(users)
-            ONLINE[key] = (name, sock, public, address[0], sign_public)
-            queues = load_queues()
-            queued_packets = queues.pop(key, [])
-            if queued_packets: save_queues(queues)
-        ready = {"type": "ready", "name": name, "version": SERVER_VERSION,
+            # Re-check under the same lock as the write: two different
+            # identities can both pass the first check for a brand-new name
+            # while their signatures are being verified.
+            taken = (previous.get("public") not in (None, public)
+                     or previous.get("sign_public") not in (None, sign_public)
+                     or key in ONLINE)
+            too_many_new = (not taken and not previous
+                            and not take_attempt(NEW_ACCOUNTS, address[0], NEW_ACCOUNT_WINDOW_SECONDS,
+                                                 MAX_NEW_ACCOUNTS_PER_IP, time.monotonic()))
+            taken = taken or too_many_new
+            if not taken:
+                users[key] = {"name": name, "public": public, "sign_public": sign_public,
+                              "allow_group_invites": bool(previous.get("allow_group_invites", True)),
+                              "friends_only_rooms": bool(previous.get("friends_only_rooms", False)),
+                              "discoverable": bool(previous.get("discoverable", True)),
+                              "share_last_seen": bool(previous.get("share_last_seen", True)),
+                              "last_seen": previous.get("last_seen") if isinstance(previous.get("last_seen"), int) else None,
+                              "status": clean_status(previous.get("status", "")),
+                              "dnd": bool(previous.get("dnd", False)),
+                              "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
+                              "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
+                save_users(users)
+                ONLINE[key] = (name, sock, public, address[0], sign_public)
+                queues = load_queues()
+                queued_packets = queues.pop(key, [])
+                if queued_packets: save_queues(queues)
+        if taken:
+            key = None  # never registered here, so the cleanup below must not touch ONLINE
+            reason = ("too many new accounts from this network; try again later" if too_many_new
+                      else "username belongs to another identity")
+            send(sock, {"type": "error", "message": reason})
+            return
+        ready ={"type": "ready", "name": name, "version": SERVER_VERSION,
                  "relay_rate": RELAY_RATE_BYTES_PER_SECOND}
         # Every signed-in Wire identity can use the relay. Security comes from
         # expiring credentials, quotas, and Coturn's private-network blocks,
@@ -583,21 +762,28 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "error", "message": "user is offline or does not exist"})
                 elif target == key:
                     send(sock, {"type": "error", "message": "cannot open a room with yourself"})
-                elif deliver(target, {"type": "request", "from": name, **signed_identity(name, public, sign_public)}):
-                    send(sock, {"type": "waiting", "to": target_info[0]})
+                elif not friends_may_open(key, target):
+                    send(sock, {"type": "error", "message": "that person only accepts chats from friends"})
+                elif not allow_open(key, target):
+                    send(sock, {"type": "error", "message": "slow down: that request was just sent, or you've sent too many"})
+                else:
+                    with LOCK:
+                        pending = PENDING_OPENS.setdefault(target, set())
+                        if key not in pending and len(pending) >= MAX_PENDING_OPENS_PER_USER:
+                            pending.pop()
+                        pending.add(key)
+                    if deliver(target, {"type": "request", "from": name, **signed_identity(name, public, sign_public)}):
+                        send(sock, {"type": "waiting", "to": target_info[0]})
             elif kind == "discover":
-                query = packet.get("query", "").lower()
-                if not isinstance(query, str):
-                    query = ""
+                query = packet.get("query", "")
+                query = query.strip().lower() if isinstance(query, str) else ""
+                if len(query) < 2:
+                    send(sock, {"type": "error", "message": "type at least 2 letters of a username to search"})
+                    continue
                 with LOCK:
                     users = load_users()
                     online = set(ONLINE)
-                matches = [
-                    {"name": account["name"], "online": username in online}
-                    for username, account in users.items()
-                    if query in account["name"].lower()
-                ][:50]
-                send(sock, {"type": "discover", "users": matches})
+                send(sock, {"type": "discover", "query": query, **search_accounts(users, online, key, query)})
             elif kind == "status":
                 requested = packet.get("users", [])
                 if not isinstance(requested, list):
@@ -616,10 +802,16 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 with LOCK:
                     users = load_users(); account = users.get(key, {})
                     friends = [item for item in account.get("friends", []) if item in users]
+                    # Like WhatsApp: you only see "last seen" if you share yours.
+                    sees_last_seen = bool(account.get("share_last_seen", True))
                     matches = [{"name": users[item]["name"], "online": item in ONLINE,
-                                "dnd": bool(users[item].get("dnd", False))} for item in friends]
+                                "dnd": bool(users[item].get("dnd", False)),
+                                "status": clean_status(users[item].get("status", "")),
+                                "last_seen": users[item].get("last_seen") if sees_last_seen and users[item].get("share_last_seen", True)
+                                and isinstance(users[item].get("last_seen"), int) else None} for item in friends]
                     requests = [users[item]["name"] for item in account.get("friend_requests", []) if item in users]
-                send(sock, {"type": "friends", "users": matches, "requests": requests})
+                    my_status = clean_status(account.get("status", ""))
+                send(sock, {"type": "friends", "users": matches, "requests": requests, "status": my_status})
             elif kind == "friend_request":
                 target = str(packet.get("to", "")).lower()
                 with LOCK:
@@ -661,6 +853,14 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     save_users(users)
                 deliver_or_queue(target, {"type": "friend_removed", "name": name})
                 send(sock, {"type": "friend_removed", "name": users[target]["name"]})
+            elif kind == "set_status":
+                status = clean_status(packet.get("status", ""))
+                with LOCK:
+                    users = load_users()
+                    if key in users:
+                        users[key]["status"] = status
+                        save_users(users)
+                send(sock, {"type": "status_saved", "status": status})
             elif kind == "ping":
                 send(sock, {"type": "pong", "id": packet.get("id", "")})
             elif kind == "preferences":
@@ -669,6 +869,9 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     account = users.get(key)
                     if account is not None:
                         account["allow_group_invites"] = bool(packet.get("allow_group_invites", True))
+                        for field in ("friends_only_rooms", "discoverable", "share_last_seen"):
+                            if field in packet:
+                                account[field] = bool(packet[field])
                         account["dnd"] = bool(packet.get("dnd", False))
                         save_users(users)
             elif kind == "sync_put_settings":
@@ -701,6 +904,52 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "sync_saved", "kind": "message"})
                 else:
                     send(sock, {"type": "error", "message": "encrypted sync storage is full"})
+            elif kind == "prekeys_put":
+                signed, one_time = packet.get("signed"), packet.get("one_time", [])
+                if (not valid_prekey(signed, name, sign_public) or not isinstance(one_time, list)
+                        or len(one_time) > MAX_ONE_TIME_PREKEYS
+                        or not all(valid_prekey(item, name, sign_public) for item in one_time)):
+                    send(sock, {"type": "error", "message": "invalid prekeys"})
+                    continue
+                with LOCK:
+                    store = load_prekeys()
+                    entry = store.get(key) if isinstance(store.get(key), dict) else {}
+                    existing = [] if packet.get("replace") else [item for item in entry.get("one_time", []) if isinstance(item, dict)]
+                    store[key] = {"signed": signed, "one_time": (existing + one_time)[-MAX_ONE_TIME_PREKEYS:]}
+                    save_prekeys(store)
+                    count = len(store[key]["one_time"])
+                send(sock, {"type": "prekeys_saved", "one_time": count})
+            elif kind == "prekey_fetch":
+                request, wanted = packet.get("id"), packet.get("users", [])
+                if not isinstance(request, str) or len(request) > 64 or not isinstance(wanted, list):
+                    send(sock, {"type": "error", "message": "invalid prekey request"})
+                    continue
+                wanted_keys = list(dict.fromkeys(item.lower() for item in wanted[:MAX_GROUP_MEMBERS] if isinstance(item, str)))
+                bundles = {}
+                with LOCK:
+                    # Only people you share a group with: otherwise anyone
+                    # could drain someone's one-time keys.
+                    shared = {member for group in load_groups().values() if isinstance(group, dict)
+                              and key in group.get("members", []) for member in group.get("members", [])}
+                    store, changed = load_prekeys(), False
+                    for target in wanted_keys:
+                        entry = store.get(target)
+                        if target == key or target not in shared or not isinstance(entry, dict):
+                            continue
+                        one_time = entry.get("one_time", [])
+                        bundles[target] = {"signed": entry.get("signed"), "one_time": one_time.pop(0) if one_time else None}
+                        changed = changed or bundles[target]["one_time"] is not None
+                    if changed:
+                        save_prekeys(store)
+                send(sock, {"type": "prekeys", "id": request, "bundles": bundles})
+            elif kind == "sync_delete_message":
+                message_id = packet.get("id")
+                if isinstance(message_id, str) and len(message_id) == 32 and all(char in "0123456789abcdef" for char in message_id):
+                    with LOCK:
+                        synced = load_sync()
+                        messages = synced.get(key, {}).get("messages", {})
+                        if isinstance(messages, dict) and messages.pop(message_id, None) is not None:
+                            save_sync(synced)
             elif kind == "sync_fetch":
                 with LOCK:
                     account_sync = load_sync().get(key, {})
@@ -767,26 +1016,6 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     users, groups = load_users(), load_groups()
                     details = [group_details(group, users, set(ONLINE)) for group in groups.values() if key in group.get("members", [])]
                 send(sock, {"type": "group_list", "groups": details})
-            elif kind == "group_add":
-                group_key, member = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower()
-                with LOCK:
-                    users, groups = load_users(), load_groups()
-                    group = groups.get(group_key)
-                    if not group or key not in group.get("admins", [group.get("owner")]):
-                        send(sock, {"type": "error", "message": "only group admins can add people"})
-                        continue
-                    if member not in users:
-                        send(sock, {"type": "error", "message": "that username does not exist"})
-                        continue
-                    if member not in group["members"] and len(group["members"]) >= MAX_GROUP_MEMBERS:
-                        send(sock, {"type": "error", "message": f"groups support up to {MAX_GROUP_MEMBERS} members"})
-                        continue
-                    if member not in group["members"]:
-                        group["members"].append(member)
-                        save_groups(groups)
-                    detail = group_details(group, users, set(ONLINE))
-                for member_key in group["members"]:
-                    deliver(member_key, {"type": "group_list", "groups": [detail]})
             elif kind == "group_invite":
                 group_key, member = str(packet.get("group", "")).lower(), str(packet.get("member", "")).lower()
                 with LOCK:
@@ -905,7 +1134,12 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 source = packet.get("from", "").lower()
                 with LOCK:
                     source_info = ONLINE.get(source)
-                if not source_info:
+                    pending = PENDING_OPENS.get(key, set())
+                    requested = source in pending
+                    pending.discard(source)
+                if not requested:
+                    send(sock, {"type": "error", "message": "no pending room request from that person"})
+                elif not source_info:
                     send(sock, {"type": "error", "message": "requester is no longer online"})
                 else:
                     deliver(source, {"type": "accepted", **signed_identity(name, public, sign_public)})
@@ -920,6 +1154,11 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     # The client paces attachment frames.  Silently drop an
                     # unpaced excess frame rather than flooding its terminal.
                     continue
+                elif payload.get("type") == "audio":
+                    # Live call audio is useless later: deliver now or drop it,
+                    # never fill someone's offline queue with it.
+                    deliver(target, wrapped)
+                    continue
                 elif deliver_or_queue(target, wrapped):
                     continue
                 else:
@@ -928,11 +1167,23 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 send(sock, {"type": "error", "message": "unknown request"})
     except (ConnectionError, OSError, ValueError, json.JSONDecodeError):
         pass
+    except (AttributeError, KeyError, TypeError):
+        # A field of the wrong JSON type (e.g. "to": 5). Only this client's
+        # own connection is affected; drop it without a thread traceback.
+        pass
     finally:
         if key:
             with LOCK:
                 if ONLINE.get(key, (None, None, None))[1] is sock:
                     ONLINE.pop(key, None)
+                    PENDING_OPENS.pop(key, None)
+                    try:
+                        users = load_users()
+                        if key in users:
+                            users[key]["last_seen"] = int(time.time())
+                            save_users(users)
+                    except (OSError, ValueError):
+                        pass
             print(f"offline  {key}")
         try:
             sock.close()
