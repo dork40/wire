@@ -63,6 +63,7 @@ MAX_SYNC_BLOB_BYTES = 64 * 1024
 MAX_SYNC_BYTES_PER_USER = 16 * 1024 * 1024
 MAX_SYNC_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_GROUP_MEMBERS = 100
+MAX_STATUS_CHARS = 80
 RELAY_RATE_BYTES_PER_SECOND = 40 * 1024 * 1024
 RELAY_RATE_BURST_BYTES = 64 * 1024 * 1024
 RELAY_BUDGETS: dict[str, tuple[float, float]] = {}
@@ -327,6 +328,13 @@ def save_sync(value: dict) -> None:
 
 def valid_sync_blob(value: object) -> bool:
     return isinstance(value, str) and 1 <= len(value.encode("ascii", errors="ignore")) <= MAX_SYNC_BLOB_BYTES
+
+
+def clean_status(value: object) -> str:
+    """Friends see this text, so only printable characters, one line, short."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if char.isprintable()).strip()[:MAX_STATUS_CHARS]
 
 
 def valid_group_name(value: object) -> bool:
@@ -615,6 +623,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 users[key] = {"name": name, "public": public, "sign_public": sign_public,
                               "allow_group_invites": bool(previous.get("allow_group_invites", True)),
                               "friends_only_rooms": bool(previous.get("friends_only_rooms", False)),
+                              "status": clean_status(previous.get("status", "")),
                               "dnd": bool(previous.get("dnd", False)),
                               "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
                               "friend_requests": [item for item in previous.get("friend_requests", []) if isinstance(item, str)]}
@@ -703,9 +712,11 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     users = load_users(); account = users.get(key, {})
                     friends = [item for item in account.get("friends", []) if item in users]
                     matches = [{"name": users[item]["name"], "online": item in ONLINE,
-                                "dnd": bool(users[item].get("dnd", False))} for item in friends]
+                                "dnd": bool(users[item].get("dnd", False)),
+                                "status": clean_status(users[item].get("status", ""))} for item in friends]
                     requests = [users[item]["name"] for item in account.get("friend_requests", []) if item in users]
-                send(sock, {"type": "friends", "users": matches, "requests": requests})
+                    my_status = clean_status(account.get("status", ""))
+                send(sock, {"type": "friends", "users": matches, "requests": requests, "status": my_status})
             elif kind == "friend_request":
                 target = str(packet.get("to", "")).lower()
                 with LOCK:
@@ -747,6 +758,14 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     save_users(users)
                 deliver_or_queue(target, {"type": "friend_removed", "name": name})
                 send(sock, {"type": "friend_removed", "name": users[target]["name"]})
+            elif kind == "set_status":
+                status = clean_status(packet.get("status", ""))
+                with LOCK:
+                    users = load_users()
+                    if key in users:
+                        users[key]["status"] = status
+                        save_users(users)
+                send(sock, {"type": "status_saved", "status": status})
             elif kind == "ping":
                 send(sock, {"type": "pong", "id": packet.get("id", "")})
             elif kind == "preferences":
@@ -788,6 +807,14 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "sync_saved", "kind": "message"})
                 else:
                     send(sock, {"type": "error", "message": "encrypted sync storage is full"})
+            elif kind == "sync_delete_message":
+                message_id = packet.get("id")
+                if isinstance(message_id, str) and len(message_id) == 32 and all(char in "0123456789abcdef" for char in message_id):
+                    with LOCK:
+                        synced = load_sync()
+                        messages = synced.get(key, {}).get("messages", {})
+                        if isinstance(messages, dict) and messages.pop(message_id, None) is not None:
+                            save_sync(synced)
             elif kind == "sync_fetch":
                 with LOCK:
                     account_sync = load_sync().get(key, {})

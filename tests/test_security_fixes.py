@@ -156,6 +156,33 @@ class AbuseLimitTests(unittest.TestCase):
         self.assertEqual(results, [True, True, True, False, False])
         self.assertTrue(self.server.deliver_or_queue("a", {"type": "relay", "from": "other", "packet": {"data": "y" * 900}}))
 
+    def test_status_is_cleaned_and_only_shown_to_friends_list(self):
+        alice = self.harness.login("alice")
+        self.harness.login("bob")
+        users = self.server.load_users()
+        users["alice"]["friends"], users["bob"]["friends"] = ["bob"], ["alice"]
+        self.server.save_users(users)
+        self.server.send(alice, {"type": "set_status", "status": "back at 6\x1b[2J\n" + "x" * 200})
+        saved = self.server.receive(alice)["status"]
+        self.assertTrue(saved.startswith("back at 6"))
+        self.assertNotIn("\x1b", saved)
+        self.assertLessEqual(len(saved), self.server.MAX_STATUS_CHARS)
+        self.server.send(alice, {"type": "friends_list"})
+        reply = self.server.receive(alice)
+        self.assertEqual(reply["status"], saved)
+        self.assertEqual(reply["users"][0]["name"], "bob")
+
+    def test_client_can_delete_its_own_synced_message_only(self):
+        alice = self.harness.login("alice")
+        message_id = "a" * 32
+        self.server.save_sync({"alice": {"messages": {message_id: "blob"}}, "bob": {"messages": {message_id: "blob"}}})
+        self.server.send(alice, {"type": "sync_delete_message", "id": message_id})
+        self.server.send(alice, {"type": "ping", "id": "done"})
+        self.assertEqual(self.server.receive(alice)["type"], "pong")
+        synced = self.server.load_sync()
+        self.assertEqual(synced["alice"]["messages"], {})
+        self.assertEqual(synced["bob"]["messages"], {message_id: "blob"})
+
     def test_rate_limit_tables_are_pruned(self):
         self.server.MAX_TRACKED_KEYS = 10
         # time.monotonic() counts from boot on Linux, so "0" can be recent on

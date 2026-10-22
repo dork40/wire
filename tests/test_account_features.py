@@ -138,5 +138,101 @@ class PasswordChangeTests(TempAccount):
         self.assertTrue(any("use /password" in line for line in self.lines))
 
 
+class FakePeer:
+    def __init__(self, name: str = "bob") -> None:
+        self.name = name
+        self.controls: list[dict] = []
+
+    def send_control(self, control: dict) -> None:
+        self.controls.append(control)
+
+
+class DisappearingMessageTests(TempAccount):
+    def test_timer_is_stored_announced_and_applied_to_new_messages(self):
+        peer = FakePeer()
+        self.app.set_chat_timer(peer, "1h")
+        self.assertEqual(peer.controls, [{"kind": "chat_timer", "seconds": 3600}])
+        self.assertEqual(wire.load_settings()["timers"], {"bob": 3600})
+        self.app.record_history("bob", "bob", "self destructs")
+        record = self.app.read_history("bob")[-1]
+        self.assertAlmostEqual(record["expires_at"], wire.time.time() + 3600, delta=5)
+        self.app.set_chat_timer(peer, "off")
+        self.app.record_history("bob", "bob", "stays")
+        self.assertNotIn("expires_at", self.app.read_history("bob")[-1])
+
+    def test_expired_messages_are_hidden_then_purged_everywhere(self):
+        self.app.record_history("bob", "bob", "keep me")
+        self.app.record_history("bob", "bob", "gone soon")
+        records = self.app.read_history("bob")
+        records[-1]["expires_at"] = int(wire.time.time()) - 1
+        self.app.save_history("bob", records)
+        self.assertEqual([r["text"] for r in self.app.read_history("bob")], ["keep me"])
+        self.assertEqual(len(self.app.read_history("bob", include_expired=True)), 2)
+
+        sent = []
+        self.app.server = object()
+        self.app.server_send = sent.append
+        self.app.server_version = "1.4.36"
+        self.assertEqual(self.app.purge_expired(), 1)
+        self.assertEqual(len(self.app.read_history("bob", include_expired=True)), 1)
+        self.assertEqual([p["type"] for p in sent], ["sync_delete_message"])
+
+    def test_old_servers_are_not_sent_the_new_delete_command(self):
+        self.app.record_history("bob", "bob", "gone")
+        records = self.app.read_history("bob")
+        records[-1]["expires_at"] = 1
+        self.app.save_history("bob", records)
+        sent = []
+        self.app.server = object()
+        self.app.server_send = sent.append
+        self.app.server_version = "1.4.35"
+        self.assertEqual(self.app.purge_expired(), 1)
+        self.assertEqual(sent, [])
+
+    def test_bad_timer_values_are_refused(self):
+        with self.assertRaises(ValueError):
+            self.app.set_chat_timer(FakePeer(), "3 days")
+
+
+class RemoteInputTests(TempAccount):
+    def test_reaction_cannot_carry_terminal_commands(self):
+        self.app.record_history("bob", "tester", "hello")
+        message_id = self.app.read_history("bob")[-1]["id"]
+        self.lines.clear()
+        self.app.apply_message_control(FakePeer(), {"kind": "message_react", "id": message_id, "reaction": "\x1b[2J\x1b]52;c;eA==\x07"})
+        self.assertTrue(all("\x1b" not in line and "\x07" not in line for line in self.lines))
+        self.app.apply_message_control(FakePeer(), {"kind": "message_react", "id": message_id, "reaction": "\x1b\x07"})
+        self.assertEqual(len(self.app.read_history("bob")[-1]["reactions"]), 1)
+
+    def test_direct_connections_respect_username_rules_and_blocks(self):
+        other = wire.Wire()
+        other.connect_server = lambda *args, **kwargs: None
+        wire.Wire().signup("mallory", password="another long password")
+        other.login("mallory", password="another long password")
+        contacts = self.app.contacts()
+        contacts["blocked"] = ["mallory"]
+        self.app.save_contacts(contacts)
+        with self.assertRaisesRegex(ValueError, "blocked"):
+            self.app.make_peer(None, other.hello())
+        hello = other.hello()
+        hello["name"] = "../../evil"
+        with self.assertRaisesRegex(ValueError, "username"):
+            self.app.make_peer(None, hello)
+
+    @unittest.skipUnless(wire.os.name == "nt", "pop-ups are Windows-only")
+    def test_notification_bursts_start_one_process_not_hundreds(self):
+        started = []
+        old_popen, old_foreground = wire.subprocess.Popen, wire.wire_console_is_foreground
+        wire.subprocess.Popen = lambda *args, **kwargs: started.append(args)
+        wire.wire_console_is_foreground = lambda: False
+        wire._last_toast_at = float("-inf")
+        try:
+            for _ in range(200):
+                wire.toast("new message from spammer")
+        finally:
+            wire.subprocess.Popen, wire.wire_console_is_foreground = old_popen, old_foreground
+        self.assertEqual(len(started), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

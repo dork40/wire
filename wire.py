@@ -320,6 +320,19 @@ def safe_terminal_text(value: object) -> str:
 
 
 CHAT_KEY_RE = re.compile(r"(?:group-)?[A-Za-z0-9_-]{3,40}")
+# Disappearing-message timers both people in a chat can choose from.
+TIMER_CHOICES = {"30s": 30, "5m": 300, "1h": 3600, "8h": 8 * 3600, "1d": 86400, "1w": 7 * 86400}
+# Server that understands "sync_delete_message".
+SYNC_DELETE_SERVER_VERSION = "1.4.36"
+
+
+def timer_label(seconds: int) -> str:
+    return next((label for label, value in TIMER_CHOICES.items() if value == seconds), "off")
+
+
+def record_expired(record: object, now: float) -> bool:
+    expires = record.get("expires_at") if isinstance(record, dict) else None
+    return isinstance(expires, (int, float)) and not isinstance(expires, bool) and expires <= now
 
 
 def chat_key(value: str) -> str:
@@ -485,9 +498,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "timers": {str(name).lower(): value for name, value in saved.get("timers", {}).items() if CHAT_KEY_RE.fullmatch(str(name)) and value in TIMER_CHOICES.values()} if isinstance(saved.get("timers"), dict) else {}, "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
     except Exception:
-        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "muted": [], "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "muted": [], "timers": {}, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
 
 
 def save_settings(settings: dict) -> None:
@@ -869,6 +882,11 @@ def wire_console_is_foreground() -> bool:
         return False
 
 
+TOAST_LOCK = threading.Lock()
+TOAST_MIN_INTERVAL_SECONDS = 3.0
+_last_toast_at = float("-inf")
+
+
 def toast(text: str) -> None:
     """Show a Windows notification without needing a packaged-app AUMID.
 
@@ -878,6 +896,14 @@ def toast(text: str) -> None:
     """
     if os.name != "nt" or wire_console_is_foreground():
         return
+    # Each pop-up is a separate PowerShell process that lives ~5 seconds, so
+    # a burst of messages from one chat must not turn into hundreds of them.
+    global _last_toast_at
+    with TOAST_LOCK:
+        now = time.monotonic()
+        if now - _last_toast_at < TOAST_MIN_INTERVAL_SECONDS:
+            return
+        _last_toast_at = now
     encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
     script = (
         "Add-Type -AssemblyName System.Windows.Forms;Add-Type -AssemblyName System.Drawing;"
@@ -1185,6 +1211,7 @@ class Wire:
         # Room consent. Any directory user can make the server send us an
         # "accepted" for an arbitrary name, so only attach a peer we either
         # opened a room with or whose request we explicitly accepted.
+        self.server_version = ""
         self.outgoing_opens: set[str] = set()
         self.accepted_requests: set[str] = set()
         self.incoming_images: dict[str, dict] = {}
@@ -1293,6 +1320,7 @@ class Wire:
         self.history_key = base64.urlsafe_b64encode(secret)
         self.account_secret = secret
         say(f"signed in as {self.name}")
+        self.start_worker(self.purge_expired_loop)
         if len(password) < MIN_PASSWORD_CHARS:
             say(f"warning: your password is shorter than {MIN_PASSWORD_CHARS} characters and could be guessed; use /password to change it")
         try:
@@ -1520,6 +1548,10 @@ class Wire:
         if hello.get("type") != "hello" or not isinstance(hello.get("name"), str) or not isinstance(hello.get("public"), str):
             raise ValueError("bad handshake")
         peer_name = hello["name"]
+        if not peer_name.isalnum() or not 3 <= len(peer_name) <= 24:
+            raise ValueError("bad peer username")
+        if self.is_blocked(peer_name):
+            raise ValueError(f"{peer_name} is blocked")
         if expected and peer_name.lower() != expected.lower():
             raise ValueError(f"connected peer is {peer_name}, not {expected}")
         peer_public = unb64(hello["public"])
@@ -1710,7 +1742,8 @@ class Wire:
                         or not valid_transfer_id(message_id)
                         or not isinstance(record.get("from"), str)
                         or not isinstance(record.get("text", ""), str)
-                        or len(record.get("text", "")) > MAX_MESSAGE_CHARS):
+                        or len(record.get("text", "")) > MAX_MESSAGE_CHARS
+                        or record_expired(record, time.time())):
                     continue
                 with self.history_lock:
                     records = self.read_history(peer_name)
@@ -1982,7 +2015,7 @@ class Wire:
         say(f"deleted local account {self.name}; the username remains reserved on Wire")
         self.close()
 
-    def read_history(self, peer_name: str) -> list[dict]:
+    def read_history(self, peer_name: str, include_expired: bool = False) -> list[dict]:
         if not self.history_key or not CHAT_KEY_RE.fullmatch(peer_name):
             return []
         path = self.history_path(peer_name)
@@ -1991,7 +2024,12 @@ class Wire:
         try:
             plaintext = Fernet(self.history_key).decrypt(path.read_bytes())
             records = json.loads(plaintext.decode("utf-8"))
-            return records if isinstance(records, list) else []
+            if not isinstance(records, list):
+                return []
+            if include_expired:
+                return records
+            now = time.time()
+            return [record for record in records if not record_expired(record, now)]
         except Exception:
             return []
 
@@ -2001,7 +2039,11 @@ class Wire:
         message_id = message_id or uuid.uuid4().hex
         with self.history_lock:
             records = self.read_history(peer_name)
-            records.append({"id": message_id, "at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text, "reply_to": reply_to, "reactions": []})
+            record = {"id": message_id, "at": time.strftime("%Y-%m-%d %H:%M"), "from": sender, "text": text, "reply_to": reply_to, "reactions": []}
+            timer = self.chat_timer(peer_name)
+            if timer:
+                record["expires_at"] = int(time.time()) + timer
+            records.append(record)
             encrypted = Fernet(self.history_key).encrypt(json.dumps(records[-500:], separators=(",", ":")).encode("utf-8"))
             replace_private_bytes(self.history_path(peer_name), encrypted)
             changed = records[-1]
@@ -2081,6 +2123,71 @@ class Wire:
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         say(f"exported {len(lines) - 3} messages to {path}")
         return path
+
+    def chat_timer(self, peer_name: str) -> int:
+        return int(self.settings.get("timers", {}).get(peer_name.lower(), 0))
+
+    def store_chat_timer(self, peer_name: str, seconds: int) -> None:
+        timers = dict(self.settings.get("timers", {}))
+        if seconds:
+            timers[peer_name.lower()] = seconds
+        else:
+            timers.pop(peer_name.lower(), None)
+        self.settings["timers"] = timers
+        save_settings(self.settings)
+        self.sync_settings()
+
+    def set_chat_timer(self, peer: "Peer", value: str) -> None:
+        """Disappearing messages for this chat. Both sides keep the same
+        setting, the way the other person learns it is an encrypted control."""
+        value = value.strip().lower()
+        if value in ("", "status"):
+            say(f"disappearing messages with {peer.name}: {timer_label(self.chat_timer(peer.name))}")
+            return
+        seconds = 0 if value in ("off", "0") else TIMER_CHOICES.get(value)
+        if seconds is None:
+            raise ValueError("use: /timer " + "|".join(TIMER_CHOICES) + "|off")
+        self.store_chat_timer(peer.name, seconds)
+        peer.send_control({"kind": "chat_timer", "seconds": seconds})
+        if seconds:
+            say(f"disappearing messages on: new messages with {peer.name} are deleted after {timer_label(seconds)}")
+        else:
+            say(f"disappearing messages off for {peer.name}")
+
+    def purge_expired(self) -> int:
+        """Delete expired messages from local history and from synced copies."""
+        if not self.history_key or not self.name or not HISTORY_DIR.exists():
+            return 0
+        prefix, now, removed = f"{self.name.lower()}--", time.time(), []
+        for path in list(HISTORY_DIR.glob(f"{self.name.lower()}--*.wire")):
+            peer_name = path.stem[len(prefix):]
+            if not CHAT_KEY_RE.fullmatch(peer_name):
+                continue
+            with self.history_lock:
+                records = self.read_history(peer_name, include_expired=True)
+                keep = [record for record in records if not record_expired(record, now)]
+                if len(keep) == len(records):
+                    continue
+                removed += [record.get("id") for record in records if record_expired(record, now)]
+                encrypted = Fernet(self.history_key).encrypt(json.dumps(keep, separators=(",", ":")).encode("utf-8"))
+                replace_private_bytes(path, encrypted)
+        if self.server and version_parts(self.server_version or "0") >= version_parts(SYNC_DELETE_SERVER_VERSION):
+            for message_id in removed:
+                if valid_transfer_id(message_id):
+                    try:
+                        self.server_send({"type": "sync_delete_message", "id": message_id})
+                    except (OSError, ConnectionError):
+                        break
+        return len(removed)
+
+    def purge_expired_loop(self) -> None:
+        while True:
+            try:
+                self.purge_expired()
+            except Exception as exc:  # noqa: BLE001 - keep purging on the next tick
+                report_background_failure("disappearing messages", exc)
+            if self.closing.wait(30):
+                return
 
     def search_history(self, query: str) -> None:
         """Search locally decrypted history; this never contacts the directory."""
@@ -3015,6 +3122,8 @@ class Wire:
         say(f"connected: {peer.name}  fingerprint: {fingerprint(peer.public_key)}")
         say(f"room open: {peer.name} (type normally; /help for commands)")
         self.show_history(peer.name)
+        if self.chat_timer(peer.name):
+            say(f"disappearing messages: {timer_label(self.chat_timer(peer.name))}")
         restart_blank_prompt_after_background_output()
         redraw_prompt()
         if peer.sock:
@@ -3083,6 +3192,14 @@ class Wire:
                     image_id = control.get("id")
                     if isinstance(image_id, str):
                         self.stop_incoming_image(peer, image_id)
+                elif control.get("kind") == "chat_timer":
+                    seconds = control.get("seconds")
+                    if (isinstance(seconds, int) and not isinstance(seconds, bool)
+                            and (seconds == 0 or seconds in TIMER_CHOICES.values())
+                            and seconds != self.chat_timer(peer.name)):
+                        self.store_chat_timer(peer.name, seconds)
+                        say(f"\n{peer.name} set disappearing messages to {timer_label(seconds)}")
+                        redraw_prompt()
                 elif control.get("kind") == "typing":
                     now = time.monotonic()
                     name = peer.name.lower()
@@ -3154,7 +3271,9 @@ class Wire:
             self.save_history(peer.name, records, target)
             return
         if kind == "message_react" and isinstance(control.get("reaction"), str) and 0 < len(control["reaction"]) <= 24:
-            reaction = control["reaction"]
+            reaction = safe_terminal_text(control["reaction"]).replace("\n", "").replace("\t", "").strip()
+            if not reaction:
+                return
             token = f"{peer.name}:{reaction}"
             target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{peer.name}:")] + [token]
             say(f"\n{peer.name} reacted {reaction} to {message_id[:6]}")
@@ -3230,6 +3349,7 @@ class Wire:
             self.sync_preferences()
             self.backup_identity()
             version = reply.get("version")
+            self.server_version = version if isinstance(version, str) else ""
             say(f"username directory online{f' (server {version})' if isinstance(version, str) else ' (old server)' }")
         except Exception:
             sock.close()
@@ -3427,12 +3547,16 @@ class Wire:
                     users = packet.get("users", [])
                     requests = packet.get("requests", [])
                     say("\nFRIENDS")
+                    if isinstance(packet.get("status"), str) and packet["status"]:
+                        say(f"your status: {safe_terminal_text(packet['status'])}")
                     if not users:
                         say("no friends yet; use /friend add <username>")
                     for user in users:
                         marker = "online" if user.get("online") else "offline"
                         dnd = "; do not disturb" if user.get("dnd") else ""
-                        say(f"{user.get('name', '?')}  [{marker}{dnd}]")
+                        status = user.get("status") if isinstance(user.get("status"), str) else ""
+                        status = safe_terminal_text(status).replace("\n", " ").strip()
+                        say(f"{user.get('name', '?')}  [{marker}{dnd}]" + (f"  - {status}" if status else ""))
                     for requester in requests:
                         say(f"friend request from {requester}: /friend accept {requester} or /friend decline {requester}")
                 elif kind == "friend_request":
@@ -3505,6 +3629,9 @@ class Wire:
                     share_id = packet.get("id", "")
                     if isinstance(share_id, str):
                         self.stop_share_id(share_id, remote=True)
+                elif kind == "status_saved":
+                    saved = safe_terminal_text(packet.get("status", "")).strip()
+                    say(f"status set: {saved}" if saved else "status cleared")
                 elif kind == "identity_backup_saved":
                     # Routine login backup succeeded. Avoid an async startup
                     # line here; it can arrive exactly as the first prompt opens.
@@ -3699,7 +3826,8 @@ ACCOUNT AND PEOPLE
   /public                            Return to Wire's public directory server.
   discover [name]                    Find a Wire username.
   open <name> / accept <name>        Open or accept a private chat.
-  friends                             Show friends, online state, and pending requests.
+  friends                             Show friends, online state, status, and pending requests.
+  /status <message> / /status clear  Set a short status your friends see (e.g. "back at 6").
   friend add|accept|decline|remove <name>
                                       Send, answer, or remove a friend request.
   block|unblock <name> / blocked     Manage blocked people.
@@ -3709,6 +3837,7 @@ CHAT
   /history <name>                    Show saved messages without cluttering chat with IDs.
   /history <name> ids                Show saved messages with message codes for reply/edit/react.
   /search <words>                    Search your saved messages locally.
+  /timer 30s|5m|1h|8h|1d|1w|off       Disappearing messages for the open chat (both sides).
   /mute <name> / /mute group <name>  Silence pop-ups from a person or group (/unmute to undo).
   /export <name> / /export group <name>
                                       Save that chat's history on this device to a text file.
@@ -3827,6 +3956,16 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
                 raise ValueError("use: /history <username> [ids]")
             app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "status":
+            text = argument.strip()
+            if not text:
+                raise ValueError("use: /status <short message> or /status clear (friends see it in their friends list)")
+            app.server_send({"type": "set_status", "status": "" if text.lower() == "clear" else text})
+        elif command == "timer":
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("open a room first; timers are per chat")
+            app.set_chat_timer(room_peer, argument)
         elif command == "password":
             app.change_password()
         elif command in ("mute", "unmute"):
