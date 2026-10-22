@@ -234,5 +234,27 @@ class RemoteInputTests(TempAccount):
         self.assertEqual(len(started), 1)
 
 
+class KeyChangeTests(TempAccount):
+    def test_changed_key_is_refused_announced_once_then_trustable(self):
+        old_public, old_sign = b"o" * 32, b"s" * 32
+        new_public, new_sign = b"n" * 32, b"t" * 32
+        self.app.verify_peer_identity("bob", old_public, old_sign)
+        self.lines.clear()
+        for _ in range(3):  # e.g. three group messages from the new key
+            with self.assertRaisesRegex(ValueError, "identity key changed"):
+                self.app.verify_peer_identity("bob", new_public, new_sign)
+        self.assertEqual(sum("SAFETY WARNING" in line for line in self.lines), 1)
+        self.assertTrue(any(wire.fingerprint(new_public) in line for line in self.lines))
+
+        wire.run_command(self.app, "trust", "bob")
+        self.app.verify_peer_identity("bob", new_public, new_sign)  # now accepted
+        with self.assertRaises(ValueError):
+            self.app.verify_peer_identity("bob", old_public, old_sign)  # and the old key is not
+
+    def test_trust_needs_a_pending_key_change(self):
+        with self.assertRaises(ValueError):
+            self.app.trust_new_identity("bob")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -121,12 +121,22 @@ def verify_account(username, password):
         return account if isinstance(account, dict) and str(account.get("name", "")).lower() == username.lower() else None
     except (KeyError, ValueError, TypeError, InvalidToken, json.JSONDecodeError): return None
 
-def allow_attempt(address):
+def allow_attempt(address, account=""):
+    """8 tries per address and 10 per account every 15 minutes. The account
+    budget stops a guesser who spreads attempts over many addresses."""
     now = time.monotonic()
+    account_key = f"account:{account.lower()}"
     with LOCK:
+        if len(ATTEMPTS) > 4096:
+            for key in [key for key, stamps in ATTEMPTS.items() if not stamps or now - stamps[-1] >= 900]:
+                ATTEMPTS.pop(key, None)
         recent = [x for x in ATTEMPTS.get(address, []) if now - x < 900]
-        if len(recent) >= 8: ATTEMPTS[address] = recent; return False
-        recent.append(now); ATTEMPTS[address] = recent; return True
+        account_recent = [x for x in ATTEMPTS.get(account_key, []) if now - x < 900]
+        if len(recent) >= 8 or (account and len(account_recent) >= 10):
+            ATTEMPTS[address] = recent; return False
+        recent.append(now); ATTEMPTS[address] = recent
+        if account: account_recent.append(now); ATTEMPTS[account_key] = account_recent
+        return True
 
 def age_text(seconds):
     if seconds is None: return "never"
@@ -285,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
             form = parse_qs(self.rfile.read(length).decode(), keep_blank_values=True)
             username, password = form.get("username", [""])[0].strip(), form.get("password", [""])[0]
         except (ValueError, UnicodeDecodeError): self.reply(400, login_page("Invalid request.")); return
-        if not allow_attempt(self.client_address[0]): self.reply(429, login_page("Too many attempts. Try again later.")); return
+        if not allow_attempt(self.client_address[0], username[:24]): self.reply(429, login_page("Too many attempts. Try again later.")); return
         if not verify_account(username, password): self.reply(401, login_page("Incorrect username or password.")); return
         token = secrets.token_urlsafe(32)
         with LOCK:

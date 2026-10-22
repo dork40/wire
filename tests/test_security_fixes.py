@@ -194,6 +194,15 @@ class AbuseLimitTests(unittest.TestCase):
         self.assertLessEqual(len(self.server.RECOVERY_ATTEMPTS), 2)
 
 
+class WebConsoleLimitTests(unittest.TestCase):
+    def test_web_login_guesses_are_capped_per_account_across_addresses(self):
+        from test_web import load_web
+        web = load_web()
+        allowed = [web.allow_attempt(f"10.1.0.{n}", "dorki") for n in range(30)]
+        self.assertEqual(sum(allowed), 10)
+        self.assertTrue(web.allow_attempt("10.1.0.200", "someoneelse"))
+
+
 class ForcedRoomClientTests(unittest.TestCase):
     def run_directory_packets(self, app: wire.Wire, packets: list[dict]) -> list[str]:
         attached: list[str] = []

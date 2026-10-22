@@ -1212,6 +1212,8 @@ class Wire:
         # "accepted" for an arbitrary name, so only attach a peer we either
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
+        # name -> identity offered after a key change; only /trust pins it.
+        self.rejected_identities: dict[str, dict] = {}
         self.outgoing_opens: set[str] = set()
         self.accepted_requests: set[str] = set()
         self.incoming_images: dict[str, dict] = {}
@@ -1625,11 +1627,31 @@ class Wire:
         proposed = {"public": b64(public), "sign_public": b64(sign_public)}
         if isinstance(current, dict):
             if current.get("public") != proposed["public"] or current.get("sign_public") != proposed["sign_public"]:
+                if self.rejected_identities.get(key) != proposed:
+                    # Say it once per new key - group messages would otherwise
+                    # be dropped silently, with no hint anything was wrong.
+                    self.rejected_identities[key] = proposed
+                    say(f"\nSAFETY WARNING: {name}'s identity key changed, so their messages are refused.")
+                    say(f"new fingerprint: {fingerprint(public)}")
+                    say(f"If {name} reinstalled Wire, check that fingerprint with them in person or by call, then type /trust {name}")
                 raise ValueError(f"SAFETY WARNING: {name}'s identity key changed; connection refused")
             return
         identities[key] = proposed
         self.save_contacts(contacts)
         say(f"saved safety identity for {name}")
+
+    def trust_new_identity(self, name: str) -> None:
+        """Accept a changed identity key the person has verified out of band."""
+        self.require_login()
+        key = name.strip().lower()
+        proposed = self.rejected_identities.get(key)
+        if not proposed:
+            raise ValueError("no changed identity is waiting for that person")
+        contacts = self.contacts()
+        contacts.setdefault("identities", {})[key] = proposed
+        self.save_contacts(contacts)
+        self.rejected_identities.pop(key, None)
+        say(f"now trusting {name.strip()}'s new identity ({fingerprint(unb64(proposed['public']))}); open the chat again")
 
     def edit_contact(self, list_name: str, username: str, add: bool) -> None:
         self.require_login()
@@ -3875,6 +3897,7 @@ SETTINGS AND UTILITIES
   /settings delete                   Delete this PC's local account data.
   /password                          Change your password (re-encrypts your keys and history).
   /identity / /fingerprint <name>    Show safety fingerprints.
+  /trust <name>                      Accept someone's changed identity key after checking it with them.
   /ping / /testnotify / /diagnose   Connection, notification, and capability checks.
   /diagnose network                 Test real ICE, STUN, and TURN candidates.
   /update                            Close Wire and install the newest version.
@@ -3956,6 +3979,10 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
                 raise ValueError("use: /history <username> [ids]")
             app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "trust":
+            if not argument.strip():
+                raise ValueError("use: /trust <name> (only after checking their new fingerprint with them)")
+            app.trust_new_identity(argument)
         elif command == "status":
             text = argument.strip()
             if not text:
