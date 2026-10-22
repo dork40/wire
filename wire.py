@@ -346,6 +346,84 @@ def human_size(size: int) -> str:
     return f"{size:.1f} MB"
 
 
+POLL_HEADER_RE = re.compile(r"POLL \(([0-9a-f]{6})\): (.+)")
+POLL_OPTION_RE = re.compile(r"  (\d{1,2})\) (.+)")
+VOTE_RE = re.compile(r"VOTE ([0-9a-f]{6}) (\d{1,2})")
+MAX_POLL_OPTIONS = 10
+# Bold/italic/code styling in a real terminal only: exports, pipes and the
+# Android app's log get the plain text.
+TEXT_FORMATTING = sys.stdout.isatty()
+
+
+def poll_text(code: str, question: str, options: list[str]) -> str:
+    """Polls travel as ordinary readable messages, so an older Wire still
+    shows the question and can vote by typing the command."""
+    lines = [f"POLL ({code}): {question}"] + [f"  {index}) {option}" for index, option in enumerate(options, 1)]
+    return "\n".join(lines + [f"Vote with /vote {code} <number>"])
+
+
+def parse_poll(text: str) -> Optional[tuple[str, str, list[str]]]:
+    lines = text.split("\n")
+    header = POLL_HEADER_RE.fullmatch(lines[0]) if lines else None
+    if not header:
+        return None
+    options = []
+    for line in lines[1:]:
+        option = POLL_OPTION_RE.fullmatch(line)
+        if not option:
+            break
+        if int(option.group(1)) != len(options) + 1:
+            return None
+        options.append(option.group(2))
+    return (header.group(1), header.group(2), options) if 2 <= len(options) <= MAX_POLL_OPTIONS else None
+
+
+def format_text(text: str) -> str:
+    """`code`, **bold**, *italic* / _italic_ - applied after sanitising, so
+    the only escape codes in the output are the ones added here."""
+    if not TEXT_FORMATTING:
+        return text
+    text = re.sub(r"`([^`\n]+)`", "\x1b[36m\\1\x1b[39m", text)
+    text = re.sub(r"\*\*(?=\S)(.+?)(?<=\S)\*\*", "\x1b[1m\\1\x1b[22m", text)
+    text = re.sub(r"(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])", "\x1b[3m\\1\x1b[23m", text)
+    return re.sub(r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)", "\x1b[3m\\1\x1b[23m", text)
+
+
+VIEW_ONCE_SECONDS = 60
+MAX_SCHEDULE_SECONDS = 7 * 86400
+MAX_SCHEDULED_MESSAGES = 50
+
+
+def ago(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return "just now"
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return f"{seconds // size}{unit} ago"
+    return "just now"
+
+
+def parse_when(value: str, now: Optional[float] = None) -> float:
+    """"10m", "2h", "45s", "1d" from now, or a clock time like "18:30"
+    (today, or tomorrow if that time has passed). Returns a Unix time."""
+    now = time.time() if now is None else now
+    value = value.strip().lower()
+    relative = re.fullmatch(r"(\d{1,4})([smhd])", value)
+    if relative:
+        delay = int(relative.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[relative.group(2)]
+    else:
+        clock = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
+        if not clock:
+            raise ValueError("when must look like 10m, 2h, 1d or 18:30")
+        local = time.localtime(now)
+        target = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, int(clock.group(1)), int(clock.group(2)), 0, 0, 0, -1))
+        delay = target - now if target > now else target + 86400 - now
+    if not 0 < delay <= MAX_SCHEDULE_SECONDS:
+        raise ValueError("schedule between a few seconds and 7 days ahead")
+    return now + delay
+
+
 def timer_label(seconds: int) -> str:
     return next((label for label, value in TIMER_CHOICES.items() if value == seconds), "off")
 
@@ -518,9 +596,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "discoverable": bool(saved.get("discoverable", True)), "timers": {str(name).lower(): value for name, value in saved.get("timers", {}).items() if CHAT_KEY_RE.fullmatch(str(name)) and value in TIMER_CHOICES.values()} if isinstance(saved.get("timers"), dict) else {}, "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "discoverable": bool(saved.get("discoverable", True)), "share_last_seen": bool(saved.get("share_last_seen", True)), "timers": {str(name).lower(): value for name, value in saved.get("timers", {}).items() if CHAT_KEY_RE.fullmatch(str(name)) and value in TIMER_CHOICES.values()} if isinstance(saved.get("timers"), dict) else {}, "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
     except Exception:
-        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "discoverable": True, "muted": [], "timers": {}, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "discoverable": True, "share_last_seen": True, "muted": [], "timers": {}, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
 
 
 def save_settings(settings: dict) -> None:
@@ -1232,6 +1310,12 @@ class Wire:
         # "accepted" for an arbitrary name, so only attach a peer we either
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
+        self.view_once_files: list[Path] = []
+        self.scheduled: list[dict] = []
+        # chat key ("bob" / "group-crew") -> messages / @mentions that arrived
+        # while a different chat was open.
+        self.unread: dict[str, int] = {}
+        self.unread_mentions: dict[str, int] = {}
         # Group members we're exchanging files with but have no open chat
         # with; only file-transfer traffic is accepted from these.
         self.transfer_peers: dict[str, Peer] = {}
@@ -1742,6 +1826,7 @@ class Wire:
         say(f"allow group invites: {'on' if self.settings['allow_group_invites'] else 'off'}")
         say(f"chats from friends only: {'on' if self.settings['friends_only_rooms'] else 'off'}")
         say(f"show me in search: {'on' if self.settings['discoverable'] else 'off (exact username only)'}")
+        say(f"share last seen: {'on' if self.settings['share_last_seen'] else 'off'}")
         if self.settings["muted"]:
             say(f"muted: {', '.join(self.settings['muted'])}")
         say(f"voice activation: {'always on' if self.settings['voice_mode'] == 'open' else 'hold F12 to talk'}")
@@ -1764,7 +1849,8 @@ class Wire:
             self.server_send({"type": "preferences", "dnd": self.settings["do_not_disturb"],
                               "allow_group_invites": self.settings["allow_group_invites"],
                               "friends_only_rooms": self.settings["friends_only_rooms"],
-                              "discoverable": self.settings["discoverable"]})
+                              "discoverable": self.settings["discoverable"],
+                              "share_last_seen": self.settings["share_last_seen"]})
 
     def sync_settings(self) -> None:
         if not self.server or not self.history_key:
@@ -1896,6 +1982,7 @@ class Wire:
                 ("Allow group invites", "On" if self.settings["allow_group_invites"] else "Off"),
                 ("Chats from friends only", "On" if self.settings["friends_only_rooms"] else "Off"),
                 ("Show me in search", "On" if self.settings["discoverable"] else "Off"),
+                ("Share last seen", "On" if self.settings["share_last_seen"] else "Off"),
                 ("Voice activation", "Always on" if self.settings["voice_mode"] == "open" else "Push-to-talk (F12)"),
                 ("Echo cancellation", "On" if self.settings["voice_echo"] else "Off"),
                 ("Noise removal", ("Off", "Light", "Normal", "Strong")[self.settings["voice_noise"]]),
@@ -1921,6 +2008,7 @@ class Wire:
                 "When off, the directory rejects new group invitations for you.",
                 "When on, the directory only lets friends open a chat with you.",
                 "When off, people only find you by typing your exact username.",
+                "Friends see when you were last online. Turn off to hide it (you then can't see theirs either).",
                 "Always on sends audio continuously; push-to-talk uses F12.",
                 "Applies to your next and current voice calls.",
                 "Higher noise removal can use more CPU.",
@@ -1965,54 +2053,56 @@ class Wire:
                     elif selected == 4:
                         self.settings["discoverable"] = not self.settings["discoverable"]
                     elif selected == 5:
-                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
+                        self.settings["share_last_seen"] = not self.settings["share_last_seen"]
                     elif selected == 6:
-                        self.settings["voice_echo"] = not self.settings["voice_echo"]
+                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
                     elif selected == 7:
-                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                        self.settings["voice_echo"] = not self.settings["voice_echo"]
                     elif selected == 8:
+                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                    elif selected == 9:
                         self.settings["voice_gain"] = not self.settings["voice_gain"]
-                    elif selected in (9, 10):
-                        choices = inputs if selected == 9 else outputs
-                        setting = "voice_input" if selected == 9 else "voice_output"
+                    elif selected in (10, 11):
+                        choices = inputs if selected == 10 else outputs
+                        setting = "voice_input" if selected == 10 else "voice_output"
                         if choices:
                             current = self.settings.get(setting)
                             position = next((i for i, (device_id, _) in enumerate(choices) if device_id == current), -1)
                             self.settings[setting] = choices[(position + direction) % len(choices)][0]
-                    elif selected == 11:
-                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
                     elif selected == 12:
+                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
+                    elif selected == 13:
                         if windows:
                             current = self.settings.get("stream_window", "")
                             position = windows.index(current) if current in windows else -1
                             self.settings["stream_window"] = windows[(position + direction) % len(windows)]
                             self.settings["stream_source"] = "window"
-                    elif selected == 13:
-                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 14:
-                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
+                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 15:
-                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 16:
-                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
                     elif selected == 17:
+                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                    elif selected == 18:
                         options = list(STREAM_PROFILES)
                         self.settings["stream_profile"] = options[(options.index(self.settings["stream_profile"]) + direction) % len(options)]
                         apply_stream_profile(self.settings)
-                    elif selected == 18:
+                    elif selected == 19:
                         options = ["auto", "H264", "VP8", "VP9", "AV1", "HEVC"]
                         self.settings["stream_codec"] = options[(options.index(self.settings["stream_codec"]) + direction) % len(options)]
-                    elif selected == 19:
-                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 20:
-                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 21:
+                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                    elif selected == 22:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
                     self.sync_settings()
                     self.apply_voice_settings()
                     self.sync_preferences()
-            elif key in ("enter", "escape") and selected == 22:
+            elif key in ("enter", "escape") and selected == 23:
                 print()
                 return
             elif key == "escape":
@@ -2149,8 +2239,13 @@ class Wire:
             raise ValueError("message code did not match exactly one saved message")
         return records, candidates[0]
 
-    def render_record(self, record: dict, show_id: bool = False) -> str:
+    def render_record(self, record: dict, show_id: bool = False, styled: bool = True) -> str:
         text = "[deleted]" if record.get("deleted") else safe_terminal_text(record.get("text", ""))
+        vote = VOTE_RE.fullmatch(text)
+        if vote:
+            text = f"(voted {vote.group(2)} in poll {vote.group(1)})"
+        elif styled:
+            text = format_text(text)
         suffix = f"  ({record.get('id', '')[:6]})" if show_id and record.get("id") else ""
         if record.get("reply_to"):
             suffix += f"  reply:{str(record['reply_to'])[:6]}"
@@ -2166,6 +2261,7 @@ class Wire:
         return f"{safe_terminal_text(record.get('from', '?'))} > {text}{suffix}"
 
     def show_history(self, peer_name: str, show_ids: bool = False) -> None:
+        self.mark_read(peer_name)
         records = self.read_history(peer_name)
         if not records:
             return
@@ -2200,7 +2296,7 @@ class Wire:
         path = folder / f"{key}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
         lines = [f"Wire chat export: {key.replace('group-', 'group ', 1)}",
                  f"Exported {time.strftime('%Y-%m-%d %H:%M')} by {self.name}. Only messages saved on this device are included.", ""]
-        lines += [f"[{safe_terminal_text(record.get('at', '?'))}] {self.render_record(record)}" for record in records if isinstance(record, dict)]
+        lines += [f"[{safe_terminal_text(record.get('at', '?'))}] {self.render_record(record, styled=False)}" for record in records if isinstance(record, dict)]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         say(f"exported {len(lines) - 3} messages to {path}")
         return path
@@ -2269,6 +2365,192 @@ class Wire:
                 report_background_failure("disappearing messages", exc)
             if self.closing.wait(30):
                 return
+
+    def open_chat_key(self) -> str:
+        return f"group-{self.group_room}".lower() if self.group_room else (self.room or "").lower()
+
+    def mark_read(self, key: str) -> None:
+        self.unread.pop(key.lower(), None)
+        self.unread_mentions.pop(key.lower(), None)
+
+    def note_incoming(self, key: str, mentioned: bool = False) -> None:
+        key = key.lower()
+        if key == self.open_chat_key():
+            return
+        self.unread[key] = self.unread.get(key, 0) + 1
+        if mentioned:
+            self.unread_mentions[key] = self.unread_mentions.get(key, 0) + 1
+
+    def is_mentioned(self, text: str) -> bool:
+        return bool(self.name) and re.search(rf"(?<![A-Za-z0-9_])@{re.escape(self.name)}(?![A-Za-z0-9_])", text, re.IGNORECASE) is not None
+
+    def show_chats(self) -> None:
+        """Every chat with saved history, newest first, with unread counts."""
+        self.require_login()
+        prefix, rows = f"{self.name.lower()}--", {}
+        for path in HISTORY_DIR.glob(f"{prefix}*.wire") if HISTORY_DIR.exists() else []:
+            key = path.stem[len(prefix):].lower()
+            if CHAT_KEY_RE.fullmatch(key):
+                records = self.read_history(key)
+                rows[key] = records[-1] if records else None
+        for key in self.unread:
+            rows.setdefault(key, None)
+        say("\nCHATS")
+        if not rows:
+            say("no chats yet: open <name> for a person, /group list for groups")
+            return
+        today, open_key = time.strftime("%Y-%m-%d"), self.open_chat_key()
+        ordered = sorted(rows.items(), key=lambda item: str((item[1] or {}).get("at", "")), reverse=True)
+        for key, last in ordered[:40]:
+            label = key.replace("group-", "group ", 1)
+            new, mentions = self.unread.get(key, 0), self.unread_mentions.get(key, 0)
+            badge = (f"{new} new" if new else "") + (f", {mentions} @you" if mentions else "")
+            at = str((last or {}).get("at", ""))
+            when = at[11:] if at[:10] == today else at[:10]
+            preview = self.render_record(last, styled=False).replace("\n", " ")[:50] if last else ""
+            say(f"{'>' if key == open_key else ' '} {label:<22} {badge:<16} {when:<10} {preview}")
+        say("open <name> / /room <name> for a person, /group open <name> for a group")
+
+    def send_to_open_chat(self, text: str) -> None:
+        if self.group_room:
+            self.send_group_message(self.group_room, text)
+        else:
+            peer = self.peers.get(self.room or "")
+            if not peer:
+                raise ValueError("open a chat first")
+            self.send_message(peer, text)
+        self.mark_read(self.open_chat_key())
+
+    def create_poll(self, argument: str) -> None:
+        parts = [part.strip() for part in argument.split("|")]
+        question, options = parts[0], [part for part in parts[1:] if part]
+        if not question or not 2 <= len(options) <= MAX_POLL_OPTIONS:
+            raise ValueError(f"use: /poll <question> | <option> | <option> (2-{MAX_POLL_OPTIONS} options)")
+        if any("\n" in item for item in [question, *options]):
+            raise ValueError("poll text must be on one line")
+        self.send_to_open_chat(poll_text(uuid.uuid4().hex[:6], question, options))
+
+    def poll_results(self, key: str, code: str) -> Optional[tuple[str, list[str], dict[str, int]]]:
+        """Tally a poll from saved history: one vote per person, latest wins."""
+        records = self.read_history(key)
+        start = None
+        for index, record in enumerate(records):
+            parsed = parse_poll(str(record.get("text", "")))
+            if parsed and parsed[0] == code:
+                start, question, options = index, parsed[1], parsed[2]
+        if start is None:
+            return None
+        votes: dict[str, int] = {}
+        for record in records[start + 1:]:
+            vote = VOTE_RE.fullmatch(str(record.get("text", "")))
+            if vote and vote.group(1) == code and 1 <= int(vote.group(2)) <= len(options):
+                votes[str(record.get("from", "?")).lower()] = int(vote.group(2))
+        return question, options, votes
+
+    def describe_poll(self, key: str, code: str, detailed: bool = False) -> str:
+        results = self.poll_results(key, code)
+        if not results:
+            return f"no poll {code} in this chat"
+        question, options, votes = results
+        counts = [sum(1 for choice in votes.values() if choice == index) for index in range(1, len(options) + 1)]
+        if not detailed:
+            return " · ".join(f"{safe_terminal_text(option)} {count}" for option, count in zip(options, counts))
+        lines = [f"POLL {code}: {safe_terminal_text(question)} ({len(votes)} vote{'s' if len(votes) != 1 else ''})"]
+        for index, (option, count) in enumerate(zip(options, counts), 1):
+            voters = ", ".join(sorted(name for name, choice in votes.items() if choice == index))
+            lines.append(f"  {index}) {safe_terminal_text(option)}: {count}" + (f"  ({voters})" if voters else ""))
+        return "\n".join(lines)
+
+    def vote(self, argument: str) -> None:
+        pieces = argument.split()
+        if len(pieces) != 2 or not re.fullmatch(r"[0-9a-f]{6}", pieces[0].lower()) or not pieces[1].isdigit():
+            raise ValueError("use: /vote <poll code> <option number>")
+        code, choice = pieces[0].lower(), int(pieces[1])
+        results = self.poll_results(self.open_chat_key(), code)
+        if not results:
+            raise ValueError("no poll with that code in this chat")
+        if not 1 <= choice <= len(results[1]):
+            raise ValueError(f"pick an option from 1 to {len(results[1])}")
+        self.send_to_open_chat(f"VOTE {code} {choice}")
+        say(self.describe_poll(self.open_chat_key(), code))
+
+    def forward_message(self, argument: str) -> None:
+        pieces = argument.split(maxsplit=1)
+        if len(pieces) != 2:
+            raise ValueError("use: /forward <message code> <name or group name>  (codes: /history <name> ids)")
+        source = self.open_chat_key()
+        if not source:
+            raise ValueError("open the chat that has the message first")
+        _, record = self.matching_message(source, pieces[0])
+        if record.get("deleted"):
+            raise ValueError("that message was deleted")
+        text = f"[forwarded from {record.get('from', '?')}] {record.get('text', '')}"
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError("that message is too long to forward")
+        target = chat_key(pieces[1])
+        if target.startswith("group-"):
+            self.send_group_message(target[len("group-"):], text)
+        else:
+            peer = self.peers.get(target)
+            if not peer:
+                raise ValueError("open a chat with that person first")
+            self.send_message(peer, text)
+        say(f"forwarded to {target.replace('group-', 'group ', 1)}")
+
+    def schedule_message(self, argument: str) -> None:
+        """Send later, to the chat that's open now. Runs inside this Wire
+        session, so it's only sent if Wire is still running at that time."""
+        pieces = argument.split(maxsplit=1)
+        if len(pieces) != 2:
+            raise ValueError("use: /schedule <10m | 2h | 18:30> <message>")
+        key = self.open_chat_key()
+        if not key:
+            raise ValueError("open the chat you want to send it to first")
+        if len(self.scheduled) >= MAX_SCHEDULED_MESSAGES:
+            raise ValueError("too many scheduled messages; /unschedule some first")
+        when, text = parse_when(pieces[0]), pieces[1]
+        if len(text) > MAX_MESSAGE_CHARS:
+            raise ValueError(f"message is too long ({MAX_MESSAGE_CHARS} character maximum)")
+        item = {"id": uuid.uuid4().hex[:6], "key": key, "text": text, "at": when}
+        item["timer"] = threading.Timer(when - time.time(), self.send_scheduled, args=(item,))
+        item["timer"].daemon = True
+        self.scheduled.append(item)
+        item["timer"].start()
+        say(f"scheduled {item['id']} for {time.strftime('%a %H:%M', time.localtime(when))} to {key.replace('group-', 'group ', 1)}")
+
+    def send_scheduled(self, item: dict) -> None:
+        if item not in self.scheduled:
+            return
+        self.scheduled.remove(item)
+        key, label = item["key"], item["key"].replace("group-", "group ", 1)
+        try:
+            if key.startswith("group-"):
+                self.send_group_message(key[len("group-"):], item["text"])
+            else:
+                peer = self.peers.get(key)
+                if not peer:
+                    raise ValueError(f"not connected to {key}")
+                self.send_message(peer, item["text"])
+            say(f"\nsent scheduled message {item['id']} to {label}")
+        except (OSError, ConnectionError, ValueError) as exc:
+            say(f"\nscheduled message {item['id']} to {label} was not sent: {safe_terminal_text(exc)}")
+
+    def show_scheduled(self) -> None:
+        if not self.scheduled:
+            say("no scheduled messages")
+            return
+        say("SCHEDULED")
+        for item in sorted(self.scheduled, key=lambda entry: entry["at"]):
+            when = time.strftime("%a %H:%M", time.localtime(item["at"]))
+            say(f"  {item['id']}  {when}  to {item['key'].replace('group-', 'group ', 1)}: {safe_terminal_text(item['text'])[:60]}")
+
+    def unschedule(self, code: str) -> None:
+        item = next((entry for entry in self.scheduled if entry["id"] == code.strip().lower()), None)
+        if not item:
+            raise ValueError("no scheduled message with that code; see /scheduled")
+        item["timer"].cancel()
+        self.scheduled.remove(item)
+        say(f"cancelled scheduled message {item['id']}")
 
     def search_history(self, query: str) -> None:
         """Search locally decrypted history; this never contacts the directory."""
@@ -3069,7 +3351,7 @@ class Wire:
         # until something forces a full repaint - this is that repaint.
         restart_blank_prompt_after_background_output()
 
-    def send_image(self, peer: Peer, value: str) -> None:
+    def send_image(self, peer: Peer, value: str, once: bool = False) -> None:
         path = Path(value.strip().strip('"')).expanduser()
         if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
             raise ValueError("choose a PNG, JPG, GIF, BMP, or WEBP image")
@@ -3079,8 +3361,14 @@ class Wire:
         image_id = uuid.uuid4().hex
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         self.outgoing_images[image_id] = {"path": path, "name": path.name, "size": size, "sha256": digest}
-        peer.send_image_frame({"kind": "offer", "id": image_id, "name": path.name, "size": size, "sha256": digest})
-        say(f"image offer sent: {path.name} (waiting for them to accept)")
+        frame = {"kind": "offer", "id": image_id, "name": path.name, "size": size, "sha256": digest}
+        if once:
+            frame["once"] = True
+        peer.send_image_frame(frame)
+        if once:
+            say(f"view-once image offer sent: {path.name} (it's deleted after viewing; older Wire versions keep a copy)")
+        else:
+            say(f"image offer sent: {path.name} (waiting for them to accept)")
 
     def send_attachment(self, peer: Peer, value: str) -> None:
         """Use one send command: image flow for images, file flow for everything else."""
@@ -3146,8 +3434,10 @@ class Wire:
                     or not 0 <= size <= MAX_IMAGE_BYTES or not isinstance(digest, str)
                     or not re.fullmatch(r"[0-9a-f]{64}", digest)):
                 return
-            self.pending_images[image_id] = {"name": name, "size": size, "sha256": digest}
-            say(f"\n{peer.name} wants to send {name} ({size // 1024} KB). Type /image accept {image_id[:6]} or /image decline {image_id[:6]}")
+            once = frame.get("once") is True
+            self.pending_images[image_id] = {"name": name, "size": size, "sha256": digest, "once": once}
+            kind_label = "a view-once image" if once else name
+            say(f"\n{peer.name} wants to send {kind_label} ({human_size(size)}). Type /image accept {image_id[:6]} or /image decline {image_id[:6]}")
         elif kind == "accept":
             self.start_worker(self.transfer_image, peer, image_id)
         elif kind == "decline":
@@ -3161,15 +3451,22 @@ class Wire:
             size = frame.get("size")
             if name != offer["name"] or size != offer["size"] or frame.get("sha256") != offer["sha256"]:
                 return
-            DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-            target = DOWNLOADS_DIR / name
-            stem, suffix, number = target.stem, target.suffix, 2
-            while target.exists():
-                target = DOWNLOADS_DIR / f"{stem} ({number}){suffix}"
-                number += 1
+            if offer.get("once"):
+                # Never lands in Downloads; deleted shortly after it's opened.
+                folder = TRANSFER_TEMP_DIR / "view-once"
+                folder.mkdir(parents=True, exist_ok=True)
+                target = folder / f"{image_id}{Path(name).suffix.lower()}"
+            else:
+                DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+                target = DOWNLOADS_DIR / name
+                stem, suffix, number = target.stem, target.suffix, 2
+                while target.exists():
+                    target = DOWNLOADS_DIR / f"{stem} ({number}){suffix}"
+                    number += 1
             temp = target.parent / f".{target.name}.{image_id}.part"
             temp.unlink(missing_ok=True)
-            self.incoming_images[image_id] = {"path": target, "temp": temp, "size": size, "sha256": frame.get("sha256"), "written": 0, "index": 0}
+            self.incoming_images[image_id] = {"path": target, "temp": temp, "size": size, "sha256": frame.get("sha256"),
+                                              "written": 0, "index": 0, "once": bool(offer.get("once"))}
             say(f"\n{peer.name} is sending image: {name}")
         elif kind == "chunk" and image_id in self.incoming_images:
             state = self.incoming_images[image_id]
@@ -3189,6 +3486,15 @@ class Wire:
                 say("image transfer failed verification")
                 return
             state["temp"].replace(state["path"])
+            if state.get("once"):
+                path = state["path"]
+                self.view_once_files.append(path)
+                say(f"\nview-once image from {peer.name}: opening it now; it's deleted in {VIEW_ONCE_SECONDS} seconds")
+                self.preview_image(path)
+                timer = threading.Timer(VIEW_ONCE_SECONDS, lambda: path.unlink(missing_ok=True))
+                timer.daemon = True
+                timer.start()
+                return
             say(f"\nimage received: {state['path'].name}")
             self.preview_image(state["path"])
             if self.notifications_allowed(peer.name):
@@ -3394,11 +3700,16 @@ class Wire:
         message_id = packet.get("id") if valid_transfer_id(packet.get("id")) else uuid.uuid4().hex
         reply_to = packet.get("reply_to") if valid_transfer_id(packet.get("reply_to")) else None
         self.record_history(peer.name, peer.name, text, message_id, reply_to)
+        self.note_incoming(peer.name)
         peer.send_control({"kind": "message_delivered", "id": message_id})
         # Wire renders incoming room messages immediately, so that is the
         # honest moment to acknowledge them as read.
         peer.send_control({"kind": "message_read", "id": message_id})
-        say(f"\n{self.render_record({'id': message_id, 'from': peer.name, 'text': text, 'reply_to': reply_to})}")
+        vote = VOTE_RE.fullmatch(text)
+        if vote:
+            say(f"\n{peer.name} voted in poll {vote.group(1)}: {self.describe_poll(peer.name, vote.group(1))}")
+        else:
+            say(f"\n{self.render_record({'id': message_id, 'from': peer.name, 'text': text, 'reply_to': reply_to})}")
         redraw_prompt()
         if self.notifications_allowed(peer.name):
             toast(f"new message from {peer.name}")
@@ -3626,9 +3937,19 @@ class Wire:
             return
         message_id = encrypted.get("id") if isinstance(encrypted.get("id"), str) else uuid.uuid4().hex
         self.record_history(f"group-{group}", sender, text, message_id)
-        say(f"\n[{safe_terminal_text(group)}] {safe_terminal_text(sender)} > {safe_terminal_text(text)}")
+        mentioned = self.is_mentioned(text)
+        self.note_incoming(f"group-{group}", mentioned)
+        vote = VOTE_RE.fullmatch(text)
+        if vote:
+            say(f"\n[{safe_terminal_text(group)}] {safe_terminal_text(sender)} voted in poll {vote.group(1)}: {self.describe_poll(f'group-{group}', vote.group(1))}")
+        else:
+            highlight = ("\x1b[1;33m@you\x1b[0m " if TEXT_FORMATTING else "@you ") if mentioned else ""
+            say(f"\n[{safe_terminal_text(group)}] {highlight}{safe_terminal_text(sender)} > {format_text(safe_terminal_text(text))}")
         redraw_prompt()
-        if self.notifications_allowed(f"group-{group}") and self.notifications_allowed(sender):
+        if mentioned and self.notifications_allowed(sender):
+            # A mention gets through a muted group (not Do Not Disturb or a muted person).
+            toast(f"{sender} mentioned you in {group}")
+        elif self.notifications_allowed(f"group-{group}") and self.notifications_allowed(sender):
             toast(f"new group message in {group} from {sender}")
 
     def group_pin(self, group_name: str, prefix: str, remove: bool = False) -> None:
@@ -3699,6 +4020,9 @@ class Wire:
                         dnd = "; do not disturb" if user.get("dnd") else ""
                         status = user.get("status") if isinstance(user.get("status"), str) else ""
                         status = safe_terminal_text(status).replace("\n", " ").strip()
+                        seen = user.get("last_seen")
+                        if not user.get("online") and isinstance(seen, int) and not isinstance(seen, bool):
+                            marker += f", last seen {ago(time.time() - seen)}"
                         say(f"{user.get('name', '?')}  [{marker}{dnd}]" + (f"  - {status}" if status else ""))
                     for requester in requests:
                         say(f"friend request from {requester}: /friend accept {requester} or /friend decline {requester}")
@@ -3901,8 +4225,10 @@ class Wire:
         for state in self.outgoing_files.values():
             if state.get("cleanup") and isinstance(state.get("path"), Path):
                 state["path"].unlink(missing_ok=True)
-        for path in self.group_transfer_temps:
+        for path in self.group_transfer_temps + self.view_once_files:
             path.unlink(missing_ok=True)
+        for item in self.scheduled:
+            item["timer"].cancel()
         self.incoming_images.clear()
         self.incoming_files.clear()
         self.outgoing_files.clear()
@@ -3985,6 +4311,14 @@ ACCOUNT AND PEOPLE
 
 CHAT
   Type normally in an open room to send a message.
+  /chats                             All chats, newest first, with unread counts and @mentions.
+  /poll <question> | <a> | <b> ...   Start a poll in the open chat (2-10 options).
+  /vote <code> <number> / /poll results <code>
+  /schedule <10m|2h|18:30> <text>    Send later to the open chat (while Wire is running).
+  /scheduled / /unschedule <code>    List or cancel scheduled messages.
+  /forward <code> <name | group name>
+                                      Forward a message from the open chat.
+  Formatting: **bold**, *italic*, `code`.  Mention someone in a group with @name.
   /history <name>                    Show saved messages without cluttering chat with IDs.
   /history <name> ids                Show saved messages with message codes for reply/edit/react.
   /search <words>                    Search your saved messages locally.
@@ -4003,6 +4337,7 @@ FILES AND MEDIA
   /send <path>                       Send an image, video, file, or folder.
                                       Images use the image flow; everything else uses file transfer.
                                       In a group, each online member gets their own offer.
+  /viewonce <image>                  Send an image that's deleted after it's opened.
   /image accept|decline <code>       Answer an image offer.
   /sendfile <path>                   Older alias for /send.
   /file accept|decline <code>        Answer an encrypted file transfer.
@@ -4111,6 +4446,31 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
                 raise ValueError("use: /history <username> [ids]")
             app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "viewonce":
+            room_peer = app.peers.get(app.room or "")
+            if not room_peer:
+                raise ValueError("open a chat first; view-once images are for one person")
+            if not argument:
+                raise ValueError("use: /viewonce <image path>")
+            app.send_image(room_peer, argument, once=True)
+        elif command == "schedule":
+            app.schedule_message(argument)
+        elif command == "scheduled":
+            app.show_scheduled()
+        elif command == "unschedule":
+            app.unschedule(argument)
+        elif command in ("chats", "inbox"):
+            app.show_chats()
+        elif command == "poll":
+            pieces = argument.split()
+            if len(pieces) == 2 and pieces[0] == "results":
+                say(app.describe_poll(app.open_chat_key(), pieces[1].lower(), detailed=True))
+            else:
+                app.create_poll(argument)
+        elif command == "vote":
+            app.vote(argument)
+        elif command == "forward":
+            app.forward_message(argument)
         elif command == "trust":
             if not argument.strip():
                 raise ValueError("use: /trust <name> (only after checking their new fingerprint with them)")
@@ -4336,6 +4696,7 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
                 raise ValueError("not connected to that user")
             app.room = peer.name.lower()
             app.group_room = None
+            app.mark_read(peer.name)
             print(f"room open: {peer.name}")
         elif command == "leave":
             if app.group_room:
@@ -4379,12 +4740,14 @@ def handle_input(app: "Wire", line: str) -> bool:
     # Prefix commands with / while inside a room, for example /leave.
     if app.group_room and not line.startswith("/"):
         try:
+            app.mark_read(app.open_chat_key())
             app.send_group_message(app.group_room, line)
         except (OSError, ConnectionError, ValueError) as exc:
             print(f"error: {exc}")
         return True
     if room_peer and not line.startswith("/"):
         try:
+            app.mark_read(room_peer.name)
             app.send_message(room_peer, line)
         except (OSError, ConnectionError, ValueError) as exc:
             print(f"error: {exc}")

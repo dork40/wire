@@ -655,6 +655,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                               "allow_group_invites": bool(previous.get("allow_group_invites", True)),
                               "friends_only_rooms": bool(previous.get("friends_only_rooms", False)),
                               "discoverable": bool(previous.get("discoverable", True)),
+                              "share_last_seen": bool(previous.get("share_last_seen", True)),
+                              "last_seen": previous.get("last_seen") if isinstance(previous.get("last_seen"), int) else None,
                               "status": clean_status(previous.get("status", "")),
                               "dnd": bool(previous.get("dnd", False)),
                               "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
@@ -740,9 +742,13 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 with LOCK:
                     users = load_users(); account = users.get(key, {})
                     friends = [item for item in account.get("friends", []) if item in users]
+                    # Like WhatsApp: you only see "last seen" if you share yours.
+                    sees_last_seen = bool(account.get("share_last_seen", True))
                     matches = [{"name": users[item]["name"], "online": item in ONLINE,
                                 "dnd": bool(users[item].get("dnd", False)),
-                                "status": clean_status(users[item].get("status", ""))} for item in friends]
+                                "status": clean_status(users[item].get("status", "")),
+                                "last_seen": users[item].get("last_seen") if sees_last_seen and users[item].get("share_last_seen", True)
+                                and isinstance(users[item].get("last_seen"), int) else None} for item in friends]
                     requests = [users[item]["name"] for item in account.get("friend_requests", []) if item in users]
                     my_status = clean_status(account.get("status", ""))
                 send(sock, {"type": "friends", "users": matches, "requests": requests, "status": my_status})
@@ -803,7 +809,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     account = users.get(key)
                     if account is not None:
                         account["allow_group_invites"] = bool(packet.get("allow_group_invites", True))
-                        for field in ("friends_only_rooms", "discoverable"):
+                        for field in ("friends_only_rooms", "discoverable", "share_last_seen"):
                             if field in packet:
                                 account[field] = bool(packet[field])
                         account["dnd"] = bool(packet.get("dnd", False))
@@ -1068,6 +1074,13 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 if ONLINE.get(key, (None, None, None))[1] is sock:
                     ONLINE.pop(key, None)
                     PENDING_OPENS.pop(key, None)
+                    try:
+                        users = load_users()
+                        if key in users:
+                            users[key]["last_seen"] = int(time.time())
+                            save_users(users)
+                    except (OSError, ValueError):
+                        pass
             print(f"offline  {key}")
         try:
             sock.close()

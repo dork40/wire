@@ -226,6 +226,21 @@ class AbuseLimitTests(unittest.TestCase):
         self.assertTrue(account["friends_only_rooms"])
         self.assertFalse(account["discoverable"])
 
+    def test_last_seen_is_recorded_and_only_shared_both_ways(self):
+        alice = self.harness.login("alice")
+        bob = self.harness.login("bob")
+        users = self.server.load_users()
+        users["alice"]["friends"], users["bob"]["friends"] = ["bob"], ["alice"]
+        self.server.save_users(users)
+        bob.close()
+        self.harness.workers[-1].join(timeout=5)
+        self.assertIsInstance(self.server.load_users()["bob"]["last_seen"], int)
+        self.server.send(alice, {"type": "friends_list"})
+        self.assertIsInstance(self.server.receive(alice)["users"][0]["last_seen"], int)
+        self.server.send(alice, {"type": "preferences", "share_last_seen": False})
+        self.server.send(alice, {"type": "friends_list"})
+        self.assertIsNone(self.server.receive(alice)["users"][0]["last_seen"])
+
     def test_rate_limit_tables_are_pruned(self):
         self.server.MAX_TRACKED_KEYS = 10
         # time.monotonic() counts from boot on Linux, so "0" can be recent on
