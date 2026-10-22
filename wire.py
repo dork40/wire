@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import array
 import binascii
+import math
 import collections
 import secrets
 import wave
@@ -1462,6 +1464,83 @@ class VoiceCall:
                 pass
 
 
+RING_SECONDS = 30
+RING_RATE = 16000
+
+
+def ring_cycle(rate: int = RING_RATE) -> bytes:
+    """One ~3 s ring: two short 440+480 Hz bursts (the classic phone ring),
+    then a pause. Built with plain math so it needs no sound file or numpy."""
+    samples = array.array("h")
+
+    def tone(seconds: float) -> None:
+        count = int(rate * seconds)
+        for index in range(count):
+            fade = min(1.0, index / 160, (count - index) / 160)  # no clicks at the edges
+            value = math.sin(2 * math.pi * 440 * index / rate) + math.sin(2 * math.pi * 480 * index / rate)
+            samples.append(int(6000 * fade * value))
+
+    def silence(seconds: float) -> None:
+        samples.extend([0] * int(rate * seconds))
+
+    tone(0.4); silence(0.2); tone(0.4); silence(2.0)
+    return samples.tobytes()
+
+
+class Ringer:
+    """Plays the ring for incoming calls until stopped or RING_SECONDS pass."""
+
+    def __init__(self, settings: dict) -> None:
+        self.settings = settings
+        self.active: dict[str, threading.Event] = {}
+        self.lock = threading.Lock()
+        self._cycle: Optional[bytes] = None
+
+    def start(self, key: str) -> None:
+        with self.lock:
+            if key in self.active or self.active:
+                return  # one ring at a time is plenty
+            stop = threading.Event()
+            self.active[key] = stop
+        threading.Thread(target=self.play, args=(key, stop), daemon=True).start()
+
+    def stop(self, key: str) -> None:
+        with self.lock:
+            stop = self.active.pop(key, None)
+        if stop:
+            stop.set()
+
+    def stop_all(self) -> None:
+        for key in list(self.active):
+            self.stop(key)
+
+    def play(self, key: str, stop: threading.Event) -> None:
+        deadline = time.monotonic() + RING_SECONDS
+        try:
+            if sd is not None:
+                if self._cycle is None:
+                    self._cycle = ring_cycle()
+                chunk = RING_RATE // 10 * 2  # 100 ms of 16-bit audio, so stopping is quick
+                with sd.RawOutputStream(samplerate=RING_RATE, channels=1, dtype="int16",
+                                        device=self.settings.get("voice_output")) as output:
+                    while not stop.is_set() and time.monotonic() < deadline:
+                        for start in range(0, len(self._cycle), chunk):
+                            if stop.is_set():
+                                break
+                            output.write(self._cycle[start:start + chunk])
+            elif os.name == "nt":
+                import winsound
+                while not stop.is_set() and time.monotonic() < deadline:
+                    winsound.Beep(440, 400)
+                    stop.wait(2.4)
+        except Exception:  # noqa: BLE001 - a missing speaker must never break the call itself
+            pass
+        finally:
+            with self.lock:
+                if self.active.get(key) is stop:
+                    self.active.pop(key, None)
+
+
 class GroupVoiceCall(VoiceCall):
     """Voice for a whole group: your microphone goes to every participant and
     their audio is mixed into one speaker stream. Same push-to-talk / always-on
@@ -1573,6 +1652,7 @@ class Wire:
         self.server_version = ""
         self.view_once_files: list[Path] = []
         self.group_call: Optional[GroupVoiceCall] = None
+        self.ringer = Ringer({})  # gets the live settings each time it rings
         self.group_call_invites: dict[str, dict] = {}
         self.api_server = None
         self.api_events: collections.deque = collections.deque(maxlen=MAX_API_EVENTS)
@@ -3482,6 +3562,7 @@ class Wire:
         if self.group_call or self.calls:
             raise ValueError("you're already in a call; /hangup first")
         self.group_call_invites.pop(group_name.strip().lower(), None)
+        self.ringer.stop(f"group-{group_name.strip().lower()}")
         self.group_call = GroupVoiceCall(group["name"], invite["call"], self.settings)
         self.group_call_control(group, "join", self.online_members(group))
         activation = "always on" if self.settings.get("voice_mode") == "open" else "hold F12 to talk"
@@ -3510,6 +3591,7 @@ class Wire:
         in_this_call = call is not None and call.call_id == call_id
         if action == "ring" and call is None:
             self.group_call_invites[group_name.lower()] = {"call": call_id, "from": peer.name}
+            self.ring(f"group-{group_name.lower()}", f"group-{group['name']}", peer.name)
             say(f"\n{peer.name} started a voice call in {safe_terminal_text(group['name'])}. Type /joincall {safe_terminal_text(group['name'])}")
             redraw_prompt()
             if self.notifications_allowed(f"group-{group['name']}") and self.notifications_allowed(peer.name):
@@ -4188,6 +4270,11 @@ class Wire:
         state["temp"].unlink(missing_ok=True)
         say(f"image transfer stopped by {peer.name}")
 
+    def ring(self, key: str, *sources: str) -> None:
+        if all(self.notifications_allowed(source) for source in sources):
+            self.ringer.settings = self.settings
+            self.ringer.start(key)
+
     def start_call(self, peer: Peer) -> None:
         if peer.name.lower() in self.calls:
             return
@@ -4211,6 +4298,7 @@ class Wire:
         if peer.name.lower() not in self.call_requests:
             raise ValueError("no voice call request from that person")
         self.call_requests.discard(peer.name.lower())
+        self.ringer.stop(peer.name.lower())
         self.start_call(peer)
         peer.send_voice_frame({"kind": "accept"})
 
@@ -4227,6 +4315,7 @@ class Wire:
         kind = frame.get("kind")
         if kind == "offer":
             self.call_requests.add(peer.name.lower())
+            self.ring(peer.name.lower(), peer.name)
             say(f"\n{peer.name} wants a voice call. Type /acceptcall {peer.name} or /declinecall {peer.name}")
         elif kind == "accept":
             if peer.name.lower() not in self.outgoing_calls:
@@ -4234,6 +4323,7 @@ class Wire:
             self.outgoing_calls.discard(peer.name.lower())
             self.start_call(peer)
         elif kind == "end":
+            self.ringer.stop(peer.name.lower())
             self.outgoing_calls.discard(peer.name.lower())
             self.call_requests.discard(peer.name.lower())
             self.end_call(peer, tell_peer=False)
@@ -5077,6 +5167,7 @@ class Wire:
             self.api_server.shutdown()
             self.api_server.server_close()
             self.api_server = None
+        self.ringer.stop_all()
         if self.group_call:
             try:
                 self.leave_group_call()
@@ -5541,6 +5632,7 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if not peer:
                 raise ValueError("that person is not in a room")
             app.call_requests.discard(peer.name.lower())
+            app.ringer.stop(peer.name.lower())
             peer.send_voice_frame({"kind": "end"})
             print("voice call declined")
         elif command == "hangup":
