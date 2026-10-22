@@ -337,6 +337,37 @@ def clean_status(value: object) -> str:
     return "".join(char for char in value if char.isprintable()).strip()[:MAX_STATUS_CHARS]
 
 
+MAX_SEARCH_RESULTS = 50
+
+
+def search_accounts(users: dict, online: set[str], searcher: str, query: str) -> dict:
+    """Rank exact > starts-with > contains. People who turned off "Show me in
+    search" only appear for an exact username (or to their friends), and
+    their online state is only shown to friends."""
+    me = users.get(searcher, {}) if isinstance(users.get(searcher), dict) else {}
+    friends = {item for item in me.get("friends", []) if isinstance(item, str)}
+    incoming = {item for item in me.get("friend_requests", []) if isinstance(item, str)}
+    ranked = []
+    for username, account in users.items():
+        if not isinstance(account, dict) or not isinstance(account.get("name"), str) or query not in username:
+            continue
+        exact, friend = username == query, username in friends
+        if not exact and not friend and not account.get("discoverable", True):
+            continue
+        ranked.append((0 if exact else 1 if username.startswith(query) else 2, username, account))
+    ranked.sort(key=lambda item: (item[0], item[1]))
+    results = []
+    for _, username, account in ranked[:MAX_SEARCH_RESULTS]:
+        friend = username in friends
+        visible = friend or username == searcher or account.get("discoverable", True)
+        requests = account.get("friend_requests", [])
+        results.append({"name": account["name"], "online": (username in online) if visible else None,
+                        "you": username == searcher, "friend": friend,
+                        "request_sent": isinstance(requests, list) and searcher in requests,
+                        "request_received": username in incoming})
+    return {"users": results, "more": len(ranked) > MAX_SEARCH_RESULTS}
+
+
 def valid_group_name(value: object) -> bool:
     return isinstance(value, str) and 3 <= len(value) <= 32 and all(char.isalnum() or char in "_-" for char in value)
 
@@ -623,6 +654,7 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                 users[key] = {"name": name, "public": public, "sign_public": sign_public,
                               "allow_group_invites": bool(previous.get("allow_group_invites", True)),
                               "friends_only_rooms": bool(previous.get("friends_only_rooms", False)),
+                              "discoverable": bool(previous.get("discoverable", True)),
                               "status": clean_status(previous.get("status", "")),
                               "dnd": bool(previous.get("dnd", False)),
                               "friends": [item for item in previous.get("friends", []) if isinstance(item, str)],
@@ -681,18 +713,15 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     if deliver(target, {"type": "request", "from": name, **signed_identity(name, public, sign_public)}):
                         send(sock, {"type": "waiting", "to": target_info[0]})
             elif kind == "discover":
-                query = packet.get("query", "").lower()
-                if not isinstance(query, str):
-                    query = ""
+                query = packet.get("query", "")
+                query = query.strip().lower() if isinstance(query, str) else ""
+                if len(query) < 2:
+                    send(sock, {"type": "error", "message": "type at least 2 letters of a username to search"})
+                    continue
                 with LOCK:
                     users = load_users()
                     online = set(ONLINE)
-                matches = [
-                    {"name": account["name"], "online": username in online}
-                    for username, account in users.items()
-                    if query in account["name"].lower()
-                ][:50]
-                send(sock, {"type": "discover", "users": matches})
+                send(sock, {"type": "discover", "query": query, **search_accounts(users, online, key, query)})
             elif kind == "status":
                 requested = packet.get("users", [])
                 if not isinstance(requested, list):
@@ -774,7 +803,9 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     account = users.get(key)
                     if account is not None:
                         account["allow_group_invites"] = bool(packet.get("allow_group_invites", True))
-                        account["friends_only_rooms"] = bool(packet.get("friends_only_rooms", False))
+                        for field in ("friends_only_rooms", "discoverable"):
+                            if field in packet:
+                                account[field] = bool(packet[field])
                         account["dnd"] = bool(packet.get("dnd", False))
                         save_users(users)
             elif kind == "sync_put_settings":

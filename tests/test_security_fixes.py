@@ -183,6 +183,49 @@ class AbuseLimitTests(unittest.TestCase):
         self.assertEqual(synced["alice"]["messages"], {})
         self.assertEqual(synced["bob"]["messages"], {message_id: "blob"})
 
+    def search(self, client, query):
+        self.server.send(client, {"type": "discover", "query": query})
+        return self.server.receive(client)
+
+    def test_search_ranks_exact_then_prefix_then_contains(self):
+        me = self.harness.login("searcher")
+        for name in ("rob", "bobby", "bob", "jimbob"):
+            self.harness.login(name)
+        names = [user["name"] for user in self.search(me, "bob")["users"]]
+        self.assertEqual(names, ["bob", "bobby", "jimbob"])
+
+    def test_hidden_accounts_need_the_exact_name_and_hide_online_state(self):
+        me = self.harness.login("searcher")
+        shy = self.harness.login("shyperson")
+        self.server.send(shy, {"type": "preferences", "discoverable": False})
+        self.server.send(shy, {"type": "ping", "id": "x"})
+        self.server.receive(shy)
+        self.assertEqual(self.search(me, "shy")["users"], [])
+        exact = self.search(me, "shyperson")["users"]
+        self.assertEqual(exact[0]["name"], "shyperson")
+        self.assertIsNone(exact[0]["online"])
+        users = self.server.load_users()
+        users["searcher"]["friends"] = ["shyperson"]
+        self.server.save_users(users)
+        friend_view = self.search(me, "shy")["users"]
+        self.assertEqual(friend_view[0]["online"], True)
+        self.assertTrue(friend_view[0]["friend"])
+
+    def test_search_needs_two_letters_so_accounts_cant_be_listed(self):
+        me = self.harness.login("searcher")
+        self.assertEqual(self.search(me, "")["type"], "error")
+        self.assertEqual(self.search(me, "a")["type"], "error")
+
+    def test_older_clients_dont_reset_newer_privacy_choices(self):
+        client = self.harness.login("private")
+        self.server.send(client, {"type": "preferences", "friends_only_rooms": True, "discoverable": False})
+        self.server.send(client, {"type": "preferences", "dnd": False, "allow_group_invites": True})  # old client
+        self.server.send(client, {"type": "ping", "id": "x"})
+        self.server.receive(client)
+        account = self.server.load_users()["private"]
+        self.assertTrue(account["friends_only_rooms"])
+        self.assertFalse(account["discoverable"])
+
     def test_rate_limit_tables_are_pruned(self):
         self.server.MAX_TRACKED_KEYS = 10
         # time.monotonic() counts from boot on Linux, so "0" can be recent on

@@ -518,9 +518,9 @@ def load_settings() -> dict:
     try:
         saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         noise = saved.get("voice_noise", 2 if saved.get("voice_effects", True) else 0)
-        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "timers": {str(name).lower(): value for name, value in saved.get("timers", {}).items() if CHAT_KEY_RE.fullmatch(str(name)) and value in TIMER_CHOICES.values()} if isinstance(saved.get("timers"), dict) else {}, "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
+        return {"notifications": bool(saved.get("notifications", True)), "do_not_disturb": bool(saved.get("do_not_disturb", False)), "allow_group_invites": bool(saved.get("allow_group_invites", True)), "friends_only_rooms": bool(saved.get("friends_only_rooms", False)), "discoverable": bool(saved.get("discoverable", True)), "timers": {str(name).lower(): value for name, value in saved.get("timers", {}).items() if CHAT_KEY_RE.fullmatch(str(name)) and value in TIMER_CHOICES.values()} if isinstance(saved.get("timers"), dict) else {}, "muted": sorted({str(item).lower() for item in saved.get("muted", []) if isinstance(item, str)})[:500] if isinstance(saved.get("muted"), list) else [], "voice_input": saved.get("voice_input"), "voice_output": saved.get("voice_output"), "voice_mode": saved.get("voice_mode", "ptt"), "voice_effects": bool(saved.get("voice_effects", True)), "voice_echo": bool(saved.get("voice_echo", saved.get("voice_effects", True))), "voice_noise": max(0, min(3, int(noise))), "voice_gain": bool(saved.get("voice_gain", True)), "stream_source": saved.get("stream_source", "monitor") if saved.get("stream_source", "monitor") in ("monitor", "window") else "monitor", "stream_window": str(saved.get("stream_window", ""))[:256], "stream_monitor": max(1, int(saved.get("stream_monitor", 1))), "stream_resolution": max(0, min(len(STREAM_RESOLUTIONS) - 1, int(saved.get("stream_resolution", 2)))), "stream_fps": max(0, min(len(STREAM_FPS) - 1, int(saved.get("stream_fps", 2)))), "stream_bitrate": max(0, min(len(STREAM_BITRATES) - 1, int(saved.get("stream_bitrate", 3)))), "stream_profile": saved.get("stream_profile", "auto") if saved.get("stream_profile", "auto") in STREAM_PROFILES else "auto", "stream_codec": saved.get("stream_codec", "auto"), "stream_hardware": bool(saved.get("stream_hardware", True)), "stream_system_audio": bool(saved.get("stream_system_audio", False)), "stream_latency": saved.get("stream_latency", "low"), "_sync_updated": max(0, int(saved.get("_sync_updated", 0)))}
     except Exception:
-        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "muted": [], "timers": {}, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
+        return {"notifications": True, "do_not_disturb": False, "allow_group_invites": True, "friends_only_rooms": False, "discoverable": True, "muted": [], "timers": {}, "voice_input": None, "voice_output": None, "voice_mode": "ptt", "voice_effects": True, "voice_echo": True, "voice_noise": 2, "voice_gain": True, "stream_source": "monitor", "stream_window": "", "stream_monitor": 1, "stream_resolution": 2, "stream_fps": 2, "stream_bitrate": 3, "stream_profile": "auto", "stream_codec": "auto", "stream_hardware": True, "stream_system_audio": False, "stream_latency": "low", "_sync_updated": 0}
 
 
 def save_settings(settings: dict) -> None:
@@ -1705,6 +1705,32 @@ class Wire:
     def is_blocked(self, username: str) -> bool:
         return any(item.lower() == username.lower() for item in self.contacts()["blocked"])
 
+    def show_search_results(self, packet: dict) -> None:
+        users = [user for user in packet.get("users", []) if isinstance(user, dict) and isinstance(user.get("name"), str)]
+        query = safe_terminal_text(packet.get("query", "")) if isinstance(packet.get("query"), str) else ""
+        say(f"\nACCOUNTS MATCHING '{query}'" if query else "\nACCOUNTS")
+        if not users:
+            say("no accounts found (people who hide from search only show up for their exact username)")
+            return
+        for user in users:
+            name = safe_terminal_text(user["name"])
+            tags = []
+            if user.get("you"):
+                tags.append("you")
+            if user.get("friend"):
+                tags.append("friend")
+            if self.is_blocked(name):
+                tags.append("blocked")
+            if user.get("request_sent"):
+                tags.append("friend request sent")
+            if user.get("request_received"):
+                tags.append(f"wants to be friends: /friend accept {name}")
+            state = {True: "online", False: "offline"}.get(user.get("online"), "hidden")
+            say(f"  {name:<24} [{state}]" + (f"  {', '.join(tags)}" if tags else ""))
+        if packet.get("more"):
+            say("  ...more matches; type more of the name to narrow it down")
+        say("open <name> to start a chat, /friend add <name> to add a friend")
+
     def show_friends(self) -> None:
         self.server_send({"type": "friends_list"})
 
@@ -1715,6 +1741,7 @@ class Wire:
         say(f"do not disturb: {'on' if self.settings['do_not_disturb'] else 'off'}")
         say(f"allow group invites: {'on' if self.settings['allow_group_invites'] else 'off'}")
         say(f"chats from friends only: {'on' if self.settings['friends_only_rooms'] else 'off'}")
+        say(f"show me in search: {'on' if self.settings['discoverable'] else 'off (exact username only)'}")
         if self.settings["muted"]:
             say(f"muted: {', '.join(self.settings['muted'])}")
         say(f"voice activation: {'always on' if self.settings['voice_mode'] == 'open' else 'hold F12 to talk'}")
@@ -1736,7 +1763,8 @@ class Wire:
         if self.server:
             self.server_send({"type": "preferences", "dnd": self.settings["do_not_disturb"],
                               "allow_group_invites": self.settings["allow_group_invites"],
-                              "friends_only_rooms": self.settings["friends_only_rooms"]})
+                              "friends_only_rooms": self.settings["friends_only_rooms"],
+                              "discoverable": self.settings["discoverable"]})
 
     def sync_settings(self) -> None:
         if not self.server or not self.history_key:
@@ -1867,6 +1895,7 @@ class Wire:
                 ("Do Not Disturb", "On" if self.settings["do_not_disturb"] else "Off"),
                 ("Allow group invites", "On" if self.settings["allow_group_invites"] else "Off"),
                 ("Chats from friends only", "On" if self.settings["friends_only_rooms"] else "Off"),
+                ("Show me in search", "On" if self.settings["discoverable"] else "Off"),
                 ("Voice activation", "Always on" if self.settings["voice_mode"] == "open" else "Push-to-talk (F12)"),
                 ("Echo cancellation", "On" if self.settings["voice_echo"] else "Off"),
                 ("Noise removal", ("Off", "Light", "Normal", "Strong")[self.settings["voice_noise"]]),
@@ -1891,6 +1920,7 @@ class Wire:
                 "Suppresses Wire notifications and tells the directory you are unavailable.",
                 "When off, the directory rejects new group invitations for you.",
                 "When on, the directory only lets friends open a chat with you.",
+                "When off, people only find you by typing your exact username.",
                 "Always on sends audio continuously; push-to-talk uses F12.",
                 "Applies to your next and current voice calls.",
                 "Higher noise removal can use more CPU.",
@@ -1933,54 +1963,56 @@ class Wire:
                     elif selected == 3:
                         self.settings["friends_only_rooms"] = not self.settings["friends_only_rooms"]
                     elif selected == 4:
-                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
+                        self.settings["discoverable"] = not self.settings["discoverable"]
                     elif selected == 5:
-                        self.settings["voice_echo"] = not self.settings["voice_echo"]
+                        self.settings["voice_mode"] = "open" if self.settings["voice_mode"] == "ptt" else "ptt"
                     elif selected == 6:
-                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                        self.settings["voice_echo"] = not self.settings["voice_echo"]
                     elif selected == 7:
+                        self.settings["voice_noise"] = (self.settings["voice_noise"] + direction) % 4
+                    elif selected == 8:
                         self.settings["voice_gain"] = not self.settings["voice_gain"]
-                    elif selected in (8, 9):
-                        choices = inputs if selected == 8 else outputs
-                        setting = "voice_input" if selected == 8 else "voice_output"
+                    elif selected in (9, 10):
+                        choices = inputs if selected == 9 else outputs
+                        setting = "voice_input" if selected == 9 else "voice_output"
                         if choices:
                             current = self.settings.get(setting)
                             position = next((i for i, (device_id, _) in enumerate(choices) if device_id == current), -1)
                             self.settings[setting] = choices[(position + direction) % len(choices)][0]
-                    elif selected == 10:
-                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
                     elif selected == 11:
+                        self.settings["stream_source"] = "window" if self.settings["stream_source"] == "monitor" else "monitor"
+                    elif selected == 12:
                         if windows:
                             current = self.settings.get("stream_window", "")
                             position = windows.index(current) if current in windows else -1
                             self.settings["stream_window"] = windows[(position + direction) % len(windows)]
                             self.settings["stream_source"] = "window"
-                    elif selected == 12:
-                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 13:
-                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
+                        self.settings["stream_monitor"] = ((self.settings["stream_monitor"] - 1 + direction) % self.monitor_count()) + 1
                     elif selected == 14:
-                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
+                        self.settings["stream_resolution"] = (self.settings["stream_resolution"] + direction) % len(STREAM_RESOLUTIONS)
                     elif selected == 15:
-                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                        self.settings["stream_fps"] = (self.settings["stream_fps"] + direction) % len(STREAM_FPS)
                     elif selected == 16:
+                        self.settings["stream_bitrate"] = (self.settings["stream_bitrate"] + direction) % len(STREAM_BITRATES)
+                    elif selected == 17:
                         options = list(STREAM_PROFILES)
                         self.settings["stream_profile"] = options[(options.index(self.settings["stream_profile"]) + direction) % len(options)]
                         apply_stream_profile(self.settings)
-                    elif selected == 17:
+                    elif selected == 18:
                         options = ["auto", "H264", "VP8", "VP9", "AV1", "HEVC"]
                         self.settings["stream_codec"] = options[(options.index(self.settings["stream_codec"]) + direction) % len(options)]
-                    elif selected == 18:
-                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 19:
-                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                        self.settings["stream_hardware"] = not self.settings["stream_hardware"]
                     elif selected == 20:
+                        self.settings["stream_system_audio"] = not self.settings["stream_system_audio"]
+                    elif selected == 21:
                         self.settings["stream_latency"] = "balanced" if self.settings["stream_latency"] == "low" else "low"
                     save_settings(self.settings)
                     self.sync_settings()
                     self.apply_voice_settings()
                     self.sync_preferences()
-            elif key in ("enter", "escape") and selected == 21:
+            elif key in ("enter", "escape") and selected == 22:
                 print()
                 return
             elif key == "escape":
@@ -3647,13 +3679,7 @@ class Wire:
                 elif kind == "waiting":
                     say(f"waiting for {packet['to']} to accept")
                 elif kind == "discover":
-                    users = packet.get("users", [])
-                    say("\nDISCOVER")
-                    if not users:
-                        say("no usernames found")
-                    for user in users:
-                        marker = "online" if user.get("online") else "offline"
-                        say(f"{user.get('name', '?')}  [{marker}]")
+                    self.show_search_results(packet)
                 elif kind == "status":
                     users = packet.get("users", [])
                     say("\nFRIENDS")
@@ -3949,7 +3975,7 @@ ACCOUNT AND PEOPLE
   signup [name] / login [name]       Create or sign in to an account.
   /private <server-ip-or-name>       Use a self-hosted Wire server (port 47666 by default).
   /public                            Return to Wire's public directory server.
-  discover [name]                    Find a Wire username.
+  /find <name>                       Search accounts (also: discover <name>). Exact matches first.
   open <name> / accept <name>        Open or accept a private chat.
   friends                             Show friends, online state, status, and pending requests.
   /status <message> / /status clear  Set a short status your friends see (e.g. "back at 6").
@@ -4051,8 +4077,10 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
                 app.switch_directory("private", host, port)
         elif command == "public":
             app.switch_directory("public", DEFAULT_DIRECTORY_HOST, DEFAULT_DIRECTORY_PORT)
-        elif command == "discover":
-            app.server_send({"type": "discover", "query": argument})
+        elif command in ("discover", "find"):
+            if len(argument.strip()) < 2:
+                raise ValueError("use: /find <part of a username> (at least 2 letters)")
+            app.server_send({"type": "discover", "query": argument.strip()})
         elif command == "friends":
             app.show_friends()
         elif command == "friend":

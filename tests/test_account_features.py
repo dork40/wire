@@ -259,6 +259,39 @@ class VoiceCallConsentTests(TempAccount):
         self.assertEqual(started, ["bob"])
 
 
+class AccountSearchTests(TempAccount):
+    def test_find_sends_the_query_and_refuses_one_letter(self):
+        sent = []
+        self.app.server = object()
+        self.app.server_send = sent.append
+        wire.run_command(self.app, "find", "  bo ")
+        self.assertEqual(sent, [{"type": "discover", "query": "bo"}])
+        self.lines.clear()
+        wire.run_command(self.app, "find", "b")
+        self.assertEqual(len(sent), 1)
+
+    def test_results_show_relationship_and_how_to_act(self):
+        contacts = self.app.contacts()
+        contacts["blocked"] = ["mallory"]
+        self.app.save_contacts(contacts)
+        self.lines.clear()
+        self.app.show_search_results({"query": "o", "more": False, "users": [
+            {"name": "bob", "online": True, "friend": True},
+            {"name": "mallory", "online": False},
+            {"name": "joe", "online": None, "request_received": True},
+            {"name": "tester", "online": True, "you": True},
+            {"name": "\x1b[2Jevil", "online": True},
+        ]})
+        text = "\n".join(self.lines)
+        self.assertRegex(text, r"bob\s+\[online\]\s+friend")
+        self.assertRegex(text, r"mallory\s+\[offline\]\s+blocked")
+        self.assertIn("/friend accept joe", text)
+        self.assertRegex(text, r"joe\s+\[hidden\]")
+        self.assertRegex(text, r"tester\s+\[online\]\s+you")
+        self.assertNotIn("\x1b", text)
+        self.assertIn("open <name>", text)
+
+
 class KeyChangeTests(TempAccount):
     def test_changed_key_is_refused_announced_once_then_trustable(self):
         old_public, old_sign = b"o" * 32, b"s" * 32
