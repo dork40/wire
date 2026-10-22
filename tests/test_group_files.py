@@ -16,7 +16,7 @@ class FakeSocket:
         self.inbox: "queue.Queue[dict | None]" = queue.Queue()
 
 
-class TwoClientsInAGroup(unittest.TestCase):
+class TwoClientHarness(unittest.TestCase):
     """Two real Wire clients joined by a fake directory that does what the
     real one does for these packets: forwards direct_offer and relay."""
 
@@ -46,6 +46,8 @@ class TwoClientsInAGroup(unittest.TestCase):
             app.server_send = lambda packet, sender=name: self.route(sender, packet)
             self.apps[name] = app
             signature = directory.sign(wire.directory_identity_bytes(name, app.public, app.sign_public))
+            self.identities = getattr(self, 'identities', {})
+            self.identities[name] = (name, wire.b64(app.public), wire.b64(app.sign_public), wire.b64(signature))
             members.append({"name": name, "public": wire.b64(app.public), "sign_public": wire.b64(app.sign_public),
                             "identity_signature": wire.b64(signature), "online": True, "role": "member"})
         for app in self.apps.values():
@@ -88,6 +90,8 @@ class TwoClientsInAGroup(unittest.TestCase):
             time.sleep(0.05)
         self.fail("timed out waiting")
 
+
+class TwoClientsInAGroup(TwoClientHarness):
     def test_group_file_arrives_intact_without_opening_a_chat(self):
         alice, bob = self.apps["alice"], self.apps["bob"]
         source = self.root / "plans.bin"

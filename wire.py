@@ -1127,6 +1127,23 @@ class Peer:
     send_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     seen_nonces: set[str] = field(default_factory=set, repr=False)
     nonce_order: list[str] = field(default_factory=list, repr=False)
+    # Forward secrecy: once both sides have swapped ephemeral keys, `key`
+    # becomes a session key that never touches disk. `previous_key` is the
+    # identity-derived key, still accepted only until the other side's first
+    # session-key packet arrives (packets they sent before switching).
+    previous_key: Optional[bytes] = field(default=None, repr=False)
+    session_private: Optional[object] = field(default=None, repr=False)
+    forward_secret: bool = False
+
+    def decrypt(self, nonce: bytes, data: bytes, aad: bytes) -> bytes:
+        try:
+            plaintext = AESGCM(self.key).decrypt(nonce, data, aad)
+        except InvalidTag:
+            if self.previous_key is None:
+                raise
+            return AESGCM(self.previous_key).decrypt(nonce, data, aad)
+        self.previous_key = None
+        return plaintext
 
     def accept_nonce(self, packet: dict) -> bool:
         encoded = packet.get("nonce")
@@ -2920,7 +2937,7 @@ class Wire:
 
     def handle_file_relay(self, peer: Peer, packet: dict) -> None:
         """Receive a bounded, end-to-end encrypted file stream via the relay."""
-        frame = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-file-relay").decode("utf-8"))
+        frame = json.loads(peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-file-relay").decode("utf-8"))
         file_id, kind = frame.get("id"), frame.get("kind")
         state = self.incoming_files.get(file_id) if isinstance(file_id, str) else None
         if not state or not same_peer(state["peer"], peer):
@@ -3420,7 +3437,7 @@ class Wire:
         say("image accepted" if accept else "image declined")
 
     def handle_image(self, peer: Peer, packet: dict) -> None:
-        raw = AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-image")
+        raw = peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-image")
         frame = json.loads(raw.decode("utf-8"))
         image_id = frame.get("id", "")
         if not valid_transfer_id(image_id):
@@ -3543,7 +3560,7 @@ class Wire:
         say("voice call ended")
 
     def handle_voice(self, peer: Peer, packet: dict) -> None:
-        frame = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-voice").decode("utf-8"))
+        frame = json.loads(peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-voice").decode("utf-8"))
         kind = frame.get("kind")
         if kind == "offer":
             self.call_requests.add(peer.name.lower())
@@ -3561,7 +3578,57 @@ class Wire:
     def handle_audio(self, peer: Peer, packet: dict) -> None:
         call = self.calls.get(peer.name.lower())
         if call:
-            call.play(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-audio"))
+            call.play(peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-audio"))
+
+    def start_session(self, peer: Peer) -> None:
+        """Send our half of a fresh session key for this chat. An older
+        client ignores it and the chat keeps the identity-derived key."""
+        if peer.session_private is not None or peer.forward_secret:
+            return
+        private = x25519.X25519PrivateKey.generate()
+        peer.session_private = private
+        public = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        try:
+            peer.send_control({"kind": "session_key", "public": b64(public)})
+        except (OSError, ConnectionError):
+            peer.session_private = None
+
+    def complete_session(self, peer: Peer, control: dict) -> None:
+        if peer.forward_secret:
+            return
+        try:
+            their_public = unb64(str(control.get("public", "")))
+        except (ValueError, binascii.Error):
+            return
+        if len(their_public) != 32:
+            return
+        if peer.session_private is None:
+            self.start_session(peer)
+            if peer.session_private is None:
+                return
+        private = peer.session_private
+        mine = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+        try:
+            shared = private.exchange(x25519.X25519PublicKey.from_public_bytes(their_public))
+        except ValueError:
+            return
+        first, second = sorted((mine, their_public))
+        # Salted with the identity-derived key, so the session is bound to
+        # these two people; the ephemeral part is what gives forward secrecy.
+        session = HKDF(algorithm=hashes.SHA256(), length=32, salt=peer.key,
+                       info=b"wire-v2-session\0" + first + second).derive(shared)
+        if not control.get("ack"):
+            # Our first half may have arrived before their chat was open and
+            # been dropped, so answer with it again - still under the old
+            # key, which they're using until they derive the session too.
+            try:
+                peer.send_control({"kind": "session_key", "public": b64(mine), "ack": True})
+            except (OSError, ConnectionError):
+                return
+        peer.previous_key, peer.key = peer.key, session
+        peer.session_private = None
+        peer.forward_secret = True
+        say(f"forward secrecy on for {peer.name}: this chat now uses a fresh key that is never saved")
 
     def attach(self, peer: Peer) -> None:
         old = self.peers.get(peer.name.lower())
@@ -3579,6 +3646,7 @@ class Wire:
         redraw_prompt()
         if peer.sock:
             self.start_worker(self.receive_loop, peer)
+        self.start_session(peer)
 
     def handle_message(self, peer: Peer, packet: dict, transfer_only: bool = False) -> None:
         if transfer_only and packet.get("type") not in ("file_relay", "control"):
@@ -3595,7 +3663,7 @@ class Wire:
     def handle_authenticated_message(self, peer: Peer, packet: dict, transfer_only: bool = False) -> None:
         if packet.get("type") == "control":
             try:
-                control = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-control").decode("utf-8"))
+                control = json.loads(peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-control").decode("utf-8"))
                 if transfer_only and control.get("kind") not in FILE_TRANSFER_CONTROLS:
                     return
                 if control.get("kind") == "webrtc_answer" and isinstance(control.get("answer"), dict):
@@ -3647,6 +3715,8 @@ class Wire:
                     image_id = control.get("id")
                     if isinstance(image_id, str):
                         self.stop_incoming_image(peer, image_id)
+                elif control.get("kind") == "session_key":
+                    self.complete_session(peer, control)
                 elif control.get("kind") == "chat_timer":
                     seconds = control.get("seconds")
                     if (isinstance(seconds, int) and not isinstance(seconds, bool)
@@ -3694,7 +3764,7 @@ class Wire:
         if packet.get("type") != "msg":
             return
         nonce, data = unb64(packet["nonce"]), unb64(packet["data"])
-        text = AESGCM(peer.key).decrypt(nonce, data, b"wire-v1-message").decode("utf-8")
+        text = peer.decrypt(nonce, data, b"wire-v1-message").decode("utf-8")
         if len(text) > MAX_MESSAGE_CHARS:
             return
         message_id = packet.get("id") if valid_transfer_id(packet.get("id")) else uuid.uuid4().hex
@@ -3930,7 +4000,7 @@ class Wire:
             peer = self.relay_peer(sender, public, sign_public_value, identity_signature)
             if encrypted.get("type") != "msg":
                 return
-            text = AESGCM(peer.key).decrypt(unb64(encrypted["nonce"]), unb64(encrypted["data"]), b"wire-v1-message").decode("utf-8")
+            text = peer.decrypt(unb64(encrypted["nonce"]), unb64(encrypted["data"]), b"wire-v1-message").decode("utf-8")
             if len(text) > MAX_MESSAGE_CHARS:
                 return
         except Exception:
@@ -4689,7 +4759,7 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
                 raise ValueError(f"not connected to {user}")
             app.send_message(peer, text)
         elif command == "peers":
-            print("\n".join(peer.name for peer in app.peers.values()) or "no peers")
+            print("\n".join(f"{peer.name}{'  (forward secrecy)' if peer.forward_secret else ''}" for peer in app.peers.values()) or "no peers")
         elif command == "room":
             peer = app.peers.get(argument.lower())
             if not peer:
