@@ -353,6 +353,9 @@ def human_size(size: int) -> str:
 POLL_HEADER_RE = re.compile(r"POLL \(([0-9a-f]{6})\): (.+)")
 POLL_OPTION_RE = re.compile(r"  (\d{1,2})\) (.+)")
 VOTE_RE = re.compile(r"VOTE ([0-9a-f]{6}) (\d{1,2})")
+# Group replies/reactions/edits/deletes ride on ordinary group messages, like
+# polls, so an older client still shows something readable.
+GROUP_ACTION_RE = re.compile(r"(REPLY|REACT|EDIT|DELETE) ([0-9a-f]{32})(?: (.+))?", re.DOTALL)
 MAX_POLL_OPTIONS = 10
 # Bold/italic/code styling in a real terminal only: exports, pipes and the
 # Android app's log get the plain text.
@@ -4627,7 +4630,8 @@ class Wire:
         say("\n" + heading + " " * max(1, width - len(heading) - len("MEMBERS")) + "MEMBERS")
         say(" | ".join(members) or "no members")
 
-    def send_group_message(self, group_name: str, text: str) -> None:
+    def send_group_message(self, group_name: str, text: str, record: bool = True,
+                           record_text: Optional[str] = None, reply_to: Optional[str] = None) -> None:
         if len(text) > MAX_MESSAGE_CHARS:
             raise ValueError(f"message is too long ({MAX_MESSAGE_CHARS} character maximum)")
         group = self.groups.get(group_name.lower())
@@ -4662,7 +4666,62 @@ class Wire:
             data = AESGCM(peer.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
             packets[name.lower()] = {"type": "msg", "id": message_id, "nonce": b64(nonce), "data": b64(data)}
         self.server_send({"type": "group_send", "group": group["name"], "packets": packets})
-        self.record_history(f"group-{group['name']}", self.name or "me", text, message_id)
+        if record:
+            self.record_history(f"group-{group['name']}", self.name or "me", text if record_text is None else record_text, message_id, reply_to)
+
+    def group_message_action(self, group_name: str, action: str, prefix: str, text: str = "") -> None:
+        """/reply, /react, /edit, /delete inside a group."""
+        group = self.groups.get(group_name.lower())
+        if not group:
+            raise ValueError("unknown group; use /group list first")
+        key = f"group-{group['name']}"
+        records, target = self.matching_message(key, prefix, own_only=action in ("edit", "delete"))
+        message_id = target["id"]
+        if action == "reply":
+            if not text:
+                raise ValueError("use: /reply <message-code> <text>")
+            self.send_group_message(group["name"], f"REPLY {message_id} {text}", record_text=text, reply_to=message_id)
+            return
+        if action == "react":
+            if not text or len(text) > 24:
+                raise ValueError("reaction must be 1-24 characters")
+            target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{self.name}:")] + [f"{self.name}:{text}"]
+            wire_text = f"REACT {message_id} {text}"
+        elif action == "edit":
+            if not text or len(text) > MAX_MESSAGE_CHARS:
+                raise ValueError("use: /edit <message-code> <new text>")
+            target["text"], target["edited"] = text, True
+            wire_text = f"EDIT {message_id} {text}"
+        else:
+            target["deleted"], target["text"] = True, ""
+            wire_text = f"DELETE {message_id}"
+        self.save_history(key, records, target)
+        self.send_group_message(group["name"], wire_text, record=False)
+
+    def apply_group_action(self, group: str, sender: str, kind: str, message_id: str, text: str) -> None:
+        key = f"group-{group}"
+        records = self.read_history(key)
+        target = next((record for record in records if record.get("id") == message_id), None)
+        if not target:
+            return
+        own = str(target.get("from", "")).lower() == sender.lower()
+        label = f"[{safe_terminal_text(group)}] {safe_terminal_text(sender)}"
+        if kind == "REACT":
+            reaction = safe_terminal_text(text).replace("\n", "").replace("\t", "").strip()
+            if not reaction or len(reaction) > 24:
+                return
+            target["reactions"] = [item for item in target.get("reactions", []) if not str(item).startswith(f"{sender}:")] + [f"{sender}:{reaction}"]
+            say(f"\n{label} reacted {reaction} to {message_id[:6]}")
+        elif kind == "EDIT" and own and text and len(text) <= MAX_MESSAGE_CHARS:
+            target["text"], target["edited"] = text, True
+            say(f"\n{label} edited {message_id[:6]}: {format_text(safe_terminal_text(text))}")
+        elif kind == "DELETE" and own:
+            target["deleted"], target["text"] = True, ""
+            say(f"\n{label} deleted message {message_id[:6]}")
+        else:
+            return  # e.g. someone trying to edit a message that isn't theirs
+        self.save_history(key, records, target)
+        redraw_prompt()
 
     def handle_group_message(self, packet: dict) -> None:
         group, sender, public, sign_public_value, identity_signature, encrypted = packet.get("group"), packet.get("from"), packet.get("public"), packet.get("sign_public"), packet.get("identity_signature"), packet.get("packet")
@@ -4687,7 +4746,14 @@ class Wire:
         except Exception:
             return
         message_id = encrypted.get("id") if isinstance(encrypted.get("id"), str) else uuid.uuid4().hex
-        self.record_history(f"group-{group}", sender, text, message_id)
+        reply_to = None
+        action = GROUP_ACTION_RE.fullmatch(text)
+        if action and action.group(1) == "REPLY" and action.group(3):
+            text, reply_to = action.group(3), action.group(2)
+        elif action:
+            self.apply_group_action(group, sender, action.group(1), action.group(2), action.group(3) or "")
+            return
+        self.record_history(f"group-{group}", sender, text, message_id, reply_to)
         mentioned = self.is_mentioned(text)
         self.note_incoming(f"group-{group}", mentioned)
         self.api_event(f"group-{group}", sender, text)
@@ -4696,7 +4762,8 @@ class Wire:
             say(f"\n[{safe_terminal_text(group)}] {safe_terminal_text(sender)} voted in poll {vote.group(1)}: {self.describe_poll(f'group-{group}', vote.group(1))}")
         else:
             highlight = ("\x1b[1;33m@you\x1b[0m " if TEXT_FORMATTING else "@you ") if mentioned else ""
-            say(f"\n[{safe_terminal_text(group)}] {highlight}{safe_terminal_text(sender)} > {format_text(safe_terminal_text(text))}")
+            replied = f"  reply:{reply_to[:6]}" if reply_to else ""
+            say(f"\n[{safe_terminal_text(group)}] {highlight}{safe_terminal_text(sender)} > {format_text(safe_terminal_text(text))}{replied}")
         redraw_prompt()
         if mentioned and self.notifications_allowed(sender):
             # A mention gets through a muted group (not Do Not Disturb or a muted person).
@@ -5104,7 +5171,7 @@ CHAT
   /mute <name> / /mute group <name>  Silence pop-ups from a person or group (/unmute to undo).
   /export <name> / /export group <name>
                                       Save that chat's history on this device to a text file.
-  /reply <code> <text>               Reply to a saved message.
+  /reply <code> <text>               Reply to a saved message (in 1:1 chats and groups).
   /react <code> <emoji>              Add or replace your reaction.
   /edit <code> <text> / /delete <code>
                                       Change or delete one of your messages.
@@ -5359,6 +5426,11 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if not argument:
                 raise ValueError("use: /sendfile <file path>")
             app.send_attachment(room_peer, argument)
+        elif command in ("reply", "react", "edit", "delete") and app.group_room and not app.peers.get(app.room or ""):
+            pieces = argument.split(maxsplit=1)
+            if not pieces or (command != "delete" and len(pieces) != 2):
+                raise ValueError(f"use: /{command} <message-code>" + (" <text>" if command != "delete" else ""))
+            app.group_message_action(app.group_room, command, pieces[0], pieces[1] if len(pieces) == 2 else "")
         elif command in ("reply", "react", "edit", "delete"):
             room_peer = app.peers.get(app.room or "")
             if not room_peer:
