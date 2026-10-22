@@ -2345,7 +2345,7 @@ class Wire:
             raise ValueError("message code did not match exactly one saved message")
         return records, candidates[0]
 
-    def render_record(self, record: dict, show_id: bool = False, styled: bool = True) -> str:
+    def render_record(self, record: dict, show_id: bool = False, styled: bool = True, with_time: bool = False) -> str:
         text = "[deleted]" if record.get("deleted") else safe_terminal_text(record.get("text", ""))
         vote = VOTE_RE.fullmatch(text)
         if vote:
@@ -2364,7 +2364,12 @@ class Wire:
         reactions = record.get("reactions", [])
         if reactions:
             suffix += "  " + " ".join(safe_terminal_text(item) for item in reactions[:12])
-        return f"{safe_terminal_text(record.get('from', '?'))} > {text}{suffix}"
+        when = ""
+        if with_time and isinstance(record.get("at"), str):
+            today = time.strftime("%Y-%m-%d")
+            stamp = record["at"]
+            when = f"[{short_stamp(stamp, today)}] " if stamp[:10] == today else f"[{short_stamp(stamp, today)} {stamp_text(stamp)[11:]}] "
+        return f"{when}{safe_terminal_text(record.get('from', '?'))} > {text}{suffix}"
 
     def show_history(self, peer_name: str, show_ids: bool = False) -> None:
         self.mark_read(peer_name)
@@ -2373,7 +2378,7 @@ class Wire:
             return
         say("-- earlier messages --")
         for record in records[-30:]:
-            say(self.render_record(record, show_id=show_ids))
+            say(self.render_record(record, show_id=show_ids, with_time=True))
         say("-- end earlier messages --")
 
     def set_muted(self, target: str, muted: bool) -> None:
@@ -4412,14 +4417,14 @@ class Wire:
         say(f"PINS — {group['name']}")
         for message_id in pins:
             record = by_id.get(message_id)
-            say(self.render_record(record, show_id=True) if record else f"({str(message_id)[:6]}) message is not in local history")
+            say(self.render_record(record, show_id=True, with_time=True) if record else f"({str(message_id)[:6]}) message is not in local history")
 
     def jump_group_message(self, group_name: str, prefix: str) -> None:
         group = self.groups.get(group_name.lower())
         if not group:
             raise ValueError("unknown group; use /group list first")
         _, record = self.matching_message(f"group-{group['name']}", prefix)
-        say(self.render_record(record, show_id=True))
+        say(self.render_record(record, show_id=True, with_time=True))
 
     def server_loop(self, sock: socket.socket) -> None:
         try:

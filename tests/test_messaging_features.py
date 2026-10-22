@@ -133,6 +133,14 @@ class ScheduleTests(Base):
         self.assertEqual(wire.short_stamp("2026-10-22 00:30", "2026-10-22"), "12:30 AM")
         self.assertEqual(wire.short_stamp("2026-10-21 18:04", "2026-10-22"), "Oct 21")
 
+    def test_history_lines_show_12_hour_times(self):
+        today = time.strftime("%Y-%m-%d")
+        line = self.app.render_record({"from": "bob", "text": "hi", "at": f"{today} 18:04"}, with_time=True)
+        self.assertEqual(line, "[6:04 PM] bob > hi")
+        older = self.app.render_record({"from": "bob", "text": "hi", "at": "2026-01-05 09:15"}, with_time=True)
+        self.assertEqual(older, "[Jan 5 9:15 AM] bob > hi")
+        self.assertEqual(self.app.render_record({"from": "bob", "text": "hi", "at": f"{today} 18:04"}), "bob > hi")
+
     def test_schedule_accepts_am_pm(self):
         now = time.mktime((2026, 10, 22, 17, 0, 0, 0, 0, -1))
         self.assertEqual(wire.parse_when("6:30pm", now), now + 5400)
