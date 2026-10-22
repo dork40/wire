@@ -326,6 +326,26 @@ TIMER_CHOICES = {"30s": 30, "5m": 300, "1h": 3600, "8h": 8 * 3600, "1d": 86400, 
 SYNC_DELETE_SERVER_VERSION = "1.4.36"
 
 
+# The only encrypted controls accepted from someone we're exchanging a group
+# file with but have no open chat with.
+FILE_TRANSFER_CONTROLS = frozenset({"file_relay_accept", "file_relay_decline", "file_relay_complete", "file_relay_abort"})
+
+
+def same_peer(first: object, second: object) -> bool:
+    """The same person and session key, even if one side's Peer object was
+    replaced (e.g. a chat opened while a group file was in flight)."""
+    return first is second or (isinstance(first, Peer) and isinstance(second, Peer)
+                               and first.name.lower() == second.name.lower() and first.key == second.key)
+
+
+def human_size(size: int) -> str:
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1024 or unit == "MB":
+            return f"{size} {unit}" if unit == "bytes" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} MB"
+
+
 def timer_label(seconds: int) -> str:
     return next((label for label, value in TIMER_CHOICES.items() if value == seconds), "off")
 
@@ -1212,6 +1232,13 @@ class Wire:
         # "accepted" for an arbitrary name, so only attach a peer we either
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
+        # Group members we're exchanging files with but have no open chat
+        # with; only file-transfer traffic is accepted from these.
+        self.transfer_peers: dict[str, Peer] = {}
+        self.group_transfer_temps: list[Path] = []
+        # People we called. A voice "accept" opens the microphone, so it is
+        # only honoured as an answer to a call we actually placed.
+        self.outgoing_calls: set[str] = set()
         # name -> identity offered after a key change; only /trust pins it.
         self.rejected_identities: dict[str, dict] = {}
         self.outgoing_opens: set[str] = set()
@@ -2487,6 +2514,64 @@ class Wire:
             except OSError:
                 pass
 
+    def group_member(self, group_name: object, name: str) -> Optional[dict]:
+        group = self.groups.get(group_name.lower()) if isinstance(group_name, str) else None
+        if not group:
+            return None
+        return next((member for member in group.get("members", [])
+                     if isinstance(member, dict) and str(member.get("name", "")).lower() == name.lower()), None)
+
+    def file_offer_sender_known(self, sender: str, offer: dict) -> bool:
+        """Only show offers from an open chat, or from a member of the group
+        the offer names - the directory forwards offers from anyone online."""
+        return sender.lower() in self.peers or self.group_member(offer.get("group"), sender) is not None
+
+    def group_transfer_peer(self, name: str, offer: dict) -> Optional[Peer]:
+        member = self.group_member(offer.get("group"), name)
+        if not member:
+            return None
+        if name.lower() not in self.transfer_peers:
+            self.transfer_peers[name.lower()] = self.relay_peer(member["name"], member["public"], member["sign_public"], member["identity_signature"])
+        return self.transfer_peers[name.lower()]
+
+    def send_group_file(self, group_name: str, value: str) -> None:
+        """Offer one file to every online member; each accepts on their own."""
+        group = self.groups.get(group_name.lower())
+        if not group:
+            raise ValueError("unknown group; use /group list first")
+        path = Path(value.strip().strip('"')).expanduser()
+        if path.is_dir():
+            say(f"packing folder: {path.name}")
+            path = self.package_folder(path)
+            self.group_transfer_temps.append(path)
+        if not path.is_file():
+            raise ValueError("choose a file to send")
+        size = path.stat().st_size
+        if size > MAX_FILE_BYTES:
+            raise ValueError("files must be 500 MB or smaller")
+        digest, contents, offered = self.file_digest(path), self.zip_contents(path), 0
+        for member in group.get("members", []):
+            name = member.get("name") if isinstance(member, dict) else None
+            if not isinstance(name, str) or name.lower() == self.name.lower() or not member.get("online"):
+                continue
+            try:
+                peer = self.peers.get(name.lower()) or self.transfer_peers.get(name.lower()) or self.relay_peer(
+                    name, member["public"], member["sign_public"], member["identity_signature"])
+            except (KeyError, TypeError, ValueError) as exc:
+                say(f"skipped {name}: {safe_terminal_text(exc)}")
+                continue
+            if name.lower() not in self.peers:
+                self.transfer_peers[name.lower()] = peer
+            file_id = uuid.uuid4().hex
+            offer = {"id": file_id, "token": os.urandom(32).hex(), "name": path.name, "size": size,
+                     "sha256": digest, "contents": contents, "group": group["name"]}
+            self.outgoing_files[file_id] = {"path": path, "offer": offer, "peer": peer, "cleanup": False}
+            self.server_send({"type": "direct_offer", "to": name, "port": 1, "offer": offer})
+            offered += 1
+        if not offered:
+            raise ValueError("nobody else in that group is online right now")
+        say(f"file offer sent to {offered} {'person' if offered == 1 else 'people'} in {group['name']}: {path.name}")
+
     def answer_file_offer(self, code: str, accept: bool) -> None:
         matches = [key for key in self.pending_files if key.startswith(code.lower())]
         if len(matches) != 1:
@@ -2496,7 +2581,7 @@ class Wire:
             raise ValueError("invalid file transfer code")
         state = self.pending_files.pop(file_id)
         sender, offer = state.get("from"), state.get("offer")
-        peer = self.peers.get(str(sender).lower())
+        peer = self.peers.get(str(sender).lower()) or (self.group_transfer_peer(str(sender), offer) if isinstance(offer, dict) else None)
         if not peer or not isinstance(offer, dict):
             raise ValueError("open a room with that person before accepting their file")
         if not accept:
@@ -2524,7 +2609,7 @@ class Wire:
         frame = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-file-relay").decode("utf-8"))
         file_id, kind = frame.get("id"), frame.get("kind")
         state = self.incoming_files.get(file_id) if isinstance(file_id, str) else None
-        if not state or state["peer"] is not peer:
+        if not state or not same_peer(state["peer"], peer):
             return
         offer = state["offer"]
         try:
@@ -2563,7 +2648,7 @@ class Wire:
     def stop_incoming_file(self, peer: Peer, file_id: str) -> None:
         """Discard an explicitly aborted partial relay file."""
         state = self.incoming_files.get(file_id)
-        if not state or state.get("peer") is not peer:
+        if not state or not same_peer(state.get("peer"), peer):
             return
         self.incoming_files.pop(file_id, None)
         state["temp"].unlink(missing_ok=True)
@@ -3100,6 +3185,7 @@ class Wire:
             say(f"voice {name}: sent {call.sent_frames} frames, received {call.received_frames} frames")
 
     def request_call(self, peer: Peer) -> None:
+        self.outgoing_calls.add(peer.name.lower())
         peer.send_voice_frame({"kind": "offer"})
         say(f"calling {peer.name}; waiting for them to accept")
 
@@ -3125,8 +3211,13 @@ class Wire:
             self.call_requests.add(peer.name.lower())
             say(f"\n{peer.name} wants a voice call. Type /acceptcall {peer.name} or /declinecall {peer.name}")
         elif kind == "accept":
+            if peer.name.lower() not in self.outgoing_calls:
+                return
+            self.outgoing_calls.discard(peer.name.lower())
             self.start_call(peer)
         elif kind == "end":
+            self.outgoing_calls.discard(peer.name.lower())
+            self.call_requests.discard(peer.name.lower())
             self.end_call(peer, tell_peer=False)
 
     def handle_audio(self, peer: Peer, packet: dict) -> None:
@@ -3151,20 +3242,24 @@ class Wire:
         if peer.sock:
             self.start_worker(self.receive_loop, peer)
 
-    def handle_message(self, peer: Peer, packet: dict) -> None:
+    def handle_message(self, peer: Peer, packet: dict, transfer_only: bool = False) -> None:
+        if transfer_only and packet.get("type") not in ("file_relay", "control"):
+            return
         if packet.get("type") in {"control", "image", "voice", "audio", "file_relay", "msg"} and not peer.accept_nonce(packet):
             return
         try:
-            self.handle_authenticated_message(peer, packet)
+            self.handle_authenticated_message(peer, packet, transfer_only)
         except (InvalidTag, KeyError, TypeError, ValueError, UnicodeError):
             # A corrupt authenticated media frame is untrusted network input.
             # Drop only that frame; do not let it tear down the whole room.
             return
 
-    def handle_authenticated_message(self, peer: Peer, packet: dict) -> None:
+    def handle_authenticated_message(self, peer: Peer, packet: dict, transfer_only: bool = False) -> None:
         if packet.get("type") == "control":
             try:
                 control = json.loads(AESGCM(peer.key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-control").decode("utf-8"))
+                if transfer_only and control.get("kind") not in FILE_TRANSFER_CONTROLS:
+                    return
                 if control.get("kind") == "webrtc_answer" and isinstance(control.get("answer"), dict):
                     media = self.webrtc_shares.get(str(control.get("id", "")))
                     if media: media.call(media.remote(control["answer"]))
@@ -3191,7 +3286,7 @@ class Wire:
                 elif control.get("kind") == "file_relay_accept":
                     file_id = control.get("id")
                     state = self.outgoing_files.get(file_id) if isinstance(file_id, str) else None
-                    if state and state["peer"] is peer:
+                    if state and same_peer(state["peer"], peer):
                         self.start_worker(self.relay_send_file_worker, file_id)
                 elif control.get("kind") == "file_relay_decline":
                     file_id = control.get("id")
@@ -3623,10 +3718,14 @@ class Wire:
                         say(f"ping: {round((time.monotonic() - started) * 1000)} ms")
                 elif kind == "direct_offer":
                     offer = packet.get("offer", {})
-                    code = offer.get("id", "")
-                    if valid_transfer_id(code) and isinstance(offer.get("name"), str) and isinstance(offer.get("size"), int):
-                        self.pending_files[code] = {"from": packet.get("from"), "host": packet.get("host"), "port": packet.get("port"), "offer": offer}
-                        say(f"\n{safe_terminal_text(packet.get('from'))} wants to send {safe_terminal_text(offer['name'])} ({offer['size'] // 1024 // 1024} MB)")
+                    sender = packet.get("from")
+                    code = offer.get("id", "") if isinstance(offer, dict) else ""
+                    if (valid_transfer_id(code) and isinstance(sender, str) and isinstance(offer.get("name"), str)
+                            and isinstance(offer.get("size"), int) and not isinstance(offer.get("size"), bool)
+                            and not self.is_blocked(sender) and self.file_offer_sender_known(sender, offer)):
+                        self.pending_files[code] = {"from": sender, "host": packet.get("host"), "port": packet.get("port"), "offer": offer}
+                        where = f" to group {safe_terminal_text(offer['group'])}" if isinstance(offer.get("group"), str) else ""
+                        say(f"\n{safe_terminal_text(sender)} wants to send {safe_filename(offer['name'])}{where} ({human_size(offer['size'])})")
                         for item in offer.get("contents", [])[:20]: say(f"  {safe_terminal_text(item)}")
                         say(f"Type /file accept {code[:6]} or /file decline {code[:6]}")
                         redraw_prompt()
@@ -3684,6 +3783,8 @@ class Wire:
                     peer = self.peers.get(sender.lower())
                     if peer:
                         self.handle_message(peer, packet["packet"])
+                    elif sender.lower() in self.transfer_peers:
+                        self.handle_message(self.transfer_peers[sender.lower()], packet["packet"], transfer_only=True)
                 elif kind == "error":
                     message = str(packet.get("message", "error"))
                     if packet.get("code") == "relay_rate_limited" or message.startswith("relay rate limit reached"):
@@ -3774,6 +3875,8 @@ class Wire:
         for state in self.outgoing_files.values():
             if state.get("cleanup") and isinstance(state.get("path"), Path):
                 state["path"].unlink(missing_ok=True)
+        for path in self.group_transfer_temps:
+            path.unlink(missing_ok=True)
         self.incoming_images.clear()
         self.incoming_files.clear()
         self.outgoing_files.clear()
@@ -3873,6 +3976,7 @@ CHAT
 FILES AND MEDIA
   /send <path>                       Send an image, video, file, or folder.
                                       Images use the image flow; everything else uses file transfer.
+                                      In a group, each online member gets their own offer.
   /image accept|decline <code>       Answer an image offer.
   /sendfile <path>                   Older alias for /send.
   /file accept|decline <code>        Answer an encrypted file transfer.
@@ -4047,6 +4151,10 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
                 app.server_send({"type": "group_leave", "group": pieces[1]})
             else:
                 raise ValueError("use: /group create <name> <people...> | list | open|members <name> | invite <name> <user> | accept <name> | kick <name> <user> | admin|member <name> <user> | pin|unpin <name> <message-code> | pins <name> | jump <name> <message-code> | leave <name>")
+        elif command == "send" and app.group_room and not app.peers.get(app.room or ""):
+            if not argument:
+                raise ValueError("use: /send <file or folder path>")
+            app.send_group_file(app.group_room, argument)
         elif command == "send":
             room_peer = app.peers.get(app.room or "")
             if not room_peer:

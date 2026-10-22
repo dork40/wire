@@ -234,6 +234,31 @@ class RemoteInputTests(TempAccount):
         self.assertEqual(len(started), 1)
 
 
+class VoiceCallConsentTests(TempAccount):
+    @staticmethod
+    def voice_packet(key: bytes, frame: dict) -> dict:
+        nonce = wire.os.urandom(12)
+        data = wire.AESGCM(key).encrypt(nonce, json.dumps(frame).encode("utf-8"), b"wire-v1-voice")
+        return {"type": "voice", "nonce": wire.b64(nonce), "data": wire.b64(data)}
+
+    def test_unrequested_accept_does_not_open_the_microphone(self):
+        started = []
+        self.app.start_call = lambda peer: started.append(peer.name)
+        peer = wire.Peer("mallory", None, wire.os.urandom(32), wire.os.urandom(32))
+        self.app.handle_voice(peer, self.voice_packet(peer.key, {"kind": "accept"}))
+        self.assertEqual(started, [])
+
+    def test_accept_after_we_called_starts_the_call_once(self):
+        started = []
+        self.app.start_call = lambda peer: started.append(peer.name)
+        peer = wire.Peer("bob", None, wire.os.urandom(32), wire.os.urandom(32))
+        peer.send_voice_frame = lambda frame: None
+        self.app.request_call(peer)
+        self.app.handle_voice(peer, self.voice_packet(peer.key, {"kind": "accept"}))
+        self.app.handle_voice(peer, self.voice_packet(peer.key, {"kind": "accept"}))  # replayed
+        self.assertEqual(started, ["bob"])
+
+
 class KeyChangeTests(TempAccount):
     def test_changed_key_is_refused_announced_once_then_trustable(self):
         old_public, old_sign = b"o" * 32, b"s" * 32
