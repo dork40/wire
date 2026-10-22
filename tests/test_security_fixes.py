@@ -244,6 +244,22 @@ class AbuseLimitTests(unittest.TestCase):
         self.server.send(alice, {"type": "friends_list"})
         self.assertIsNone(self.server.receive(alice)["users"][0]["last_seen"])
 
+    def test_room_request_spam_is_limited(self):
+        spammer = self.harness.login("spammer")
+        target = self.harness.login("target")
+        self.server.send(spammer, {"type": "open", "to": "target"})
+        self.assertEqual(self.server.receive(target)["type"], "request")
+        self.assertEqual(self.server.receive(spammer)["type"], "waiting")
+        self.server.send(spammer, {"type": "open", "to": "target"})  # immediate repeat
+        self.assertIn("slow down", self.server.receive(spammer)["message"])
+        target.settimeout(0.3)
+        with self.assertRaises(socket.timeout):
+            self.server.receive(target)
+        self.server.MAX_OPENS_PER_WINDOW = 1  # the first request already used the budget
+        self.harness.login("other")
+        self.server.send(spammer, {"type": "open", "to": "other"})
+        self.assertIn("slow down", self.server.receive(spammer)["message"])
+
     def test_rate_limit_tables_are_pruned(self):
         self.server.MAX_TRACKED_KEYS = 10
         # time.monotonic() counts from boot on Linux, so "0" can be recent on

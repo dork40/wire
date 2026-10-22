@@ -49,6 +49,13 @@ ONLINE: dict[str, tuple[str, socket.socket, str, str, str]] = {}
 # open on someone else's client.
 PENDING_OPENS: dict[str, set[str]] = {}
 MAX_PENDING_OPENS_PER_USER = 200
+# Room-request spam: a repeat to the same person is ignored for a minute, and
+# nobody can fire off more than 20 new requests a minute.
+OPEN_REPEAT_SECONDS = 60
+OPEN_WINDOW_SECONDS = 60
+MAX_OPENS_PER_WINDOW = 20
+RECENT_OPENS: dict[str, list[float]] = {}
+LAST_OPEN: dict[tuple[str, str], float] = {}
 # A client can be sent packets by its own handler and by any number of other
 # handlers (messages, file relay, group updates).  TCP is a byte stream, so
 # concurrent sendall() calls can splice two length-prefixed packets together.
@@ -544,6 +551,20 @@ def allow_relay(sender: str, size: int) -> bool:
         return True
 
 
+def allow_open(requester: str, target: str) -> bool:
+    now = time.monotonic()
+    with LOCK:
+        if now - LAST_OPEN.get((requester, target), float("-inf")) < OPEN_REPEAT_SECONDS:
+            return False
+        if not take_attempt(RECENT_OPENS, requester, OPEN_WINDOW_SECONDS, MAX_OPENS_PER_WINDOW, now):
+            return False
+        if len(LAST_OPEN) > MAX_TRACKED_KEYS:
+            for pair in [pair for pair, stamp in LAST_OPEN.items() if now - stamp >= OPEN_REPEAT_SECONDS]:
+                LAST_OPEN.pop(pair, None)
+        LAST_OPEN[(requester, target)] = now
+        return True
+
+
 def friends_may_open(requester: str, target: str) -> bool:
     """Honour a target's "chats from friends only" preference."""
     with LOCK:
@@ -743,6 +764,8 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "error", "message": "cannot open a room with yourself"})
                 elif not friends_may_open(key, target):
                     send(sock, {"type": "error", "message": "that person only accepts chats from friends"})
+                elif not allow_open(key, target):
+                    send(sock, {"type": "error", "message": "slow down: that request was just sent, or you've sent too many"})
                 else:
                     with LOCK:
                         pending = PENDING_OPENS.setdefault(target, set())

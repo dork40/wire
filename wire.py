@@ -1551,6 +1551,10 @@ class Wire:
         self.directory_public: Optional[bytes] = None
         self.turn_configured = False
         self.history_lock = threading.Lock()
+        # Contacts are read-modify-written from the command thread and the
+        # server thread (identity pinning); without this, concurrent saves
+        # lose updates and Windows refuses the second file replace.
+        self.contacts_lock = threading.RLock()
         self.peers: dict[str, Peer] = {}
         self.room: Optional[str] = None
         self.listener: Optional[socket.socket] = None
@@ -1992,6 +1996,10 @@ class Wire:
             return empty
 
     def save_contacts(self, contacts: dict) -> None:
+        with self.contacts_lock:
+            self._save_contacts(contacts)
+
+    def _save_contacts(self, contacts: dict) -> None:
         self.require_login()
         if not self.history_key:
             raise ValueError("sign in first")
@@ -2000,6 +2008,10 @@ class Wire:
 
     def verify_peer_identity(self, name: str, public: bytes, sign_public: bytes) -> None:
         """Trust a peer on first use and reject silent identity-key changes."""
+        with self.contacts_lock:
+            self._verify_peer_identity(name, public, sign_public)
+
+    def _verify_peer_identity(self, name: str, public: bytes, sign_public: bytes) -> None:
         contacts = self.contacts()
         identities = contacts.setdefault("identities", {})
         key = name.lower()
