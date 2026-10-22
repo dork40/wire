@@ -154,6 +154,35 @@ native modules; AES-GCM and scrypt stay on pycryptodome.
 - Verifies system audio and video together through a real local DTLS-SRTP
   WebRTC session, including clean shutdown of every media thread.
 
+## What's new (next release, needs server 1.4.36)
+
+Chat
+- `/chats` lists every chat newest first with unread and `@you` counts.
+- `@name` mentions in groups are highlighted and get through a muted group.
+- `/poll`, `/vote`, `/forward`, `/schedule` (e.g. `6:30pm`), `/viewonce`
+  images, `/record` voice messages, `/timer` disappearing messages,
+  `/mute`, `/export`, `/status`, and **bold** / *italic* / `code` styling.
+- `/send` inside a group offers the file to every online member.
+- `/find <name>` searches accounts (exact matches first) and shows how you're
+  connected to each person.
+- Times are shown in 12-hour format.
+
+Privacy and security
+- Forward secrecy: 1:1 chats switch to a fresh session key that is never
+  saved, and group / offline messages use signed one-time prekeys and
+  per-message hash chains (Signal-style). A stolen identity key can't
+  decrypt earlier traffic.
+- `/password` changes your password and re-encrypts everything it protects.
+- Settings: chats from friends only, show me in search, share last seen.
+- `/trust <name>` accepts a contact's changed identity key once you've
+  checked their new fingerprint with them.
+- Fixed: anyone could force a chat open on your client, or turn on your
+  microphone with a fake call answer; peer-supplied file names could carry
+  terminal escapes or disguised extensions; and several server abuse
+  limits (per-account password guesses, sign-ups per address, offline
+  queue per sender).
+- `/api on` starts a local, token-protected bot API (this computer only).
+
 ## Private self-hosted server
 
 The `truenas-app` folder is a TrueNAS Community Apps catalog definition with
@@ -211,6 +240,20 @@ accept <username>                 accept their room request
 
 When the other person accepts, a room opens automatically. Type normally; every line is sent as a message. Use `/help`, `/leave`, and `/exit` while in a room.
 
+Everyday commands (type `/help` for the full list):
+
+```text
+/chats                        your chats, newest first, with unread counts
+/find <name>                  search for accounts
+/poll Lunch? | pizza | tacos  start a poll; /vote <code> <number>
+/record                       record a voice message (/record again to send)
+/schedule 6:30pm <text>       send later
+/timer 1h                     disappearing messages for this chat
+/mute <name> | group <name>   silence pop-ups from a chat
+/status back at 6             a short status your friends see
+/password                     change your password
+```
+
 File transfers use end-to-end encryption, bounded relay chunks, and SHA-256
 verification. The recipient must be online while a transfer is active.
 
@@ -243,7 +286,12 @@ The directory address is saved after `server <host> [port]` is used once. In a n
 Passwords are never stored in plaintext. They derive a local key that encrypts
 the X25519 and Ed25519 private identities on disk. Wire does not store a copy of
 that derived key. New accounts use scrypt with OWASP-equivalent parameters.
-Messages use an X25519 shared secret, HKDF-SHA256, and AES-256-GCM.
+Messages use an X25519 shared secret, HKDF-SHA256, and AES-256-GCM. Each 1:1
+chat then swaps ephemeral X25519 keys and switches to a session key that only
+lives in memory. Group and offline messages start a per-recipient chain from
+the recipient's signed one-time prekey and advance it with HMAC for every
+message, deleting old keys. Older clients fall back to the identity-derived
+key. New passwords must be at least 8 characters.
 
 The directory stores public identity keys and forwards encrypted packets only.
 Directory traffic uses TLS with trust-on-first-use key pinning. Peer identity
