@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
+import collections
+import secrets
 import wave
 import ctypes
 import multiprocessing as mp
@@ -428,6 +430,80 @@ def short_stamp(stamp: str, today: str) -> str:
     if stamp[:10] == today:
         return twelve_hour(int(match.group(4)), int(match.group(5)))
     return f"{MONTHS[int(match.group(2)) - 1]} {int(match.group(3))}"
+
+
+MAX_API_BODY_BYTES = 64 * 1024
+MAX_API_EVENTS = 1000
+
+
+def make_api_handler(app: "Wire", token: str, port_holder: dict):
+    """Local bot API. Only this computer can connect (127.0.0.1), every
+    request needs the token, and the Host header must be the loopback
+    address - which stops a web page using DNS rebinding to reach it."""
+    from http.server import BaseHTTPRequestHandler
+    from urllib.parse import parse_qs, urlparse
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args) -> None:
+            pass
+
+        def reply(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def allowed(self) -> bool:
+            port = port_holder.get("port")
+            if self.headers.get("Host", "") not in (f"127.0.0.1:{port}", f"localhost:{port}"):
+                self.reply(403, {"error": "wrong host"})
+                return False
+            supplied = self.headers.get("Authorization", "")
+            if not hmac.compare_digest(supplied.encode("utf-8"), f"Bearer {token}".encode("utf-8")):
+                self.reply(401, {"error": "missing or wrong token"})
+                return False
+            return True
+
+        def do_GET(self) -> None:
+            if not self.allowed():
+                return
+            url = urlparse(self.path)
+            if url.path == "/events":
+                try:
+                    after = int(parse_qs(url.query).get("after", ["0"])[0])
+                except ValueError:
+                    after = 0
+                events = [event for event in list(app.api_events) if event["seq"] > after]
+                self.reply(200, {"events": events, "last": events[-1]["seq"] if events else after})
+            elif url.path == "/chats":
+                self.reply(200, {"open": app.open_chat_key(), "unread": dict(app.unread),
+                                 "connected": sorted(app.peers), "groups": sorted(app.groups)})
+            else:
+                self.reply(404, {"error": "unknown endpoint; use /events, /chats or POST /send"})
+
+        def do_POST(self) -> None:
+            if not self.allowed():
+                return
+            if urlparse(self.path).path != "/send":
+                self.reply(404, {"error": "unknown endpoint"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_API_BODY_BYTES:
+                    raise ValueError("body must be 1 byte to 64 KB of JSON")
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(body, dict) or not isinstance(body.get("to"), str) or not isinstance(body.get("text"), str):
+                    raise ValueError('send {"to": "name or group name", "text": "..."}')
+                app.api_send(body["to"], body["text"])
+            except (ValueError, UnicodeDecodeError, OSError, ConnectionError) as exc:
+                self.reply(400, {"error": str(exc)})
+                return
+            self.reply(200, {"ok": True})
+
+    return Handler
 
 
 def ago(seconds: float) -> str:
@@ -1409,6 +1485,9 @@ class Wire:
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
         self.view_once_files: list[Path] = []
+        self.api_server = None
+        self.api_events: collections.deque = collections.deque(maxlen=MAX_API_EVENTS)
+        self.api_sequence = 0
         self.ratchet_lock = threading.RLock()
         self.prekey_waiters: dict[str, dict] = {}
         self.no_prekeys_until: dict[str, float] = {}
@@ -2684,6 +2763,46 @@ class Wire:
 
         self.start_worker(play)
         say(f"playing {path.name} ({count / rate:.0f}s)")
+
+    def start_api(self, port: int = 0) -> tuple[int, str]:
+        from http.server import ThreadingHTTPServer
+        self.require_login()
+        if self.api_server:
+            raise ValueError("the bot API is already on; /api off first")
+        token, holder = secrets.token_urlsafe(24), {}
+        server = ThreadingHTTPServer(("127.0.0.1", port), make_api_handler(self, token, holder))
+        server.daemon_threads = True
+        holder["port"] = server.server_address[1]
+        self.api_server = server
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        say(f"bot API on: http://127.0.0.1:{holder['port']}  token: {token}")
+        say("only programs on this computer can use it; send the token as 'Authorization: Bearer <token>'. /api off stops it")
+        return holder["port"], token
+
+    def stop_api(self) -> None:
+        if not self.api_server:
+            raise ValueError("the bot API is off")
+        server, self.api_server = self.api_server, None
+        server.shutdown()
+        server.server_close()
+        say("bot API off")
+
+    def api_event(self, chat: str, sender: str, text: str) -> None:
+        if self.api_server is None:
+            return
+        self.api_sequence += 1
+        self.api_events.append({"seq": self.api_sequence, "time": int(time.time()), "chat": chat.lower(),
+                                "from": sender, "text": text})
+
+    def api_send(self, to: str, text: str) -> None:
+        key = chat_key(to)
+        if key.startswith("group-"):
+            self.send_group_message(key[len("group-"):], text)
+            return
+        peer = self.peers.get(key)
+        if not peer:
+            raise ValueError(f"not connected to {key}; open a chat with them first")
+        self.send_message(peer, text)
 
     def schedule_message(self, argument: str) -> None:
         """Send later, to the chat that's open now. Runs inside this Wire
@@ -4120,6 +4239,7 @@ class Wire:
         reply_to = packet.get("reply_to") if valid_transfer_id(packet.get("reply_to")) else None
         self.record_history(peer.name, peer.name, text, message_id, reply_to)
         self.note_incoming(peer.name)
+        self.api_event(peer.name, peer.name, text)
         peer.send_control({"kind": "message_delivered", "id": message_id})
         # Wire renders incoming room messages immediately, so that is the
         # honest moment to acknowledge them as read.
@@ -4384,6 +4504,7 @@ class Wire:
         self.record_history(f"group-{group}", sender, text, message_id)
         mentioned = self.is_mentioned(text)
         self.note_incoming(f"group-{group}", mentioned)
+        self.api_event(f"group-{group}", sender, text)
         vote = VOTE_RE.fullmatch(text)
         if vote:
             say(f"\n[{safe_terminal_text(group)}] {safe_terminal_text(sender)} voted in poll {vote.group(1)}: {self.describe_poll(f'group-{group}', vote.group(1))}")
@@ -4683,6 +4804,10 @@ class Wire:
             except Exception:  # noqa: BLE001 - shutting down regardless
                 pass
             self.recording = None
+        if self.api_server:
+            self.api_server.shutdown()
+            self.api_server.server_close()
+            self.api_server = None
         for path in self.group_transfer_temps + self.view_once_files + self.voice_temp_files:
             path.unlink(missing_ok=True)
         for item in self.scheduled:
@@ -4821,6 +4946,8 @@ SETTINGS AND UTILITIES
                                       Chats from friends only.
   /settings delete                   Delete this PC's local account data.
   /password                          Change your password (re-encrypts your keys and history).
+  /api on|off                        Local bot API for your own scripts (this computer only, needs a token):
+                                      GET /events?after=N, GET /chats, POST /send {"to": "bob", "text": "hi"}
   /identity / /fingerprint <name>    Show safety fingerprints.
   /trust <name>                      Accept someone's changed identity key after checking it with them.
   /ping / /testnotify / /diagnose   Connection, notification, and capability checks.
@@ -4906,6 +5033,14 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
                 raise ValueError("use: /history <username> [ids]")
             app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "api":
+            choice = argument.strip().lower()
+            if choice == "on":
+                app.start_api()
+            elif choice == "off":
+                app.stop_api()
+            else:
+                say(f"bot API is {'on' if app.api_server else 'off'}; use /api on or /api off")
         elif command == "record":
             if argument.strip().lower() == "cancel":
                 app.finish_voice_recording(send=False)

@@ -298,6 +298,57 @@ class VoiceMessageTests(Base):
             self.app.play_voice(str(bogus))
 
 
+class BotApiTests(Base):
+    def setUp(self) -> None:
+        super().setUp()
+        self.port, self.token = self.app.start_api()
+
+    def tearDown(self) -> None:
+        if self.app.api_server:
+            self.app.stop_api()
+        super().tearDown()
+
+    def call(self, method: str, path: str, body=None, token=None, host=None):
+        import json
+        import urllib.error
+        import urllib.request
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method)
+        request.add_header("Authorization", f"Bearer {token if token is not None else self.token}")
+        if host:
+            request.add_header("Host", host)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_token_and_host_are_required(self):
+        self.assertEqual(self.call("GET", "/events", token="wrong")[0], 401)
+        self.assertEqual(self.call("GET", "/events", host="evil.example:80")[0], 403)
+
+    def test_events_and_sending(self):
+        self.app.api_event("bob", "bob", "ping")
+        self.app.api_event("group-crew", "carol", "hello all")
+        status, reply = self.call("GET", "/events?after=0")
+        self.assertEqual(status, 200)
+        self.assertEqual([(e["chat"], e["text"]) for e in reply["events"]], [("bob", "ping"), ("group-crew", "hello all")])
+        self.assertEqual(self.call("GET", f"/events?after={reply['last']}")[1]["events"], [])
+
+        self.assertEqual(self.call("POST", "/send", {"to": "bob", "text": "pong"})[0], 200)
+        self.assertEqual(self.bob.sent[-1], "pong")
+        self.assertEqual(self.call("POST", "/send", {"to": "group crew", "text": "hi crew"})[0], 200)
+        self.assertEqual(self.group_sent[-1], ("crew", "hi crew"))
+
+    def test_bad_requests_are_refused(self):
+        self.assertEqual(self.call("POST", "/send", {"to": "stranger", "text": "x"})[0], 400)
+        self.assertEqual(self.call("POST", "/send", {"text": "missing to"})[0], 400)
+        self.assertEqual(self.call("GET", "/nope")[0], 404)
+
+    def test_only_listens_on_this_computer(self):
+        self.assertEqual(self.app.api_server.server_address[0], "127.0.0.1")
+
+
 class LastSeenTests(Base):
     def test_friends_list_shows_last_seen_for_offline_friends(self):
         self.app.server = object()
