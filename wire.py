@@ -399,6 +399,37 @@ MAX_SCHEDULE_SECONDS = 7 * 86400
 MAX_SCHEDULED_MESSAGES = 50
 
 
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def twelve_hour(hour: int, minute: int) -> str:
+    """6:04 PM - built by hand so it doesn't depend on the system locale."""
+    return f"{hour % 12 or 12}:{minute:02d} {'AM' if hour < 12 else 'PM'}"
+
+
+def clock_text(epoch: float, with_day: bool = False) -> str:
+    local = time.localtime(epoch)
+    text = twelve_hour(local.tm_hour, local.tm_min)
+    return f"{WEEKDAYS[local.tm_wday]} {text}" if with_day else text
+
+
+def stamp_text(stamp: str) -> str:
+    """Saved "2026-10-22 18:04" -> "2026-10-22 6:04 PM" for display."""
+    match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2})", stamp)
+    return f"{match.group(1)} {twelve_hour(int(match.group(2)), int(match.group(3)))}" if match else stamp
+
+
+def short_stamp(stamp: str, today: str) -> str:
+    """6:04 PM for today, Oct 21 for earlier days."""
+    match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2})", stamp)
+    if not match:
+        return stamp
+    if stamp[:10] == today:
+        return twelve_hour(int(match.group(4)), int(match.group(5)))
+    return f"{MONTHS[int(match.group(2)) - 1]} {int(match.group(3))}"
+
+
 def ago(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds < 60:
@@ -418,11 +449,17 @@ def parse_when(value: str, now: Optional[float] = None) -> float:
     if relative:
         delay = int(relative.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[relative.group(2)]
     else:
+        twelve = re.fullmatch(r"(1[0-2]|0?[1-9])(?::([0-5]\d))?\s*([ap])\.?m\.?", value)
         clock = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value)
-        if not clock:
-            raise ValueError("when must look like 10m, 2h, 1d or 18:30")
+        if twelve:
+            hour = int(twelve.group(1)) % 12 + (12 if twelve.group(3) == "p" else 0)
+            minute = int(twelve.group(2) or 0)
+        elif clock:
+            hour, minute = int(clock.group(1)), int(clock.group(2))
+        else:
+            raise ValueError("when must look like 10m, 2h, 1d, 6:30pm or 18:30")
         local = time.localtime(now)
-        target = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, int(clock.group(1)), int(clock.group(2)), 0, 0, 0, -1))
+        target = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, hour, minute, 0, 0, 0, -1))
         delay = target - now if target > now else target + 86400 - now
     if not 0 < delay <= MAX_SCHEDULE_SECONDS:
         raise ValueError("schedule between a few seconds and 7 days ahead")
@@ -2364,8 +2401,8 @@ class Wire:
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"{key}-{time.strftime('%Y%m%d-%H%M%S')}.txt"
         lines = [f"Wire chat export: {key.replace('group-', 'group ', 1)}",
-                 f"Exported {time.strftime('%Y-%m-%d %H:%M')} by {self.name}. Only messages saved on this device are included.", ""]
-        lines += [f"[{safe_terminal_text(record.get('at', '?'))}] {self.render_record(record, styled=False)}" for record in records if isinstance(record, dict)]
+                 f"Exported {time.strftime('%Y-%m-%d')} {clock_text(time.time())} by {self.name}. Only messages saved on this device are included.", ""]
+        lines += [f"[{stamp_text(safe_terminal_text(record.get('at', '?')))}] {self.render_record(record, styled=False)}" for record in records if isinstance(record, dict)]
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         say(f"exported {len(lines) - 3} messages to {path}")
         return path
@@ -2475,7 +2512,7 @@ class Wire:
             new, mentions = self.unread.get(key, 0), self.unread_mentions.get(key, 0)
             badge = (f"{new} new" if new else "") + (f", {mentions} @you" if mentions else "")
             at = str((last or {}).get("at", ""))
-            when = at[11:] if at[:10] == today else at[:10]
+            when = short_stamp(at, today)
             preview = self.render_record(last, styled=False).replace("\n", " ")[:50] if last else ""
             say(f"{'>' if key == open_key else ' '} {label:<22} {badge:<16} {when:<10} {preview}")
         say("open <name> / /room <name> for a person, /group open <name> for a group")
@@ -2646,9 +2683,11 @@ class Wire:
     def schedule_message(self, argument: str) -> None:
         """Send later, to the chat that's open now. Runs inside this Wire
         session, so it's only sent if Wire is still running at that time."""
-        pieces = argument.split(maxsplit=1)
+        # "6:30 pm hello" - keep a spaced am/pm with the time, not the message.
+        match = re.match(r"\s*(\d{1,2}(?::[0-5]\d)?\s+[aApP]\.?[mM]\.?(?=\s)|\S+)\s+(.+)", argument, re.DOTALL)
+        pieces = [match.group(1), match.group(2)] if match else []
         if len(pieces) != 2:
-            raise ValueError("use: /schedule <10m | 2h | 18:30> <message>")
+            raise ValueError("use: /schedule <10m | 2h | 6:30pm> <message>")
         key = self.open_chat_key()
         if not key:
             raise ValueError("open the chat you want to send it to first")
@@ -2662,7 +2701,7 @@ class Wire:
         item["timer"].daemon = True
         self.scheduled.append(item)
         item["timer"].start()
-        say(f"scheduled {item['id']} for {time.strftime('%a %H:%M', time.localtime(when))} to {key.replace('group-', 'group ', 1)}")
+        say(f"scheduled {item['id']} for {clock_text(when, with_day=True)} to {key.replace('group-', 'group ', 1)}")
 
     def send_scheduled(self, item: dict) -> None:
         if item not in self.scheduled:
@@ -2687,7 +2726,7 @@ class Wire:
             return
         say("SCHEDULED")
         for item in sorted(self.scheduled, key=lambda entry: entry["at"]):
-            when = time.strftime("%a %H:%M", time.localtime(item["at"]))
+            when = clock_text(item["at"], with_day=True)
             say(f"  {item['id']}  {when}  to {item['key'].replace('group-', 'group ', 1)}: {safe_terminal_text(item['text'])[:60]}")
 
     def unschedule(self, code: str) -> None:
@@ -4728,7 +4767,7 @@ CHAT
   /chats                             All chats, newest first, with unread counts and @mentions.
   /poll <question> | <a> | <b> ...   Start a poll in the open chat (2-10 options).
   /vote <code> <number> / /poll results <code>
-  /schedule <10m|2h|18:30> <text>    Send later to the open chat (while Wire is running).
+  /schedule <10m|2h|6:30pm> <text>   Send later to the open chat (while Wire is running).
   /scheduled / /unschedule <code>    List or cancel scheduled messages.
   /forward <code> <name | group name>
                                       Forward a message from the open chat.

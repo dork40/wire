@@ -126,6 +126,32 @@ class ScheduleTests(Base):
             with self.assertRaises(ValueError):
                 wire.parse_when(bad, now)
 
+    def test_twelve_hour_times(self):
+        self.assertEqual([wire.twelve_hour(h, 5) for h in (0, 9, 12, 18, 23)],
+                         ["12:05 AM", "9:05 AM", "12:05 PM", "6:05 PM", "11:05 PM"])
+        self.assertEqual(wire.stamp_text("2026-10-22 18:04"), "2026-10-22 6:04 PM")
+        self.assertEqual(wire.short_stamp("2026-10-22 00:30", "2026-10-22"), "12:30 AM")
+        self.assertEqual(wire.short_stamp("2026-10-21 18:04", "2026-10-22"), "Oct 21")
+
+    def test_schedule_accepts_am_pm(self):
+        now = time.mktime((2026, 10, 22, 17, 0, 0, 0, 0, -1))
+        self.assertEqual(wire.parse_when("6:30pm", now), now + 5400)
+        self.assertEqual(wire.parse_when("6:30 p.m.", now), now + 5400)
+        self.assertEqual(wire.parse_when("12am", now), now + 7 * 3600)       # midnight
+        self.assertEqual(wire.parse_when("9am", now), now + 16 * 3600)       # tomorrow morning
+        with self.assertRaises(ValueError):
+            wire.parse_when("13pm", now)
+
+    def test_schedule_with_a_spaced_pm_keeps_the_message_intact(self):
+        self.app.room = "bob"
+        wire.run_command(self.app, "schedule", "11:59 pm see you tomorrow")
+        item = self.app.scheduled[-1]
+        self.assertEqual(item["text"], "see you tomorrow")
+        self.lines.clear()
+        self.app.show_scheduled()
+        self.assertRegex("\n".join(self.lines), r"\w{3} 11:59 PM")
+        wire.run_command(self.app, "unschedule", item["id"])
+
     def test_scheduled_message_is_sent_listed_and_cancellable(self):
         self.app.room = "bob"
         wire.run_command(self.app, "schedule", "1s good morning")
