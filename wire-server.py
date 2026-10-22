@@ -37,6 +37,8 @@ GROUPS_FILE = STATE / "groups.json"
 BACKUPS_FILE = STATE / "identity-backups.json"
 QUEUES_FILE = STATE / "offline-queue.json"
 SYNC_FILE = STATE / "encrypted-sync.json"
+PREKEYS_FILE = STATE / "prekeys.json"
+MAX_ONE_TIME_PREKEYS = 100
 BACKUP_DIR = Path(os.environ["WIRE_BACKUP_DIR"]) if os.environ.get("WIRE_BACKUP_DIR") else None
 BACKUP_INTERVAL_SECONDS = max(900, int(os.environ.get("WIRE_BACKUP_INTERVAL", "21600")))
 BACKUP_RETAIN = max(2, min(365, int(os.environ.get("WIRE_BACKUP_RETAIN", "28"))))
@@ -92,7 +94,7 @@ STARTED_AT = time.time()
 
 def state_file_names() -> tuple[str, ...]:
     return ("users.json", "groups.json", "identity-backups.json", "offline-queue.json",
-            "encrypted-sync.json", "server-signing-key", "server-certificate.pem", "server-tls-key.pem")
+            "encrypted-sync.json", "prekeys.json", "server-signing-key", "server-certificate.pem", "server-tls-key.pem")
 
 
 def create_state_backup() -> Path | None:
@@ -324,6 +326,41 @@ def load_sync() -> dict:
 
 def save_sync(value: dict) -> None:
     replace_private_json(SYNC_FILE, json.dumps(value, separators=(",", ":")))
+
+
+def load_prekeys() -> dict:
+    try:
+        value = json.loads(PREKEYS_FILE.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_prekeys(value: dict) -> None:
+    replace_private_json(PREKEYS_FILE, json.dumps(value, separators=(",", ":")))
+
+
+def prekey_signature_bytes(owner: str, key_id: str, public: bytes) -> bytes:
+    return b"wire-prekey-v1\0" + owner.lower().encode("utf-8") + b"\0" + key_id.encode("ascii") + b"\0" + public
+
+
+def valid_prekey(item: object, owner: str, sign_public: str) -> bool:
+    """A public prekey the owner really signed - only ever public halves."""
+    if not isinstance(item, dict) or set(item) != {"id", "public", "signature"}:
+        return False
+    key_id, public, signature = item["id"], item["public"], item["signature"]
+    if not isinstance(key_id, str) or len(key_id) != 16 or any(char not in "0123456789abcdef" for char in key_id):
+        return False
+    try:
+        public_raw = base64.b64decode(str(public).encode("ascii"), validate=True)
+        signature_raw = base64.b64decode(str(signature).encode("ascii"), validate=True)
+        if len(public_raw) != 32 or len(signature_raw) != 64:
+            return False
+        ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(sign_public.encode("ascii"), validate=True)).verify(
+            signature_raw, prekey_signature_bytes(owner, key_id, public_raw))
+    except Exception:
+        return False
+    return True
 
 
 def valid_sync_blob(value: object) -> bool:
@@ -844,6 +881,44 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     send(sock, {"type": "sync_saved", "kind": "message"})
                 else:
                     send(sock, {"type": "error", "message": "encrypted sync storage is full"})
+            elif kind == "prekeys_put":
+                signed, one_time = packet.get("signed"), packet.get("one_time", [])
+                if (not valid_prekey(signed, name, sign_public) or not isinstance(one_time, list)
+                        or len(one_time) > MAX_ONE_TIME_PREKEYS
+                        or not all(valid_prekey(item, name, sign_public) for item in one_time)):
+                    send(sock, {"type": "error", "message": "invalid prekeys"})
+                    continue
+                with LOCK:
+                    store = load_prekeys()
+                    entry = store.get(key) if isinstance(store.get(key), dict) else {}
+                    existing = [] if packet.get("replace") else [item for item in entry.get("one_time", []) if isinstance(item, dict)]
+                    store[key] = {"signed": signed, "one_time": (existing + one_time)[-MAX_ONE_TIME_PREKEYS:]}
+                    save_prekeys(store)
+                    count = len(store[key]["one_time"])
+                send(sock, {"type": "prekeys_saved", "one_time": count})
+            elif kind == "prekey_fetch":
+                request, wanted = packet.get("id"), packet.get("users", [])
+                if not isinstance(request, str) or len(request) > 64 or not isinstance(wanted, list):
+                    send(sock, {"type": "error", "message": "invalid prekey request"})
+                    continue
+                wanted_keys = list(dict.fromkeys(item.lower() for item in wanted[:MAX_GROUP_MEMBERS] if isinstance(item, str)))
+                bundles = {}
+                with LOCK:
+                    # Only people you share a group with: otherwise anyone
+                    # could drain someone's one-time keys.
+                    shared = {member for group in load_groups().values() if isinstance(group, dict)
+                              and key in group.get("members", []) for member in group.get("members", [])}
+                    store, changed = load_prekeys(), False
+                    for target in wanted_keys:
+                        entry = store.get(target)
+                        if target == key or target not in shared or not isinstance(entry, dict):
+                            continue
+                        one_time = entry.get("one_time", [])
+                        bundles[target] = {"signed": entry.get("signed"), "one_time": one_time.pop(0) if one_time else None}
+                        changed = changed or bundles[target]["one_time"] is not None
+                    if changed:
+                        save_prekeys(store)
+                send(sock, {"type": "prekeys", "id": request, "bundles": bundles})
             elif kind == "sync_delete_message":
                 message_id = packet.get("id")
                 if isinstance(message_id, str) and len(message_id) == 32 and all(char in "0123456789abcdef" for char in message_id):

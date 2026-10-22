@@ -14,13 +14,15 @@ class TempAccount(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
         root = Path(self._temp.name)
-        names = ("USERS", "HISTORY_DIR", "CONTACTS_DIR", "SETTINGS_FILE", "DOWNLOADS_DIR")
+        names = ("USERS", "HISTORY_DIR", "CONTACTS_DIR", "SETTINGS_FILE", "DOWNLOADS_DIR", "RATCHET_DIR", "TRANSFER_TEMP_DIR")
         self._saved = {name: getattr(wire, name) for name in names}
         wire.USERS = root / "users.json"
         wire.HISTORY_DIR = root / "history"
         wire.CONTACTS_DIR = root / "contacts"
         wire.SETTINGS_FILE = root / "settings.json"
         wire.DOWNLOADS_DIR = root / "Downloads"
+        wire.RATCHET_DIR = root / "ratchets"
+        wire.TRANSFER_TEMP_DIR = root / "transfer-temp"
         self._old_say = wire.say
         self.lines: list[str] = []
         wire.say = self.lines.append

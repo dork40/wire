@@ -23,11 +23,12 @@ class TwoClientHarness(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
         root = Path(self._temp.name)
-        names = ("USERS", "HISTORY_DIR", "CONTACTS_DIR", "SETTINGS_FILE", "DOWNLOADS_DIR")
+        names = ("USERS", "HISTORY_DIR", "CONTACTS_DIR", "SETTINGS_FILE", "DOWNLOADS_DIR", "RATCHET_DIR", "TRANSFER_TEMP_DIR")
         self._saved = {name: getattr(wire, name) for name in names}
         self._saved_funcs = (wire.recv_frame, wire.say, wire.toast)
         wire.USERS, wire.HISTORY_DIR, wire.CONTACTS_DIR = root / "users.json", root / "history", root / "contacts"
         wire.SETTINGS_FILE, wire.DOWNLOADS_DIR = root / "settings.json", root / "Downloads"
+        wire.RATCHET_DIR, wire.TRANSFER_TEMP_DIR = root / "ratchets", root / "transfer-temp"
         wire.say = lambda _line: None
         wire.toast = lambda _text: None
         wire.recv_frame = self.fake_recv

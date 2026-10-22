@@ -144,6 +144,7 @@ SERVER_CONFIG = DATA / "server.json"
 HISTORY_DIR = DATA / "history"
 CONTACTS_DIR = DATA / "contacts"
 SETTINGS_FILE = DATA / "settings.json"
+RATCHET_DIR = DATA / "ratchets"
 DIRECTORY_KEYS_FILE = DATA / "directory-keys.json"
 
 
@@ -426,6 +427,45 @@ def parse_when(value: str, now: Optional[float] = None) -> float:
     if not 0 < delay <= MAX_SCHEDULE_SECONDS:
         raise ValueError("schedule between a few seconds and 7 days ahead")
     return now + delay
+
+
+# Forward secrecy for group (and offline) messages, Signal-style: everyone
+# uploads signed one-time prekeys; a sender starts a per-recipient chain from
+# one, and every message advances the chain and deletes the old step.
+PREKEY_SERVER_VERSION = "1.4.36"
+ONE_TIME_PREKEYS_PER_UPLOAD = 50
+MAX_LOCAL_ONE_TIME_PREKEYS = 300
+SIGNED_PREKEY_ROTATE_SECONDS = 7 * 86400
+SIGNED_PREKEY_KEEP_SECONDS = 14 * 86400
+CHAIN_MAX_MESSAGES = 500
+CHAIN_MAX_AGE_SECONDS = 7 * 86400
+MAX_SKIPPED_KEYS = 200
+MAX_CHAIN_JUMP = 1000
+NO_PREKEYS_RETRY_SECONDS = 600
+HEX16_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def prekey_signature_bytes(owner: str, key_id: str, public: bytes) -> bytes:
+    return b"wire-prekey-v1\0" + owner.lower().encode("utf-8") + b"\0" + key_id.encode("ascii") + b"\0" + public
+
+
+def chain_step(chain_key: bytes) -> tuple[bytes, bytes]:
+    """(next chain key, this message's key) - one-way, so old keys can't be rebuilt."""
+    return hmac.new(chain_key, b"\x02", hashlib.sha256).digest(), hmac.new(chain_key, b"\x01", hashlib.sha256).digest()
+
+
+def chain_root(shared: bytes, pair_key: bytes, sender: str, recipient: str, ephemeral: bytes, prekey: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=pair_key,
+                info=b"wire-v2-chain\0" + sender.lower().encode("utf-8") + b"\0" + recipient.lower().encode("utf-8")
+                + b"\0" + ephemeral + prekey).derive(shared)
+
+
+def group_aad(chain_id: str, index: int) -> bytes:
+    return b"wire-v2-group\0" + chain_id.encode("ascii") + b"\0" + str(index).encode("ascii")
+
+
+def raw_x25519_public(private: object) -> bytes:
+    return private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
 
 
 def timer_label(seconds: int) -> str:
@@ -1332,6 +1372,9 @@ class Wire:
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
         self.view_once_files: list[Path] = []
+        self.ratchet_lock = threading.RLock()
+        self.prekey_waiters: dict[str, dict] = {}
+        self.no_prekeys_until: dict[str, float] = {}
         self.recording: Optional[dict] = None
         self.voice_temp_files: list[Path] = []
         self.scheduled: list[dict] = []
@@ -1534,6 +1577,8 @@ class Wire:
             owned = list(HISTORY_DIR.glob(f"{self.name.lower()}--*.wire")) if HISTORY_DIR.exists() else []
             if self.contacts_path().exists():
                 owned.append(self.contacts_path())
+            if self.ratchet_path().exists():
+                owned.append(self.ratchet_path())
             rewritten = {}
             for path in owned:
                 try:
@@ -2206,6 +2251,7 @@ class Wire:
         for path in HISTORY_DIR.glob(f"{self.name.lower()}--*.wire"):
             path.unlink(missing_ok=True)
         self.contacts_path().unlink(missing_ok=True)
+        self.ratchet_path().unlink(missing_ok=True)
         say(f"deleted local account {self.name}; the username remains reserved on Wire")
         self.close()
 
@@ -2651,6 +2697,180 @@ class Wire:
         item["timer"].cancel()
         self.scheduled.remove(item)
         say(f"cancelled scheduled message {item['id']}")
+
+    def ratchet_path(self) -> Path:
+        self.require_login()
+        return RATCHET_DIR / f"{self.name.lower()}.wire"
+
+    def load_ratchets(self) -> dict:
+        state = {"prekeys": {}, "signed": None, "old_signed": [], "send": {}, "recv": {}}
+        if not self.history_key or not self.ratchet_path().exists():
+            return state
+        try:
+            saved = json.loads(Fernet(self.history_key).decrypt(self.ratchet_path().read_bytes()).decode("utf-8"))
+        except (InvalidToken, ValueError):
+            return state
+        if isinstance(saved, dict):
+            state.update({name: value for name, value in saved.items() if name in state})
+        return state
+
+    def save_ratchets(self, state: dict) -> None:
+        replace_private_bytes(self.ratchet_path(), Fernet(self.history_key).encrypt(json.dumps(state, separators=(",", ":")).encode("utf-8")))
+
+    def supports_prekeys(self) -> bool:
+        return bool(self.server and self.sign_private and self.history_key
+                    and version_parts(self.server_version or "0") >= version_parts(PREKEY_SERVER_VERSION))
+
+    @staticmethod
+    def new_prekey() -> dict:
+        private = x25519.X25519PrivateKey.generate()
+        raw = private.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+        return {"id": os.urandom(8).hex(), "private": b64(raw)}
+
+    def public_prekey(self, item: dict) -> dict:
+        public = raw_x25519_public(x25519.X25519PrivateKey.from_private_bytes(unb64(item["private"])))
+        signature = self.sign_private.sign(prekey_signature_bytes(self.name, item["id"], public))
+        return {"id": item["id"], "public": b64(public), "signature": b64(signature)}
+
+    def publish_prekeys(self) -> None:
+        """Upload fresh one-time prekeys (and rotate the signed one weekly).
+        Older private halves are kept for a while so messages queued while
+        we were offline can still be opened."""
+        if not self.supports_prekeys():
+            return
+        now = int(time.time())
+        with self.ratchet_lock:
+            state = self.load_ratchets()
+            signed = state.get("signed")
+            old_signed = [item for item in state.get("old_signed", []) if isinstance(item, dict) and int(item.get("retire_at", 0)) > now]
+            if not isinstance(signed, dict) or now - int(signed.get("created", 0)) > SIGNED_PREKEY_ROTATE_SECONDS:
+                if isinstance(signed, dict):
+                    old_signed.append(dict(signed, retire_at=now + SIGNED_PREKEY_KEEP_SECONDS))
+                signed = dict(self.new_prekey(), created=now)
+            fresh = [self.new_prekey() for _ in range(ONE_TIME_PREKEYS_PER_UPLOAD)]
+            prekeys = dict(state.get("prekeys", {}))
+            prekeys.update({item["id"]: item["private"] for item in fresh})
+            state.update(signed=signed, old_signed=old_signed,
+                         prekeys=dict(list(prekeys.items())[-MAX_LOCAL_ONE_TIME_PREKEYS:]))
+            self.save_ratchets(state)
+        try:
+            self.server_send({"type": "prekeys_put", "replace": True, "signed": self.public_prekey(signed),
+                              "one_time": [self.public_prekey(item) for item in fresh]})
+        except (OSError, ConnectionError):
+            pass
+
+    def fetch_prekey_bundles(self, names: list[str]) -> dict:
+        request = uuid.uuid4().hex
+        waiter = {"event": threading.Event(), "bundles": {}}
+        self.prekey_waiters[request] = waiter
+        try:
+            self.server_send({"type": "prekey_fetch", "id": request, "users": names})
+            waiter["event"].wait(5)
+        finally:
+            self.prekey_waiters.pop(request, None)
+        return waiter["bundles"]
+
+    @staticmethod
+    def chain_usable(chain: object, now: float) -> bool:
+        return (isinstance(chain, dict) and int(chain.get("n", 0)) < CHAIN_MAX_MESSAGES
+                and now - int(chain.get("created", 0)) <= CHAIN_MAX_AGE_SECONDS)
+
+    def new_send_chain(self, member: dict, pair_key: bytes, bundle: object) -> Optional[dict]:
+        """Start a chain to one member from one of their signed prekeys."""
+        if not isinstance(bundle, dict):
+            return None
+        kind, prekey = ("one_time", bundle.get("one_time")) if isinstance(bundle.get("one_time"), dict) else ("signed", bundle.get("signed"))
+        try:
+            key_id, public = prekey["id"], unb64(prekey["public"])
+            if not HEX16_RE.fullmatch(key_id) or len(public) != 32:
+                return None
+            ed25519.Ed25519PublicKey.from_public_bytes(unb64(member["sign_public"])).verify(
+                unb64(prekey["signature"]), prekey_signature_bytes(member["name"], key_id, public))
+        except Exception:
+            return None  # unsigned or forged prekey: fall back rather than trust it
+        ephemeral = x25519.X25519PrivateKey.generate()
+        ephemeral_public = raw_x25519_public(ephemeral)
+        root_key = chain_root(ephemeral.exchange(x25519.X25519PublicKey.from_public_bytes(public)),
+                              pair_key, self.name, member["name"], ephemeral_public, public)
+        return {"id": os.urandom(8).hex(), "chain": b64(root_key), "n": 0, "created": int(time.time()),
+                "header": {"eph": b64(ephemeral_public), "prekey": key_id, "kind": kind}}
+
+    def chained_group_packet(self, member: dict, pair_key: bytes, text: str, message_id: str, bundles: dict) -> Optional[dict]:
+        name, now = member["name"].lower(), time.time()
+        with self.ratchet_lock:
+            state = self.load_ratchets()
+            chain = state["send"].get(name)
+            if not self.chain_usable(chain, now):
+                chain = self.new_send_chain(member, pair_key, bundles.get(name))
+                if chain is None:
+                    return None
+            index = int(chain["n"])
+            next_key, message_key = chain_step(unb64(chain["chain"]))
+            chain.update(chain=b64(next_key), n=index + 1)
+            state["send"][name] = chain
+            self.save_ratchets(state)
+        nonce = os.urandom(12)
+        data = AESGCM(message_key).encrypt(nonce, text.encode("utf-8"), group_aad(chain["id"], index))
+        return {"type": "msg2", "id": message_id, "chain": chain["id"], "n": index, "header": chain["header"],
+                "nonce": b64(nonce), "data": b64(data)}
+
+    def open_receive_chain(self, state: dict, sender: str, pair_key: bytes, header: object) -> Optional[bytes]:
+        if not isinstance(header, dict) or not isinstance(header.get("prekey"), str) or not HEX16_RE.fullmatch(header["prekey"]):
+            return None
+        try:
+            ephemeral = unb64(str(header.get("eph", "")))
+        except (ValueError, binascii.Error):
+            return None
+        if len(ephemeral) != 32:
+            return None
+        key_id = header["prekey"]
+        private_text = state["prekeys"].pop(key_id, None)  # one-time: gone once used
+        if private_text is None:
+            for signed in [state.get("signed"), *state.get("old_signed", [])]:
+                if isinstance(signed, dict) and signed.get("id") == key_id:
+                    private_text = signed["private"]
+        if private_text is None:
+            return None
+        private = x25519.X25519PrivateKey.from_private_bytes(unb64(private_text))
+        return chain_root(private.exchange(x25519.X25519PublicKey.from_public_bytes(ephemeral)),
+                          pair_key, sender, self.name, ephemeral, raw_x25519_public(private))
+
+    def decrypt_chained_packet(self, sender: str, pair_key: bytes, packet: dict) -> Optional[str]:
+        chain_id, index = packet.get("chain"), packet.get("n")
+        if (not isinstance(chain_id, str) or not HEX16_RE.fullmatch(chain_id) or not isinstance(index, int)
+                or isinstance(index, bool) or not 0 <= index < CHAIN_MAX_MESSAGES * 2):
+            return None
+        with self.ratchet_lock:
+            state = self.load_ratchets()
+            current = state["recv"].get(sender.lower())
+            if not isinstance(current, dict) or current.get("id") != chain_id:
+                root_key = self.open_receive_chain(state, sender, pair_key, packet.get("header"))
+                if root_key is None:
+                    return None
+                current = {"id": chain_id, "chain": b64(root_key), "n": 0, "skipped": {}}
+            chain_key, position, skipped = unb64(current["chain"]), int(current["n"]), dict(current.get("skipped", {}))
+            if index < position:
+                saved = skipped.pop(str(index), None)  # out-of-order arrival; replays find nothing
+                if saved is None:
+                    return None
+                message_key = unb64(saved)
+            else:
+                if index - position > MAX_CHAIN_JUMP:
+                    return None
+                while position < index:
+                    chain_key, skipped_key = chain_step(chain_key)
+                    skipped[str(position)] = b64(skipped_key)
+                    position += 1
+                chain_key, message_key = chain_step(chain_key)
+                position += 1
+                skipped = dict(list(skipped.items())[-MAX_SKIPPED_KEYS:])
+            try:
+                text = AESGCM(message_key).decrypt(unb64(packet["nonce"]), unb64(packet["data"]), group_aad(chain_id, index)).decode("utf-8")
+            except Exception:
+                return None  # nothing saved: a bad packet can't burn a prekey or desync the chain
+            state["recv"][sender.lower()] = {"id": chain_id, "chain": b64(chain_key), "n": position, "skipped": skipped}
+            self.save_ratchets(state)
+        return text
 
     def search_history(self, query: str) -> None:
         """Search locally decrypted history; this never contacts the directory."""
@@ -3965,6 +4185,7 @@ class Wire:
             self.backup_identity()
             version = reply.get("version")
             self.server_version = version if isinstance(version, str) else ""
+            self.start_worker(self.publish_prekeys)
             say(f"username directory online{f' (server {version})' if isinstance(version, str) else ' (old server)' }")
         except Exception:
             sock.close()
@@ -4064,11 +4285,29 @@ class Wire:
             raise ValueError("unknown group; use group list first")
         packets: dict[str, dict] = {}
         message_id = uuid.uuid4().hex
-        for member in group.get("members", []):
-            name, public, sign_public_value, identity_signature = member.get("name"), member.get("public"), member.get("sign_public"), member.get("identity_signature")
-            if not isinstance(name, str) or not isinstance(public, str) or not isinstance(sign_public_value, str) or not isinstance(identity_signature, str) or name.lower() == self.name.lower():
-                continue
+        members = [member for member in group.get("members", []) if isinstance(member, dict)
+                   and all(isinstance(member.get(field), str) for field in ("name", "public", "sign_public", "identity_signature"))
+                   and member["name"].lower() != self.name.lower()]
+        bundles: dict = {}
+        chained = self.supports_prekeys()
+        if chained:
+            now = time.time()
+            with self.ratchet_lock:
+                sending = self.load_ratchets()["send"]
+            needed = [member["name"].lower() for member in members if not self.chain_usable(sending.get(member["name"].lower()), now)
+                      and self.no_prekeys_until.get(member["name"].lower(), 0) <= now]
+            if needed:
+                bundles = self.fetch_prekey_bundles(needed)
+                for name in needed:
+                    if not isinstance(bundles.get(name), dict):
+                        self.no_prekeys_until[name] = now + NO_PREKEYS_RETRY_SECONDS  # older client: retry later
+        for member in members:
+            name, public, sign_public_value, identity_signature = member["name"], member["public"], member["sign_public"], member["identity_signature"]
             peer = self.relay_peer(name, public, sign_public_value, identity_signature)
+            packet = self.chained_group_packet(member, peer.key, text, message_id, bundles) if chained else None
+            if packet is not None:
+                packets[name.lower()] = packet
+                continue
             nonce = os.urandom(12)
             data = AESGCM(peer.key).encrypt(nonce, text.encode("utf-8"), b"wire-v1-message")
             packets[name.lower()] = {"type": "msg", "id": message_id, "nonce": b64(nonce), "data": b64(data)}
@@ -4083,9 +4322,16 @@ class Wire:
             return
         try:
             peer = self.relay_peer(sender, public, sign_public_value, identity_signature)
-            if encrypted.get("type") != "msg":
+            if encrypted.get("type") == "msg2":
+                text = self.decrypt_chained_packet(sender, peer.key, encrypted)
+                if text is None:
+                    say(f"\n[{safe_terminal_text(group)}] a message from {safe_terminal_text(sender)} couldn't be opened on this device "
+                        "(sent to your other device, or a repeat)")
+                    return
+            elif encrypted.get("type") == "msg":
+                text = peer.decrypt(unb64(encrypted["nonce"]), unb64(encrypted["data"]), b"wire-v1-message").decode("utf-8")
+            else:
                 return
-            text = peer.decrypt(unb64(encrypted["nonce"]), unb64(encrypted["data"]), b"wire-v1-message").decode("utf-8")
             if len(text) > MAX_MESSAGE_CHARS:
                 return
         except Exception:
@@ -4255,6 +4501,13 @@ class Wire:
                     share_id = packet.get("id", "")
                     if isinstance(share_id, str):
                         self.stop_share_id(share_id, remote=True)
+                elif kind == "prekeys":
+                    waiter = self.prekey_waiters.get(packet.get("id")) if isinstance(packet.get("id"), str) else None
+                    if waiter:
+                        waiter["bundles"] = packet.get("bundles") if isinstance(packet.get("bundles"), dict) else {}
+                        waiter["event"].set()
+                elif kind == "prekeys_saved":
+                    pass
                 elif kind == "status_saved":
                     saved = safe_terminal_text(packet.get("status", "")).strip()
                     say(f"status set: {saved}" if saved else "status cleared")

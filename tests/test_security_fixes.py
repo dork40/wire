@@ -25,11 +25,14 @@ class ServerHarness:
         self.server.QUEUES_FILE = state / "offline-queue.json"
         self.server.BACKUPS_FILE = state / "identity-backups.json"
         self.server.SYNC_FILE = state / "encrypted-sync.json"
+        self.server.PREKEYS_FILE = state / "prekeys.json"
+        self.signing: dict[str, ed25519.Ed25519PrivateKey] = {}
         self.workers: list[threading.Thread] = []
         self.clients: list[socket.socket] = []
 
     def login(self, name: str) -> socket.socket:
         signing = ed25519.Ed25519PrivateKey.generate()
+        self.signing[name] = signing
         public = base64.b64encode(name.encode().ljust(32, b"x")[:32]).decode("ascii")
         sign_public = base64.b64encode(signing.public_key().public_bytes_raw()).decode("ascii")
         client, service = socket.socketpair()
