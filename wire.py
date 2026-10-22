@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import wave
 import ctypes
 import multiprocessing as mp
 import queue
@@ -390,6 +391,9 @@ def format_text(text: str) -> str:
 
 
 VIEW_ONCE_SECONDS = 60
+VOICE_SAMPLE_RATE = 16000  # speech-quality mono: ~32 KB per second
+MAX_VOICE_SECONDS = 120
+VOICE_MESSAGE_RE = re.compile(r"voice-\d{8}-\d{6}(?: \(\d+\))?\.wav")
 MAX_SCHEDULE_SECONDS = 7 * 86400
 MAX_SCHEDULED_MESSAGES = 50
 
@@ -1328,6 +1332,8 @@ class Wire:
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
         self.view_once_files: list[Path] = []
+        self.recording: Optional[dict] = None
+        self.voice_temp_files: list[Path] = []
         self.scheduled: list[dict] = []
         # chat key ("bob" / "group-crew") -> messages / @mentions that arrived
         # while a different chat was open.
@@ -2514,6 +2520,83 @@ class Wire:
             self.send_message(peer, text)
         say(f"forwarded to {target.replace('group-', 'group ', 1)}")
 
+    def start_voice_recording(self) -> None:
+        if sd is None:
+            raise ValueError("voice messages need the voice packages, which are not installed on this device")
+        key = self.open_chat_key()
+        if not key:
+            raise ValueError("open the chat you want to send a voice message to first")
+        chunks: list[bytes] = []
+        started = time.monotonic()
+
+        def capture(indata, _frames, _time_info, _status) -> None:
+            if time.monotonic() - started > MAX_VOICE_SECONDS:
+                raise sd.CallbackStop
+            chunks.append(bytes(indata))
+
+        stream = sd.RawInputStream(samplerate=VOICE_SAMPLE_RATE, channels=1, dtype="int16",
+                                   device=self.settings.get("voice_input"), callback=capture)
+        stream.start()
+        self.recording = {"stream": stream, "chunks": chunks, "key": key}
+        say(f"recording a voice message for {key.replace('group-', 'group ', 1)}... "
+            f"/record again to send it, /record cancel to throw it away ({MAX_VOICE_SECONDS // 60} minutes max)")
+
+    def finish_voice_recording(self, send: bool = True) -> Optional[Path]:
+        recording, self.recording = self.recording, None
+        if not recording:
+            raise ValueError("not recording; type /record to start")
+        recording["stream"].stop()
+        recording["stream"].close()
+        if not send:
+            say("voice message discarded")
+            return None
+        audio = b"".join(recording["chunks"])
+        seconds = len(audio) / 2 / VOICE_SAMPLE_RATE
+        if seconds < 0.5:
+            raise ValueError("that recording was too short to send")
+        TRANSFER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        path = TRANSFER_TEMP_DIR / f"voice-{time.strftime('%Y%m%d-%H%M%S')}.wav"
+        with wave.open(str(path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(VOICE_SAMPLE_RATE)
+            output.writeframes(audio)
+        self.voice_temp_files.append(path)
+        key = recording["key"]
+        if key.startswith("group-"):
+            self.send_group_file(key[len("group-"):], str(path))
+        else:
+            peer = self.peers.get(key)
+            if not peer:
+                raise ValueError(f"no longer connected to {key}; the recording is at {path}")
+            self.send_file(peer, str(path))
+        say(f"voice message ({seconds:.0f}s) sent as a file offer")
+        return path
+
+    def play_voice(self, value: str) -> None:
+        if sd is None:
+            raise ValueError("playing voice messages needs the voice packages, which are not installed on this device")
+        path = Path(value.strip().strip('"')).expanduser()
+        try:
+            with wave.open(str(path), "rb") as source:
+                channels, width, rate, count = source.getnchannels(), source.getsampwidth(), source.getframerate(), source.getnframes()
+                if channels not in (1, 2) or width != 2 or not 8000 <= rate <= 48000 or count > rate * 600:
+                    raise ValueError("unsupported audio format")
+                frames = source.readframes(count)
+        except (OSError, EOFError, wave.Error, ValueError) as exc:
+            raise ValueError(f"can't play that file: {exc}") from exc
+        device = self.settings.get("voice_output")
+
+        def play() -> None:
+            try:
+                with sd.RawOutputStream(samplerate=rate, channels=channels, dtype="int16", device=device) as output:
+                    output.write(frames)
+            except Exception as exc:  # noqa: BLE001 - shown to the person
+                say(f"playback stopped: {safe_terminal_text(exc)}")
+
+        self.start_worker(play)
+        say(f"playing {path.name} ({count / rate:.0f}s)")
+
     def schedule_message(self, argument: str) -> None:
         """Send later, to the chat that's open now. Runs inside this Wire
         session, so it's only sent if Wire is still running at that time."""
@@ -2966,6 +3049,8 @@ class Wire:
                 self.incoming_files.pop(file_id, None)
                 peer.send_control({"kind": "file_relay_complete", "id": file_id})
                 say(f"\nfile received and verified: {state['path']}")
+                if VOICE_MESSAGE_RE.fullmatch(state["path"].name):
+                    say(f"voice message from {peer.name}: type /play \"{state['path']}\"")
                 if self.notifications_allowed(peer.name):
                     toast(f"file received from {peer.name}: {state['path'].name}")
                 if state["path"].suffix.lower() in VIDEO_EXTENSIONS:
@@ -4295,7 +4380,13 @@ class Wire:
         for state in self.outgoing_files.values():
             if state.get("cleanup") and isinstance(state.get("path"), Path):
                 state["path"].unlink(missing_ok=True)
-        for path in self.group_transfer_temps + self.view_once_files:
+        if self.recording:
+            try:
+                self.recording["stream"].close()
+            except Exception:  # noqa: BLE001 - shutting down regardless
+                pass
+            self.recording = None
+        for path in self.group_transfer_temps + self.view_once_files + self.voice_temp_files:
             path.unlink(missing_ok=True)
         for item in self.scheduled:
             item["timer"].cancel()
@@ -4408,6 +4499,8 @@ FILES AND MEDIA
                                       Images use the image flow; everything else uses file transfer.
                                       In a group, each online member gets their own offer.
   /viewonce <image>                  Send an image that's deleted after it's opened.
+  /record / /record cancel           Record a voice message for the open chat; /record again sends it.
+  /play <file>                       Play a received voice message.
   /image accept|decline <code>       Answer an image offer.
   /sendfile <path>                   Older alias for /send.
   /file accept|decline <code>        Answer an encrypted file transfer.
@@ -4516,6 +4609,17 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             if len(pieces) not in (1, 2) or (len(pieces) == 2 and pieces[1] != "ids"):
                 raise ValueError("use: /history <username> [ids]")
             app.show_history(pieces[0], show_ids=len(pieces) == 2)
+        elif command == "record":
+            if argument.strip().lower() == "cancel":
+                app.finish_voice_recording(send=False)
+            elif app.recording:
+                app.finish_voice_recording()
+            else:
+                app.start_voice_recording()
+        elif command == "play":
+            if not argument:
+                raise ValueError('use: /play "<voice message file>"')
+            app.play_voice(argument)
         elif command == "viewonce":
             room_peer = app.peers.get(app.room or "")
             if not room_peer:

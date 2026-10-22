@@ -171,6 +171,99 @@ class ViewOnceTests(Base):
         self.assertFalse(receiver.view_once_files[0].exists())
 
 
+class FakeSoundDevice:
+    """Stands in for the sounddevice module: a microphone that produces a
+    second of audio when started, and a speaker that records what it plays."""
+
+    class CallbackStop(Exception):
+        pass
+
+    def __init__(self) -> None:
+        self.played: list[tuple[int, int, bytes]] = []
+        device = self
+
+        class RawInputStream:
+            def __init__(self, samplerate, channels, dtype, device=None, callback=None):
+                self.callback, self.samplerate = callback, samplerate
+
+            def start(self):
+                for _ in range(10):
+                    self.callback(b"\x01\x00" * (self.samplerate // 10), self.samplerate // 10, None, None)
+
+            def stop(self):
+                pass
+
+            def close(self):
+                pass
+
+        class RawOutputStream:
+            def __init__(self, samplerate, channels, dtype, device=None):
+                self.samplerate, self.channels = samplerate, channels
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write(self, frames):
+                device.played.append((self.samplerate, self.channels, bytes(frames)))
+
+        self.RawInputStream, self.RawOutputStream = RawInputStream, RawOutputStream
+
+
+class VoiceMessageTests(Base):
+    def setUp(self) -> None:
+        super().setUp()
+        self.old_sd = wire.sd
+        self.fake = FakeSoundDevice()
+        wire.sd = self.fake
+        self.sent_files: list[str] = []
+        self.app.send_file = lambda peer, path: self.sent_files.append(path)
+
+    def tearDown(self) -> None:
+        wire.sd = self.old_sd
+        super().tearDown()
+
+    def test_record_send_and_play_back(self):
+        self.app.room = "bob"
+        wire.run_command(self.app, "record", "")
+        self.assertIsNotNone(self.app.recording)
+        wire.run_command(self.app, "record", "")
+        self.assertIsNone(self.app.recording)
+        path = wire.Path(self.sent_files[-1])
+        self.assertRegex(path.name, wire.VOICE_MESSAGE_RE)
+        with wire.wave.open(str(path), "rb") as clip:
+            self.assertEqual((clip.getnchannels(), clip.getframerate()), (1, wire.VOICE_SAMPLE_RATE))
+            self.assertEqual(clip.getnframes(), wire.VOICE_SAMPLE_RATE)  # one second
+
+        wire.run_command(self.app, "play", f'"{path}"')
+        deadline = time.monotonic() + 5
+        while not self.fake.played and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.fake.played[0][:2], (wire.VOICE_SAMPLE_RATE, 1))
+        self.assertEqual(len(self.fake.played[0][2]), wire.VOICE_SAMPLE_RATE * 2)
+        self.app.close()
+        self.assertFalse(path.exists())  # temp recording removed on exit
+
+    def test_group_voice_message_and_cancel(self):
+        group_files = []
+        self.app.send_group_file = lambda group, path: group_files.append((group, path))
+        self.app.group_room = "crew"
+        wire.run_command(self.app, "record", "")
+        wire.run_command(self.app, "record", "cancel")
+        self.assertEqual(group_files, [])
+        wire.run_command(self.app, "record", "")
+        wire.run_command(self.app, "record", "")
+        self.assertEqual(group_files[0][0], "crew")
+
+    def test_play_refuses_non_audio(self):
+        bogus = wire.DOWNLOADS_DIR.parent / "notes.txt"
+        bogus.write_text("hello")
+        with self.assertRaises(ValueError):
+            self.app.play_voice(str(bogus))
+
+
 class LastSeenTests(Base):
     def test_friends_list_shows_last_seen_for_offline_friends(self):
         self.app.server = object()
