@@ -332,7 +332,7 @@ SYNC_DELETE_SERVER_VERSION = "1.4.36"
 
 # The only encrypted controls accepted from someone we're exchanging a group
 # file with but have no open chat with.
-FILE_TRANSFER_CONTROLS = frozenset({"file_relay_accept", "file_relay_decline", "file_relay_complete", "file_relay_abort"})
+FILE_TRANSFER_CONTROLS = frozenset({"file_relay_accept", "file_relay_decline", "file_relay_complete", "file_relay_abort", "group_call"})
 
 
 def same_peer(first: object, second: object) -> bool:
@@ -1424,11 +1424,14 @@ class VoiceCall:
                 with self.processor_lock:
                     processor = self.processor
                 clean = processor.process(near, far)
-                self.peer.send_audio(np.asarray(clean, dtype=np.int16).tobytes())
+                self.send_frame(np.asarray(clean, dtype=np.int16).tobytes())
                 self.sent_frames += 1
             except Exception as exc:
                 self.talking.clear()
                 self.report_error("microphone", exc)
+
+    def send_frame(self, audio: bytes) -> None:
+        self.peer.send_audio(audio)
 
     def play(self, audio: bytes) -> None:
         try:
@@ -1454,6 +1457,83 @@ class VoiceCall:
                 item.close()
             except Exception:
                 pass
+
+
+class GroupVoiceCall(VoiceCall):
+    """Voice for a whole group: your microphone goes to every participant and
+    their audio is mixed into one speaker stream. Same push-to-talk / always-on
+    rules as a 1:1 call."""
+
+    FRAME_SAMPLES = 960  # 20 ms at 48 kHz
+    MAX_QUEUED_FRAMES = 8  # ~160 ms per person; older audio is dropped, not delayed
+
+    def __init__(self, group: str, call_id: str, settings: dict) -> None:
+        self.group, self.call_id = group, call_id
+        self.participants: dict[str, Peer] = {}
+        self.queues: dict[str, collections.deque] = {}
+        self.queue_lock = threading.Lock()
+        self.running = threading.Event()
+        self.running.set()
+        super().__init__(None, settings)
+        self.mixer = threading.Thread(target=self.mix_loop, daemon=True)
+        self.mixer.start()
+
+    def add(self, peer: Peer) -> bool:
+        key = peer.name.lower()
+        with self.queue_lock:
+            new = key not in self.participants
+            self.participants[key] = peer
+            self.queues.setdefault(key, collections.deque(maxlen=self.MAX_QUEUED_FRAMES))
+        return new
+
+    def remove(self, name: str) -> bool:
+        with self.queue_lock:
+            self.queues.pop(name.lower(), None)
+            return self.participants.pop(name.lower(), None) is not None
+
+    def send_frame(self, audio: bytes) -> None:
+        with self.queue_lock:
+            peers = list(self.participants.values())
+        for peer in peers:
+            try:
+                peer.send_audio(audio)
+            except (OSError, ConnectionError):
+                pass
+
+    def receive(self, name: str, audio: bytes) -> None:
+        with self.queue_lock:
+            queue = self.queues.get(name.lower())
+            if queue is not None and len(audio) == self.FRAME_SAMPLES * 2:
+                queue.append(audio)
+                self.received_frames += 1
+
+    def mix_next(self) -> Optional[bytes]:
+        """One 20 ms frame: everyone's next frame added together and clipped."""
+        with self.queue_lock:
+            frames = [queue.popleft() for queue in self.queues.values() if queue]
+        if not frames:
+            return None
+        total = np.zeros(self.FRAME_SAMPLES, dtype=np.int32)
+        for frame in frames:
+            total += np.frombuffer(frame, dtype=np.int16).astype(np.int32)
+        return np.clip(total, -32768, 32767).astype(np.int16).tobytes()
+
+    def mix_loop(self) -> None:
+        while self.running.is_set():
+            mixed = self.mix_next()
+            if mixed is None:
+                time.sleep(0.005)
+                continue
+            try:
+                with self.audio_lock:
+                    self.far_audio = np.frombuffer(mixed, dtype=np.int16).copy()
+                self.output.write(mixed)  # blocks for ~20 ms: this is the playback clock
+            except Exception as exc:  # noqa: BLE001 - reported once
+                self.report_error("speaker", exc)
+
+    def close(self) -> None:
+        self.running.clear()
+        super().close()
 
 
 class Wire:
@@ -1485,6 +1565,8 @@ class Wire:
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
         self.view_once_files: list[Path] = []
+        self.group_call: Optional[GroupVoiceCall] = None
+        self.group_call_invites: dict[str, dict] = {}
         self.api_server = None
         self.api_events: collections.deque = collections.deque(maxlen=MAX_API_EVENTS)
         self.api_sequence = 0
@@ -3331,6 +3413,104 @@ class Wire:
             self.transfer_peers[name.lower()] = self.relay_peer(member["name"], member["public"], member["sign_public"], member["identity_signature"])
         return self.transfer_peers[name.lower()]
 
+    def shared_group_member(self, name: str) -> Optional[dict]:
+        for group in list(self.groups.values()):
+            member = self.group_member(group.get("name"), name)
+            if member:
+                return member
+        return None
+
+    def member_peer(self, name: str) -> Peer:
+        """A transfer-only link to a group member (files and group calls only)."""
+        key = name.lower()
+        if key in self.peers:
+            return self.peers[key]
+        if key not in self.transfer_peers:
+            member = self.shared_group_member(name)
+            if not member:
+                raise ValueError(f"{name} isn't in any of your groups")
+            self.transfer_peers[key] = self.relay_peer(member["name"], member["public"], member["sign_public"], member["identity_signature"])
+        return self.transfer_peers[key]
+
+    def group_call_control(self, group: dict, action: str, names: list[str]) -> None:
+        for name in names:
+            try:
+                self.member_peer(name).send_control({"kind": "group_call", "action": action, "group": group["name"],
+                                                     "call": self.group_call.call_id if self.group_call else ""})
+            except (OSError, ConnectionError, ValueError, KeyError):
+                pass
+
+    def online_members(self, group: dict) -> list[str]:
+        return [member["name"] for member in group.get("members", []) if isinstance(member, dict)
+                and isinstance(member.get("name"), str) and member.get("online")
+                and member["name"].lower() != (self.name or "").lower()]
+
+    def start_group_call(self, group_name: str) -> None:
+        group = self.groups.get(group_name.lower())
+        if not group:
+            raise ValueError("unknown group; use /group list first")
+        if self.group_call or self.calls:
+            raise ValueError("you're already in a call; /hangup first")
+        online = self.online_members(group)
+        if not online:
+            raise ValueError("nobody else in that group is online")
+        self.group_call = GroupVoiceCall(group["name"], uuid.uuid4().hex[:16], self.settings)
+        self.group_call_control(group, "ring", online)
+        activation = "always on" if self.settings.get("voice_mode") == "open" else "hold F12 to talk"
+        say(f"calling {group['name']} ({len(online)} online); {activation}, /hangup to leave")
+
+    def join_group_call(self, group_name: str) -> None:
+        invite = self.group_call_invites.get(group_name.strip().lower())
+        group = self.groups.get(group_name.strip().lower())
+        if not invite or not group:
+            raise ValueError("no call to join in that group")
+        if self.group_call or self.calls:
+            raise ValueError("you're already in a call; /hangup first")
+        self.group_call_invites.pop(group_name.strip().lower(), None)
+        self.group_call = GroupVoiceCall(group["name"], invite["call"], self.settings)
+        self.group_call_control(group, "join", self.online_members(group))
+        activation = "always on" if self.settings.get("voice_mode") == "open" else "hold F12 to talk"
+        say(f"joined the {group['name']} call; {activation}, /hangup to leave")
+
+    def leave_group_call(self) -> None:
+        call, self.group_call = self.group_call, None
+        if not call:
+            raise ValueError("you're not in a group call")
+        for peer in list(call.participants.values()):
+            try:
+                peer.send_control({"kind": "group_call", "action": "leave", "group": call.group, "call": call.call_id})
+            except (OSError, ConnectionError):
+                pass
+        call.close()
+        say(f"left the {call.group} call")
+
+    def handle_group_call(self, peer: Peer, control: dict) -> None:
+        group_name, action, call_id = control.get("group"), control.get("action"), control.get("call")
+        if not isinstance(group_name, str) or not isinstance(call_id, str) or not HEX16_RE.fullmatch(call_id):
+            return
+        group = self.groups.get(group_name.lower())
+        if not group or not self.group_member(group_name, peer.name):
+            return
+        call = self.group_call
+        in_this_call = call is not None and call.call_id == call_id
+        if action == "ring" and call is None:
+            self.group_call_invites[group_name.lower()] = {"call": call_id, "from": peer.name}
+            say(f"\n{peer.name} started a voice call in {safe_terminal_text(group['name'])}. Type /joincall {safe_terminal_text(group['name'])}")
+            redraw_prompt()
+            if self.notifications_allowed(f"group-{group['name']}") and self.notifications_allowed(peer.name):
+                toast(f"{peer.name} started a call in {group['name']}")
+        elif action in ("join", "here") and in_this_call:
+            if call.add(peer):
+                say(f"{peer.name} is in the {group['name']} call")
+            if action == "join":
+                peer.send_control({"kind": "group_call", "action": "here", "group": group["name"], "call": call_id})
+        elif action == "join" and call is None:
+            # Someone joined a call we were rung for but haven't joined yet.
+            self.group_call_invites.setdefault(group_name.lower(), {"call": call_id, "from": peer.name})
+        elif action == "leave" and in_this_call:
+            if call.remove(peer.name):
+                say(f"{peer.name} left the {group['name']} call")
+
     def send_group_file(self, group_name: str, value: str) -> None:
         """Offer one file to every online member; each accepts on their own."""
         group = self.groups.get(group_name.lower())
@@ -4044,6 +4224,10 @@ class Wire:
             self.end_call(peer, tell_peer=False)
 
     def handle_audio(self, peer: Peer, packet: dict) -> None:
+        group_call = self.group_call
+        if group_call is not None and peer.name.lower() in group_call.participants:
+            group_call.receive(peer.name, peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-audio"))
+            return
         call = self.calls.get(peer.name.lower())
         if call:
             call.play(peer.decrypt(unb64(packet["nonce"]), unb64(packet["data"]), b"wire-v1-audio"))
@@ -4117,7 +4301,7 @@ class Wire:
         self.start_session(peer)
 
     def handle_message(self, peer: Peer, packet: dict, transfer_only: bool = False) -> None:
-        if transfer_only and packet.get("type") not in ("file_relay", "control"):
+        if transfer_only and packet.get("type") not in ("file_relay", "control", "audio"):
             return
         if packet.get("type") in {"control", "image", "voice", "audio", "file_relay", "msg"} and not peer.accept_nonce(packet):
             return
@@ -4183,6 +4367,8 @@ class Wire:
                     image_id = control.get("id")
                     if isinstance(image_id, str):
                         self.stop_incoming_image(peer, image_id)
+                elif control.get("kind") == "group_call":
+                    self.handle_group_call(peer, control)
                 elif control.get("kind") == "session_key":
                     self.complete_session(peer, control)
                 elif control.get("kind") == "chat_timer":
@@ -4706,8 +4892,12 @@ class Wire:
                     peer = self.peers.get(sender.lower())
                     if peer:
                         self.handle_message(peer, packet["packet"])
-                    elif sender.lower() in self.transfer_peers:
-                        self.handle_message(self.transfer_peers[sender.lower()], packet["packet"], transfer_only=True)
+                    elif sender.lower() in self.transfer_peers or self.shared_group_member(sender):
+                        try:
+                            transfer = self.member_peer(sender)
+                        except (ValueError, KeyError, TypeError):
+                            continue  # e.g. their identity key changed: warned once, packet dropped
+                        self.handle_message(transfer, packet["packet"], transfer_only=True)
                 elif kind == "error":
                     message = str(packet.get("message", "error"))
                     if packet.get("code") == "relay_rate_limited" or message.startswith("relay rate limit reached"):
@@ -4808,6 +4998,11 @@ class Wire:
             self.api_server.shutdown()
             self.api_server.server_close()
             self.api_server = None
+        if self.group_call:
+            try:
+                self.leave_group_call()
+            except Exception:  # noqa: BLE001 - shutting down regardless
+                pass
         for path in self.group_transfer_temps + self.view_once_files + self.voice_temp_files:
             path.unlink(missing_ok=True)
         for item in self.scheduled:
@@ -4928,6 +5123,7 @@ FILES AND MEDIA
   /file accept|decline <code>        Answer an encrypted file transfer.
   /preview <video path>              Play the first five seconds locally.
   /call / /call stats / /acceptcall <name> / /declinecall <name> / /hangup
+  /call in an open group rings everyone online; others /joincall <group>.
   /share                             Start sharing your selected monitor.
   /share accept|decline <code>       Answer a screen-share request.
   /share pause|resume               Temporarily pause or resume outgoing capture.
@@ -5236,6 +5432,14 @@ def run_command(app: "Wire", command: str, argument: str) -> bool:
             app.answer_image_offer(room_peer, pieces[1], accept=pieces[0] == "accept")
         elif command == "call" and argument.strip().lower() == "stats":
             app.show_call_stats()
+        elif command == "call" and app.group_room and not argument:
+            app.start_group_call(app.group_room)
+        elif command == "joincall":
+            if not argument:
+                raise ValueError("use: /joincall <group>")
+            app.join_group_call(argument)
+        elif command == "hangup" and app.group_call:
+            app.leave_group_call()
         elif command == "call":
             if argument:
                 raise ValueError("use: /call or /call stats")

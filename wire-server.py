@@ -1131,6 +1131,11 @@ def handle(sock: socket.socket, address: tuple[str, int]) -> None:
                     # The client paces attachment frames.  Silently drop an
                     # unpaced excess frame rather than flooding its terminal.
                     continue
+                elif payload.get("type") == "audio":
+                    # Live call audio is useless later: deliver now or drop it,
+                    # never fill someone's offline queue with it.
+                    deliver(target, wrapped)
+                    continue
                 elif deliver_or_queue(target, wrapped):
                     continue
                 else:
