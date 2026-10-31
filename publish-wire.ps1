@@ -50,6 +50,6 @@ if (Get-Process wire -ErrorAction SilentlyContinue) {
     exit 0
 }
 
-py -m pipx install --force "https://github.com/dork40/wire/archive/$releaseCommit.zip"
+py -m pipx install --force "wire-messenger[media] @ https://github.com/dork40/wire/archive/$releaseCommit.zip"
 if ($LASTEXITCODE -ne 0) { throw 'GitHub is updated, but the local Wire replacement failed.' }
 Write-Host "Published and installed Wire v$Version."

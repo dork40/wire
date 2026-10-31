@@ -10,3 +10,6 @@ __pycache__/
 *.pyc
 *.zip
 *.spec
+!buildozer.spec
+.buildozer/
+bin/

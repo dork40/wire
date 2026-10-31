@@ -3,6 +3,21 @@ set -eu
 
 SOURCE=${1:-'https://github.com/dork40/wire/archive/refs/heads/main.zip'}
 
+# Termux (Android) has no sudo, uses `pkg`/`apt` without root, and cannot
+# build the native voice-call/screen-share stack (aiortc, PyAV, portaudio).
+# Install Wire there as a plain encrypted texting app: chat, friends,
+# do-not-disturb, and encrypted file transfer all work fully; /call and
+# /share report that media packages are not installed on this device.
+if [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux/files ]; then
+  pkg update -y
+  pkg install -y python python-pip
+  pip install --user pipx
+  python -m pipx ensurepath
+  python -m pipx install --force "$SOURCE"
+  printf '%s\n' 'Wire installed for this phone terminal (chat/friends/files; voice calls and screen sharing are desktop-only). Open a new terminal and run: wire'
+  exit 0
+fi
+
 if ! command -v python3 >/dev/null 2>&1 || ! command -v pipx >/dev/null 2>&1; then
   if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update
@@ -18,5 +33,5 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v pipx >/dev/null 2>&1; th
 fi
 
 pipx ensurepath
-pipx install --force "$SOURCE"
+pipx install --force "wire-messenger[media] @ $SOURCE"
 printf '%s\n' 'Wire installed. Open a new terminal and run: wire'
