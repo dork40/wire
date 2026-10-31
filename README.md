@@ -32,54 +32,6 @@ PipeWire/XDG Desktop Portal backend is implemented and tested.
 New installs automatically connect to the Wire username directory at
 `wirecmd.ddns.net`; no IP address or server command is needed for normal use.
 
-## What's new in server 1.4.32
-
-- Added an Account page to the TrueNAS Web UI with identity-backup status,
-  do-not-disturb status, group-invite preference, and privacy boundaries.
-- Added the same safety fingerprint shown by the Wire terminal so an account's
-  public identity can be compared through another trusted channel.
-- Limited active Web UI sessions and automatically removes expired sessions.
-- Hardened backup inspection against oversized or malformed archive entries.
-- Prevented malformed group data from crashing the Groups dashboard.
-- Kept the dashboard privacy-safe: it does not display message contents,
-  passwords, or private identity keys.
-
-## What's new in server 1.4.33
-
-- Added a visible mobile sign-out control and changed sign-out to a POST action.
-- Prevented malformed account, friend, and group records from crashing pages.
-- Made backup inventory resilient when files change during a dashboard refresh.
-- Restricted Web login KDF parameters to Wire's exact safe client whitelist,
-  preventing malicious backups from triggering excessive memory or CPU use.
-- Added regression coverage for damaged state, safe logout, and unsafe KDF data.
-
-## What's new in server 1.4.34
-
-- Streams backup checksums in bounded chunks instead of loading large state
-  files into Web UI memory.
-- Rejects oversized backup manifests and avoids duplicate verification work on
-  Overview and Server page refreshes.
-- Hardens generated TrueNAS containers with read-only roots, dropped Linux
-  capabilities, no-new-privileges, bounded temporary storage, and graceful
-  shutdown periods.
-
-## What's new in server 1.4.35
-
-- Completes the encrypted message-sync request with an explicit success reply,
-  preventing clients and diagnostics from waiting indefinitely after storage.
-- Reports a clear error when the encrypted server-side sync quota is full.
-- Adds a real two-device regression test covering authenticated upload,
-  disconnect, reconnect, encrypted download, and local history merge.
-
-## What's new in Wire 1.4.69
-
-- Isolates Windows.Graphics.Capture in a bounded shared-memory worker so a
-  native WinRT wait cannot freeze chat or settings.
-- Falls back to a DXGI crop of the selected application window when WGC is
-  unavailable, never to a full-monitor capture.
-- Preserves cursor position in the DXGI window fallback and reports backend
-  startup failures instead of leaving a black share running.
-
 ## What's new in Wire 1.4.70
 
 - Fixes application-window sharing when the selected window is static at
