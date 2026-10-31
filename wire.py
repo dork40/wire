@@ -1464,6 +1464,10 @@ class VoiceCall:
                 pass
 
 
+KEEPALIVE_SECONDS = 20
+DEAD_AFTER_SECONDS = 55
+RECONNECT_DELAYS = (1, 2, 4, 8, 15, 30)
+
 RING_SECONDS = 30
 RING_RATE = 16000
 
@@ -1651,6 +1655,9 @@ class Wire:
         # opened a room with or whose request we explicitly accepted.
         self.server_version = ""
         self.view_once_files: list[Path] = []
+        self.last_server_frame = time.monotonic()
+        self.reconnecting = False
+        self.keepalive_started = False
         self.group_call: Optional[GroupVoiceCall] = None
         self.ringer = Ringer({})  # gets the live settings each time it rings
         self.group_call_invites: dict[str, dict] = {}
@@ -4634,7 +4641,11 @@ class Wire:
                     RELAY_UPLOAD_BYTES_PER_SECOND,
                     int(advertised_rate / RELAY_UPLOAD_EXPANSION * 0.85),
                 )
+            self.last_server_frame = time.monotonic()
             self.start_worker(self.server_loop, sock)
+            if not self.keepalive_started:
+                self.keepalive_started = True
+                self.start_worker(self.keepalive_loop)
             self.server_send({"type": "sync_fetch"})
             self.sync_preferences()
             self.backup_identity()
@@ -4645,6 +4656,69 @@ class Wire:
         except Exception:
             sock.close()
             raise
+
+    def drop_dead_connection(self) -> None:
+        """Close a directory socket that stopped answering. The server_loop
+        reading it then fails and starts the reconnect."""
+        sock = self.server
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def check_connection(self, wait: float = 4.0) -> bool:
+        """Ping the directory and wait briefly for any reply (Android calls
+        this on resume, when the old socket may be dead without knowing it)."""
+        if not self.server:
+            self.schedule_reconnect()
+            return False
+        before = self.last_server_frame
+        try:
+            self.server_send({"type": "ping", "id": ""})
+        except (OSError, ConnectionError):
+            self.drop_dead_connection()
+            return False
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if self.last_server_frame != before:
+                return True
+            time.sleep(0.1)
+        self.drop_dead_connection()
+        return False
+
+    def keepalive_loop(self) -> None:
+        while not self.closing.wait(KEEPALIVE_SECONDS):
+            if not self.server:
+                continue
+            try:
+                self.server_send({"type": "ping", "id": ""})
+            except (OSError, ConnectionError):
+                self.drop_dead_connection()
+                continue
+            if time.monotonic() - self.last_server_frame > DEAD_AFTER_SECONDS:
+                self.drop_dead_connection()
+
+    def schedule_reconnect(self) -> None:
+        if self.closing.is_set() or not self.name or self.reconnecting:
+            return
+        self.reconnecting = True
+        self.start_worker(self.reconnect_loop)
+
+    def reconnect_loop(self) -> None:
+        attempt = 0
+        try:
+            while not self.closing.is_set() and not self.server:
+                delay = RECONNECT_DELAYS[min(attempt, len(RECONNECT_DELAYS) - 1)]
+                if self.closing.wait(delay):
+                    return
+                attempt += 1
+                try:
+                    self.connect_server()
+                except (OSError, ConnectionError, ValueError):
+                    continue  # offline or "still online" from the dead socket: try again
+        finally:
+            self.reconnecting = False
 
     def switch_directory(self, mode: str, host: str, port: int) -> None:
         """Persist a directory choice and reconnect without mixing private realms."""
@@ -4906,6 +4980,7 @@ class Wire:
         try:
             while not self.closing.is_set():
                 packet = recv_frame(sock)
+                self.last_server_frame = time.monotonic()
                 kind = packet.get("type")
                 if kind == "request":
                     name, public, sign_public_value, identity_signature = packet["from"], packet["public"], packet.get("sign_public"), packet.get("identity_signature")
@@ -5082,7 +5157,8 @@ class Wire:
                 if not isinstance(exc, (ConnectionError, OSError)):
                     report_background_failure("username directory connection", exc)
                 if not self.closing.is_set():
-                    say("\ndirectory disconnected")
+                    say("\ndirectory disconnected; reconnecting...")
+                    self.schedule_reconnect()
 
     def listen(self, port: int) -> None:
         self.require_login()

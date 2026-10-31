@@ -248,6 +248,21 @@ def tls_context() -> ssl.SSLContext:
     return context
 
 
+def enable_keepalive(sock: socket.socket) -> None:
+    """Have the OS probe idle clients so a phone that vanished (or was put to
+    sleep) is noticed within about a minute and its username is freed."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+        elif hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows: (on, idle ms, interval ms)
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 10_000))
+    except (OSError, ValueError):
+        pass
+
+
 def receive_exact(sock: socket.socket, count: int) -> bytes:
     data = bytearray()
     while len(data) < count:
@@ -1235,6 +1250,7 @@ def main() -> None:
             def serve(connection: socket.socket, peer_address: tuple[str, int]) -> None:
                 try:
                     connection.settimeout(15)
+                    enable_keepalive(connection)
                     secure = secure_context.wrap_socket(connection, server_side=True)
                     handle(secure, peer_address)
                 except (ssl.SSLError, OSError):
